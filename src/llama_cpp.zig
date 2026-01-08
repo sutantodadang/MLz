@@ -16,8 +16,13 @@ pub const LlamaError = error{
     TokenizeFailed,
     DecodeFailed,
     LogitsUnavailable,
+    CapacityExceeded,
+    SeqIdOverflow,
+    SamplerInitFailed,
 };
 
+/// Duplicate a slice as a null-terminated string.
+/// Caller owns the returned memory.
 pub fn dupeZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
     const out = try allocator.alloc(u8, s.len + 1);
     @memcpy(out[0..s.len], s);
@@ -25,15 +30,18 @@ pub fn dupeZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
     return out[0..s.len :0];
 }
 
-pub fn systemInfo() []const u8 {
-    return std.mem.span(c.llama_print_system_info());
+/// Returns system info string. Caller owns the returned memory.
+/// The underlying C function returns a static buffer; we dupe it for safety.
+pub fn systemInfo(allocator: std.mem.Allocator) ![]const u8 {
+    const ptr = c.llama_print_system_info();
+    return try allocator.dupe(u8, std.mem.span(ptr));
 }
 
 /// Global backend lifecycle.
 pub const Backend = struct {
     pub fn init() Backend {
         c.llama_backend_init();
-        _ = c.ggml_backend_load_all();
+        c.ggml_backend_load_all();
         return .{};
     }
 
@@ -50,7 +58,8 @@ pub const Model = struct {
         return .{ .handle = m };
     }
 
-    pub fn deinit(self: *Model) void {
+    /// Frees the model. Takes self by value so both const and var work.
+    pub fn deinit(self: Model) void {
         c.llama_model_free(self.handle);
     }
 
@@ -75,7 +84,8 @@ pub const Context = struct {
         return .{ .handle = ctx };
     }
 
-    pub fn deinit(self: *Context) void {
+    /// Frees the context. Takes self by value.
+    pub fn deinit(self: Context) void {
         c.llama_free(self.handle);
     }
 
@@ -96,52 +106,101 @@ pub const Context = struct {
     }
 };
 
+/// Configuration for sampler chain. All fields have sane defaults.
+pub const SamplerConfig = struct {
+    temp: f32 = 0.8,
+    top_k: i32 = 40,
+    top_p: f32 = 0.95,
+    min_p: f32 = 0.05,
+    seed: u32 = 1234,
+
+    /// Returns true if greedy sampling (temp <= 0).
+    pub fn isGreedy(self: SamplerConfig) bool {
+        return self.temp <= 0;
+    }
+};
+
 pub const Sampler = struct {
     handle: *c.llama_sampler,
 
-    pub fn initDefault() Sampler {
-        // llama_sampler_chain_init(params)
-        // For simplicity, we can use llama_sampler_chain_default() if available,
-        // or build a standard chain. Standard chain: temp -> top_k -> top_p -> min_p -> softmax.
-        const chain = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params());
-        c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_k(40));
-        c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_p(0.95, 1));
-        c.llama_sampler_chain_add(chain, c.llama_sampler_init_temp(0.8));
-        c.llama_sampler_chain_add(chain, c.llama_sampler_init_dist(1234)); // Seed or handle externally
-        return .{ .handle = chain };
+    /// Initialize with default parameters.
+    pub fn initDefault() LlamaError!Sampler {
+        return initWithConfig(.{});
     }
 
-    pub fn initAdvanced(temp: f32, top_k: i32, top_p: f32, seed: u32) Sampler {
+    /// Initialize with custom configuration.
+    pub fn initWithConfig(config: SamplerConfig) LlamaError!Sampler {
         const params = c.llama_sampler_chain_default_params();
-        const chain = c.llama_sampler_chain_init(params);
-        if (temp > 0) {
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_k(top_k));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_p(top_p, 1));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_temp(temp));
+        const chain = c.llama_sampler_chain_init(params) orelse return LlamaError.SamplerInitFailed;
+        errdefer c.llama_sampler_free(chain);
+
+        if (config.isGreedy()) {
+            // Greedy: just use temp=0
+            const temp_sampler = c.llama_sampler_init_temp(0.0) orelse return LlamaError.SamplerInitFailed;
+            c.llama_sampler_chain_add(chain, temp_sampler);
         } else {
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_temp(0.0));
+            // Stochastic: top_k -> top_p -> min_p -> temp
+            const top_k_sampler = c.llama_sampler_init_top_k(config.top_k) orelse return LlamaError.SamplerInitFailed;
+            c.llama_sampler_chain_add(chain, top_k_sampler);
+
+            const top_p_sampler = c.llama_sampler_init_top_p(config.top_p, 1) orelse return LlamaError.SamplerInitFailed;
+            c.llama_sampler_chain_add(chain, top_p_sampler);
+
+            const min_p_sampler = c.llama_sampler_init_min_p(config.min_p, 1) orelse return LlamaError.SamplerInitFailed;
+            c.llama_sampler_chain_add(chain, min_p_sampler);
+
+            const temp_sampler = c.llama_sampler_init_temp(config.temp) orelse return LlamaError.SamplerInitFailed;
+            c.llama_sampler_chain_add(chain, temp_sampler);
         }
-        c.llama_sampler_chain_add(chain, c.llama_sampler_init_dist(seed));
+
+        // Distribution sampler (always needed for actual sampling)
+        const dist_sampler = c.llama_sampler_init_dist(config.seed) orelse return LlamaError.SamplerInitFailed;
+        c.llama_sampler_chain_add(chain, dist_sampler);
+
         return .{ .handle = chain };
     }
 
-    pub fn deinit(self: *Sampler) void {
+    /// Legacy API for backward compatibility.
+    pub fn initAdvanced(temp: f32, top_k: i32, top_p: f32, seed: u32) LlamaError!Sampler {
+        return initWithConfig(.{
+            .temp = temp,
+            .top_k = top_k,
+            .top_p = top_p,
+            .seed = seed,
+        });
+    }
+
+    /// Frees the sampler. Takes self by value.
+    pub fn deinit(self: Sampler) void {
         c.llama_sampler_free(self.handle);
     }
 
-    pub fn sample(self: Sampler, ctx: Context, idx: i32) Token {
+    /// Sample from the last token's logits (idx = -1).
+    pub fn sampleLast(self: Sampler, ctx: Context) Token {
+        return c.llama_sampler_sample(self.handle, ctx.handle, -1);
+    }
+
+    /// Sample from a specific token index's logits.
+    pub fn sampleAt(self: Sampler, ctx: Context, idx: i32) Token {
         return c.llama_sampler_sample(self.handle, ctx.handle, idx);
     }
 };
 
 pub const Batch = struct {
     handle: c.llama_batch,
+    capacity: i32,
+    n_seq_max: i32,
 
     pub fn init(n_tokens: i32, embd: i32, n_seq_max: i32) Batch {
-        return .{ .handle = c.llama_batch_init(n_tokens, embd, n_seq_max) };
+        return .{
+            .handle = c.llama_batch_init(n_tokens, embd, n_seq_max),
+            .capacity = n_tokens,
+            .n_seq_max = n_seq_max,
+        };
     }
 
-    pub fn deinit(self: *Batch) void {
+    /// Frees the batch. Takes self by value.
+    pub fn deinit(self: Batch) void {
         c.llama_batch_free(self.handle);
     }
 
@@ -149,7 +208,15 @@ pub const Batch = struct {
         self.handle.n_tokens = 0;
     }
 
-    pub fn add(self: *Batch, token: Token, pos: i32, seq_ids: []const i32, logits: bool) void {
+    /// Add a token to the batch. Returns error if capacity exceeded.
+    pub fn add(self: *Batch, token: Token, pos: i32, seq_ids: []const i32, logits: bool) LlamaError!void {
+        if (self.handle.n_tokens >= self.capacity) {
+            return LlamaError.CapacityExceeded;
+        }
+        if (seq_ids.len > @as(usize, @intCast(self.n_seq_max))) {
+            return LlamaError.SeqIdOverflow;
+        }
+
         const i: usize = @intCast(self.handle.n_tokens);
         self.handle.token[i] = token;
         self.handle.pos[i] = pos;
@@ -159,6 +226,16 @@ pub const Batch = struct {
         }
         self.handle.logits[i] = if (logits) 1 else 0;
         self.handle.n_tokens += 1;
+    }
+
+    /// Returns remaining capacity.
+    pub fn remaining(self: Batch) i32 {
+        return self.capacity - self.handle.n_tokens;
+    }
+
+    /// Returns true if at capacity.
+    pub fn isFull(self: Batch) bool {
+        return self.handle.n_tokens >= self.capacity;
     }
 };
 
@@ -173,10 +250,11 @@ pub fn applyChatTemplate(
     const need_len = c.llama_chat_apply_template(template, chat.ptr, chat.len, add_assistant, null, 0);
     if (need_len <= 0) return LlamaError.TemplateFailed;
 
-    var buf = try allocator.alloc(u8, @intCast(need_len));
-    const out_len = c.llama_chat_apply_template(template, chat.ptr, chat.len, add_assistant, @ptrCast(buf.ptr), need_len);
+    var buf = allocator.alloc(u8, @intCast(need_len)) catch return LlamaError.OutOfMemory;
+    errdefer allocator.free(buf);
+
+    const out_len = c.llama_chat_apply_template(template, chat.ptr, chat.len, add_assistant, buf.ptr, need_len);
     if (out_len <= 0) {
-        allocator.free(buf);
         return LlamaError.TemplateFailed;
     }
 
@@ -187,9 +265,10 @@ pub fn applyChatTemplate(
         used = z;
     }
 
-    // Make the returned slice match the allocation size so `allocator.free()` is correct.
-    buf = try allocator.realloc(buf, used);
-    return buf;
+    return allocator.realloc(buf, used) catch |err| {
+        allocator.free(buf);
+        return err;
+    };
 }
 
 /// Tokenize UTF-8 text into llama tokens.
@@ -201,19 +280,54 @@ pub fn tokenize(
     add_bos: bool,
     special: bool,
 ) LlamaError![]c.llama_token {
-    var tmp_tokens = try allocator.alloc(c.llama_token, text.len + 32);
-    var n_tok = c.llama_tokenize(vocab, @ptrCast(text.ptr), @intCast(text.len), tmp_tokens.ptr, @intCast(tmp_tokens.len), add_bos, special);
+    // Initial estimate: 1 token per 4 chars + some slack
+    const initial_capacity = @max(text.len / 4 + 32, 64);
+    var tmp_tokens = allocator.alloc(c.llama_token, initial_capacity) catch return LlamaError.OutOfMemory;
+    errdefer allocator.free(tmp_tokens);
+
+    var n_tok = c.llama_tokenize(vocab, text.ptr, @intCast(text.len), tmp_tokens.ptr, @intCast(tmp_tokens.len), add_bos, special);
+
     if (n_tok < 0) {
+        // Buffer too small, reallocate with exact size
         const need: usize = @intCast(-n_tok);
-        tmp_tokens = try allocator.realloc(tmp_tokens, need);
-        n_tok = c.llama_tokenize(vocab, @ptrCast(text.ptr), @intCast(text.len), tmp_tokens.ptr, @intCast(tmp_tokens.len), add_bos, special);
+        tmp_tokens = allocator.realloc(tmp_tokens, need) catch return LlamaError.OutOfMemory;
+        n_tok = c.llama_tokenize(vocab, text.ptr, @intCast(text.len), tmp_tokens.ptr, @intCast(tmp_tokens.len), add_bos, special);
     }
+
     if (n_tok <= 0) {
-        allocator.free(tmp_tokens);
         return LlamaError.TokenizeFailed;
     }
 
     const n_tok_usize: usize = @intCast(n_tok);
-    tmp_tokens = try allocator.realloc(tmp_tokens, n_tok_usize);
-    return tmp_tokens;
+    return allocator.realloc(tmp_tokens, n_tok_usize) catch |err| {
+        allocator.free(tmp_tokens);
+        return err;
+    };
+}
+
+/// Detokenize a single token to a string piece.
+/// Returns null if the token cannot be converted.
+pub fn tokenToPiece(allocator: std.mem.Allocator, vocab: ?*const c.llama_vocab, token: Token) !?[]const u8 {
+    var stack_buf: [256]u8 = undefined;
+    const n = c.llama_token_to_piece(vocab, token, &stack_buf, stack_buf.len, 0, false);
+
+    if (n == 0) {
+        return null;
+    } else if (n > 0) {
+        return try allocator.dupe(u8, stack_buf[0..@intCast(n)]);
+    } else {
+        // Buffer too small, allocate exact size
+        const actual_n: usize = @intCast(-n);
+        const large_buf = try allocator.alloc(u8, actual_n);
+        const n2 = c.llama_token_to_piece(vocab, token, large_buf.ptr, @intCast(large_buf.len), 0, false);
+        if (n2 > 0) {
+            const used: usize = @intCast(n2);
+            if (used < large_buf.len) {
+                return allocator.realloc(large_buf, used) catch large_buf[0..used];
+            }
+            return large_buf;
+        }
+        allocator.free(large_buf);
+        return null;
+    }
 }

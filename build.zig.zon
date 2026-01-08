@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .llama_cpp = .{
-            .url = "https://github.com/ggerganov/llama.cpp/archive/master.tar.gz",
-            .hash = "1220817a9c667c6b8312e78170f3337dc11250f0f7bda28453244046a8f7e88a2c5d",
+            .url = "https://github.com/ggerganov/llama.cpp/archive/refs/tags/b7664.tar.gz",
+            .hash = "1220b18d7bfe9cab84dfdb57b6fbd70259d324168eee092943a98e01263d43b03ae3",
         },
     },
     // Specifies the set of files and directories that are included in this package.

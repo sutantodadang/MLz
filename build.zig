@@ -14,13 +14,17 @@ pub fn build(b: *std.Build) void {
     const use_cuda = b.option(bool, "cuda", "Use CUDA for GPU acceleration") orelse false;
     const target = b.standardTargetOptions(.{});
     var actual_target = target;
-    if (use_cuda) {
+    if (use_cuda and target.result.os.tag == .windows) {
         actual_target.query.abi = .msvc;
         actual_target.query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
     }
     const optimize = b.standardOptimizeOption(.{});
 
     const use_vulkan = b.option(bool, "vulkan", "Use Vulkan for GPU acceleration") orelse false;
+
+    // Metal is auto-enabled on macOS/iOS unless explicitly disabled
+    const use_metal_default = target.result.os.tag == .macos or target.result.os.tag == .ios;
+    const use_metal = b.option(bool, "metal", "Use Metal for GPU acceleration (macOS/iOS)") orelse use_metal_default;
 
     // ggml's C sources intentionally do pointer arithmetic on null pointers
     // (e.g. for size calculations). In Debug this can trap under Zig/clang's
@@ -80,13 +84,17 @@ pub fn build(b: *std.Build) void {
     c_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
     c_flags.append(b.allocator, "-DGGML_VERSION=\"100\"") catch @panic("OOM");
     c_flags.append(b.allocator, "-DGGML_COMMIT=\"unknown\"") catch @panic("OOM");
-    c_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
 
     cpp_flags.append(b.allocator, "-std=c++17") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_VERSION=\"100\"") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_COMMIT=\"unknown\"") catch @panic("OOM");
-    cpp_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
+
+    // x86_64-specific flags (AVX512 disabled for compatibility)
+    if (actual_target.result.cpu.arch == .x86_64) {
+        c_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
+        cpp_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
+    }
 
     c_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
@@ -97,6 +105,11 @@ pub fn build(b: *std.Build) void {
     } else if (use_cuda) {
         c_flags.append(b.allocator, "-DGGML_USE_CUDA") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-DGGML_USE_CUDA") catch @panic("OOM");
+    }
+
+    if (use_metal) {
+        c_flags.append(b.allocator, "-DGGML_USE_METAL") catch @panic("OOM");
+        cpp_flags.append(b.allocator, "-DGGML_USE_METAL") catch @panic("OOM");
     }
 
     const ggml_lib = b.addLibrary(.{
@@ -197,19 +210,42 @@ pub fn build(b: *std.Build) void {
         .file = llama_cpp_dep.path("ggml/src/ggml-cpu/ops.cpp"),
         .flags = cpp_flags.items,
     });
-    // x86 feature detection + optimized repack/quants
-    ggml_lib.addCSourceFile(.{
-        .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp"),
-        .flags = cpp_flags.items,
-    });
-    ggml_lib.addCSourceFile(.{
-        .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/repack.cpp"),
-        .flags = cpp_flags.items,
-    });
-    ggml_lib.addCSourceFile(.{
-        .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/quants.c"),
-        .flags = c_flags.items,
-    });
+    // Architecture-specific CPU backend sources
+    switch (actual_target.result.cpu.arch) {
+        .x86_64 => {
+            // x86 feature detection + optimized repack/quants
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp"),
+                .flags = cpp_flags.items,
+            });
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/repack.cpp"),
+                .flags = cpp_flags.items,
+            });
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/quants.c"),
+                .flags = c_flags.items,
+            });
+        },
+        .aarch64 => {
+            // ARM NEON optimizations
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/arm/cpu-feats.cpp"),
+                .flags = cpp_flags.items,
+            });
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/arm/repack.cpp"),
+                .flags = cpp_flags.items,
+            });
+            ggml_lib.addCSourceFile(.{
+                .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/arm/quants.c"),
+                .flags = c_flags.items,
+            });
+        },
+        else => {
+            // Fallback: no arch-specific optimizations
+        },
+    }
 
     if (use_vulkan) {
         ggml_lib.addCSourceFile(.{
@@ -217,106 +253,129 @@ pub fn build(b: *std.Build) void {
             .flags = cpp_flags.items,
         });
         ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-vulkan"));
-        if (target.result.os.tag == .windows) {
-            if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
-                const lib_path = b.pathJoin(&.{ sdk_path, "Lib" });
-                ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
-            }
+
+        // Platform-specific Vulkan SDK handling
+        switch (target.result.os.tag) {
+            .windows => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    const lib_path = b.pathJoin(&.{ sdk_path, "Lib" });
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
+                } else {
+                    std.log.warn("VULKAN_SDK environment variable not set. Vulkan build may fail.", .{});
+                }
+                ggml_lib.linkSystemLibrary("vulkan-1");
+            },
+            .linux => {
+                ggml_lib.linkSystemLibrary("vulkan");
+            },
+            .macos => {
+                // macOS uses MoltenVK via Vulkan SDK
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    const lib_path = b.pathJoin(&.{ sdk_path, "lib" });
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
+                }
+                ggml_lib.linkSystemLibrary("vulkan");
+            },
+            else => {
+                ggml_lib.linkSystemLibrary("vulkan");
+            },
         }
-        ggml_lib.linkSystemLibrary("vulkan-1");
     } else if (use_cuda) {
-        const cuda_path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1";
-        ggml_lib.addIncludePath(.{ .cwd_relative = cuda_path ++ "/include" });
+        // CUDA support - detect paths from environment variables
+        const cuda_path = getCudaPath(b);
+        if (cuda_path == null) {
+            std.log.err("CUDA_PATH environment variable not set. Please set it to your CUDA installation directory.", .{});
+            std.log.err("Example: export CUDA_PATH=/usr/local/cuda", .{});
+            @panic("CUDA_PATH required for CUDA build");
+        }
+        const cuda_root = cuda_path.?;
+
+        const cuda_include = b.pathJoin(&.{ cuda_root, "include" });
         const ggml_cuda_path_abs = llama_cpp_dep.path("ggml/src/ggml-cuda").getPath(b);
+
+        ggml_lib.addIncludePath(.{ .cwd_relative = cuda_include });
         ggml_lib.addIncludePath(.{ .cwd_relative = ggml_cuda_path_abs });
-        ggml_lib.addLibraryPath(.{ .cwd_relative = cuda_path ++ "/lib/x64" });
-        ggml_lib.linkSystemLibrary("cudart");
-        ggml_lib.linkSystemLibrary("cublas");
-        ggml_lib.linkSystemLibrary("cuda");
 
-        const nvcc_path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe";
-        const msvc_base = "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207";
-        const sdk_base = "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0";
-
-        const cl_path_win = msvc_base ++ "/bin/Hostx64/x64/cl.exe";
-        const cl_dir_win = msvc_base ++ "/bin/Hostx64/x64";
-
-        const include_var = b.fmt(
-            "{s}/include;{s}/ucrt;{s}/shared;{s}/um",
-            .{ msvc_base, sdk_base, sdk_base, sdk_base },
-        );
-
-        // Discover and compile all .cu files
-        var cuda_dir = std.fs.openDirAbsolute(ggml_cuda_path_abs, .{ .iterate = true }) catch |err| {
-            std.debug.panic("failed to open ggml-cuda dir: {s}: {any}", .{ ggml_cuda_path_abs, err });
+        // Platform-specific CUDA library paths
+        const cuda_lib_path = switch (target.result.os.tag) {
+            .windows => b.pathJoin(&.{ cuda_root, "lib", "x64" }),
+            else => b.pathJoin(&.{ cuda_root, "lib64" }),
         };
-        defer cuda_dir.close();
+        ggml_lib.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
 
-        var walker = cuda_dir.walk(b.allocator) catch @panic("oom walking ggml-cuda");
-        defer walker.deinit();
-
-        while (true) {
-            const entry_opt = walker.next() catch @panic("walk failed");
-            if (entry_opt == null) break;
-            const entry = entry_opt.?;
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.path, ".cu")) continue;
-
-            const cc = b.addSystemCommand(&.{nvcc_path});
-
-            // Explicitly set PATH to include MSVC bin dir
-            const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
-            cc.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ cl_dir_win, current_path }));
-            cc.setEnvironmentVariable("INCLUDE", include_var);
-            cc.addArg("-c");
-            cc.addArg("-O3");
-            cc.addArg("-std=c++17");
-            cc.addArg("--extended-lambda");
-            cc.addArg("--use-local-env");
-            cc.addArg("-ccbin");
-            cc.addArg(cl_path_win);
-
-            cc.addArg("-Xcompiler");
-            cc.addArg("/bigobj");
-            cc.addArg("-Xcompiler");
-            cc.addArg("/std:c++17");
-            cc.addArg("-Xcompiler");
-            cc.addArg("/w");
-
-            cc.addArg("-DGGML_USE_CUDA");
-            cc.addArg("-D_CRT_SECURE_NO_WARNINGS");
-            cc.addArg("-DGGML_VERSION=100");
-            cc.addArg("-DGGML_COMMIT=unknown");
-
-            // CUDA paths
-            cc.addArg("-I");
-            cc.addArg("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\include");
-
-            // llama.cpp paths
-            const inc2 = llama_cpp_dep.path("ggml/include").getPath(b);
-            const inc3 = llama_cpp_dep.path("ggml/src").getPath(b);
-
-            cc.addArg("-I");
-            cc.addArg(ggml_cuda_path_abs);
-            cc.addArg("-I");
-            cc.addArg(inc2);
-            cc.addArg("-I");
-            cc.addArg(inc3);
-
-            const source_path = b.fmt("{s}/{s}", .{ ggml_cuda_path_abs, entry.path });
-            cc.addArg(source_path);
-
-            cc.addArg("-o");
-            const obj_name = b.fmt("{s}.obj", .{entry.path});
-            const obj = cc.addOutputFileArg(obj_name);
-
-            ggml_lib.addObjectFile(obj);
+        // Link CUDA libraries
+        if (target.result.os.tag == .windows) {
+            ggml_lib.linkSystemLibrary("cudart");
+            ggml_lib.linkSystemLibrary("cublas");
+            ggml_lib.linkSystemLibrary("cuda");
+        } else {
+            ggml_lib.linkSystemLibrary("cudart");
+            ggml_lib.linkSystemLibrary("cublas");
+            ggml_lib.linkSystemLibrary("cuda");
         }
 
-        ggml_lib.linkSystemLibrary("cudart_static");
-        ggml_lib.linkSystemLibrary("cublas");
-        ggml_lib.linkSystemLibrary("cuda");
-        ggml_lib.addLibraryPath(.{ .cwd_relative = cuda_path ++ "/lib/x64" });
+        // Compile CUDA sources with nvcc (Windows-specific for now)
+        if (target.result.os.tag == .windows) {
+            compileCudaSources(b, ggml_lib, llama_cpp_dep, cuda_root, ggml_cuda_path_abs);
+        }
+    }
+
+    // Metal backend for Apple Silicon GPU acceleration
+    if (use_metal) {
+        // Metal backend include path
+        ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-metal"));
+
+        // Objective-C flags for .m files
+        var objc_flags: std.ArrayList([]const u8) = .empty;
+        objc_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
+        objc_flags.append(b.allocator, "-DGGML_VERSION=\"100\"") catch @panic("OOM");
+        objc_flags.append(b.allocator, "-DGGML_COMMIT=\"unknown\"") catch @panic("OOM");
+        objc_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
+        objc_flags.append(b.allocator, "-DGGML_USE_METAL") catch @panic("OOM");
+        objc_flags.append(b.allocator, "-fno-objc-arc") catch @panic("OOM");
+
+        // Metal C++ flags
+        var metal_cpp_flags: std.ArrayList([]const u8) = .empty;
+        metal_cpp_flags.append(b.allocator, "-std=c++17") catch @panic("OOM");
+        metal_cpp_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
+        metal_cpp_flags.append(b.allocator, "-DGGML_VERSION=\"100\"") catch @panic("OOM");
+        metal_cpp_flags.append(b.allocator, "-DGGML_COMMIT=\"unknown\"") catch @panic("OOM");
+        metal_cpp_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
+        metal_cpp_flags.append(b.allocator, "-DGGML_USE_METAL") catch @panic("OOM");
+
+        // Objective-C sources
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-context.m"),
+            .flags = objc_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-device.m"),
+            .flags = objc_flags.items,
+        });
+
+        // C++ sources
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal.cpp"),
+            .flags = metal_cpp_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-common.cpp"),
+            .flags = metal_cpp_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-device.cpp"),
+            .flags = metal_cpp_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-ops.cpp"),
+            .flags = metal_cpp_flags.items,
+        });
+
+        // Link Apple frameworks required for Metal
+        ggml_lib.linkFramework("Metal");
+        ggml_lib.linkFramework("Foundation");
+        ggml_lib.linkFramework("MetalPerformanceShaders");
+        ggml_lib.linkFramework("MetalPerformanceShadersGraph");
     }
 
     ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/include"));
@@ -346,9 +405,17 @@ pub fn build(b: *std.Build) void {
     llama_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-cpu"));
 
     if (use_cuda) {
-        const cuda_path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1";
-        llama_lib.addLibraryPath(.{ .cwd_relative = cuda_path ++ "/lib/x64" });
-        llama_lib.linkSystemLibrary("cudart_static");
+        const cuda_path = getCudaPath(b).?;
+        const cuda_lib_path = switch (target.result.os.tag) {
+            .windows => b.pathJoin(&.{ cuda_path, "lib", "x64" }),
+            else => b.pathJoin(&.{ cuda_path, "lib64" }),
+        };
+        llama_lib.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
+        if (target.result.os.tag == .windows) {
+            llama_lib.linkSystemLibrary("cudart_static");
+        } else {
+            llama_lib.linkSystemLibrary("cudart");
+        }
         llama_lib.linkSystemLibrary("cublas");
         llama_lib.linkSystemLibrary("cuda");
     }
@@ -411,37 +478,93 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
 
     if (use_cuda) {
-        const cuda_path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1";
-        exe.addLibraryPath(.{ .cwd_relative = cuda_path ++ "/lib/x64" });
-        exe.linkSystemLibrary("cudart_static");
+        const cuda_path = getCudaPath(b).?;
+        const cuda_lib_path = switch (target.result.os.tag) {
+            .windows => b.pathJoin(&.{ cuda_path, "lib", "x64" }),
+            else => b.pathJoin(&.{ cuda_path, "lib64" }),
+        };
+        exe.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
+
+        if (target.result.os.tag == .windows) {
+            exe.linkSystemLibrary("cudart_static");
+
+            // MSVC/SDK libs for linking - detect from environment
+            if (getMsvcLibPath(b)) |msvc_lib| {
+                exe.addLibraryPath(.{ .cwd_relative = msvc_lib });
+            }
+            if (getWindowsSdkLibPath(b, "ucrt")) |ucrt_lib| {
+                exe.addLibraryPath(.{ .cwd_relative = ucrt_lib });
+            }
+            if (getWindowsSdkLibPath(b, "um")) |um_lib| {
+                exe.addLibraryPath(.{ .cwd_relative = um_lib });
+            }
+
+            if (actual_target.query.abi == .msvc) {
+                exe.linkSystemLibrary("libcpmt");
+            }
+        } else {
+            exe.linkSystemLibrary("cudart");
+        }
         exe.linkSystemLibrary("cublas");
         exe.linkSystemLibrary("cuda");
+    }
 
-        // MSVC/SDK libs for linking
-        const msvc_lib = "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/lib/x64";
-        const sdk_lib_base = "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0";
-        exe.addLibraryPath(.{ .cwd_relative = msvc_lib });
-        exe.addLibraryPath(.{ .cwd_relative = sdk_lib_base ++ "/ucrt/x64" });
-        exe.addLibraryPath(.{ .cwd_relative = sdk_lib_base ++ "/um/x64" });
+    // Link Metal frameworks to executable
+    if (use_metal) {
+        exe.linkFramework("Metal");
+        exe.linkFramework("Foundation");
+        exe.linkFramework("MetalPerformanceShaders");
+        exe.linkFramework("MetalPerformanceShadersGraph");
 
-        if (actual_target.query.abi == .msvc) {
-            exe.linkSystemLibrary("libcpmt");
-        }
+        // Install the Metal shader file so it can be found at runtime
+        const install_metal = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal.metal"), "bin/ggml-metal.metal");
+        b.getInstallStep().dependOn(&install_metal.step);
+
+        // Headers required for Metal on-the-fly compilation
+        const install_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-common.h"), "bin/ggml-common.h");
+        b.getInstallStep().dependOn(&install_common_h.step);
+
+        const install_metal_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-common.h"), "bin/ggml-metal-common.h");
+        b.getInstallStep().dependOn(&install_metal_common_h.step);
+
+        const install_metal_impl_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-impl.h"), "bin/ggml-metal-impl.h");
+        b.getInstallStep().dependOn(&install_metal_impl_h.step);
+
+        const install_metal_device_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-device.h"), "bin/ggml-metal-device.h");
+        b.getInstallStep().dependOn(&install_metal_device_h.step);
+
+        const install_metal_ops_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-ops.h"), "bin/ggml-metal-ops.h");
+        b.getInstallStep().dependOn(&install_metal_ops_h.step);
     }
 
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
-    if (use_cuda) {
-        const cuda_bin = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/x64";
-        const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
-        run_cmd.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ cuda_bin, current_path }));
+
+    // Ensure the Metal shader is installed before running
+    run_cmd.step.dependOn(b.getInstallStep());
+
+    // Tell llama.cpp where to find the Metal shader file
+    if (use_metal) {
+        run_cmd.setEnvironmentVariable("GGML_METAL_PATH_RESOURCES", b.getInstallPath(.bin, ""));
     }
-    run_step.dependOn(&run_cmd.step);
 
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+    run_step.dependOn(&run_cmd.step);
+
+    if (use_cuda) {
+        if (getCudaPath(b)) |cuda_path| {
+            const cuda_bin = switch (target.result.os.tag) {
+                .windows => b.pathJoin(&.{ cuda_path, "bin" }),
+                else => b.pathJoin(&.{ cuda_path, "bin" }),
+            };
+            const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
+            const path_sep = if (target.result.os.tag == .windows) ";" else ":";
+            run_cmd.setEnvironmentVariable("PATH", b.fmt("{s}{s}{s}", .{ cuda_bin, path_sep, current_path }));
+        }
     }
 
     const test_step = b.step("test", "Run tests");
@@ -453,4 +576,149 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+}
+
+/// Get CUDA installation path from environment variable.
+/// Supports CUDA_PATH (Windows default) and CUDA_HOME (Linux/macOS common).
+fn getCudaPath(b: *std.Build) ?[]const u8 {
+    // Try CUDA_PATH first (Windows default)
+    if (b.graph.env_map.get("CUDA_PATH")) |path| {
+        return path;
+    }
+    // Try CUDA_HOME (common on Linux/macOS)
+    if (b.graph.env_map.get("CUDA_HOME")) |path| {
+        return path;
+    }
+    // Try common default locations
+    const default_paths = [_][]const u8{
+        "/usr/local/cuda",
+        "/opt/cuda",
+    };
+    for (default_paths) |path| {
+        if (std.fs.accessAbsolute(path, .{})) |_| {
+            return path;
+        } else |_| {}
+    }
+    return null;
+}
+
+/// Get MSVC library path from environment or common locations.
+fn getMsvcLibPath(b: *std.Build) ?[]const u8 {
+    // Try VCToolsInstallDir environment variable
+    if (b.graph.env_map.get("VCToolsInstallDir")) |vc_dir| {
+        return b.pathJoin(&.{ vc_dir, "lib", "x64" });
+    }
+
+    // Try to detect from VSINSTALLDIR
+    if (b.graph.env_map.get("VSINSTALLDIR")) |vs_dir| {
+        // This is a simplified detection - in practice you'd need to find the version
+        const vc_base = b.pathJoin(&.{ vs_dir, "VC", "Tools", "MSVC" });
+        // For now, return null if we can't find it precisely
+        _ = vc_base;
+    }
+
+    return null;
+}
+
+/// Get Windows SDK library path.
+fn getWindowsSdkLibPath(b: *std.Build, lib_type: []const u8) ?[]const u8 {
+    // Try WindowsSdkDir environment variable
+    if (b.graph.env_map.get("WindowsSdkDir")) |sdk_dir| {
+        if (b.graph.env_map.get("WindowsSDKVersion")) |sdk_ver| {
+            return b.pathJoin(&.{ sdk_dir, "Lib", sdk_ver, lib_type, "x64" });
+        }
+    }
+    return null;
+}
+
+/// Compile CUDA source files with nvcc (Windows).
+fn compileCudaSources(
+    b: *std.Build,
+    ggml_lib: *std.Build.Step.Compile,
+    llama_cpp_dep: *std.Build.Dependency,
+    cuda_root: []const u8,
+    ggml_cuda_path_abs: []const u8,
+) void {
+    const nvcc_path = b.pathJoin(&.{ cuda_root, "bin", "nvcc.exe" });
+
+    // Get MSVC paths from environment or use defaults
+    const msvc_base = b.graph.env_map.get("VCToolsInstallDir") orelse
+        "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207";
+    const sdk_include = b.graph.env_map.get("WindowsSdkDir") orelse
+        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0";
+
+    const cl_path_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64", "cl.exe" });
+    const cl_dir_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64" });
+
+    const include_var = b.fmt(
+        "{s}/include;{s}/ucrt;{s}/shared;{s}/um",
+        .{ msvc_base, sdk_include, sdk_include, sdk_include },
+    );
+
+    // Discover and compile all .cu files
+    var cuda_dir = std.fs.openDirAbsolute(ggml_cuda_path_abs, .{ .iterate = true }) catch |err| {
+        std.debug.panic("failed to open ggml-cuda dir: {s}: {any}", .{ ggml_cuda_path_abs, err });
+    };
+    defer cuda_dir.close();
+
+    var walker = cuda_dir.walk(b.allocator) catch @panic("oom walking ggml-cuda");
+    defer walker.deinit();
+
+    while (true) {
+        const entry_opt = walker.next() catch @panic("walk failed");
+        if (entry_opt == null) break;
+        const entry = entry_opt.?;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".cu")) continue;
+
+        const cc = b.addSystemCommand(&.{nvcc_path});
+
+        // Explicitly set PATH to include MSVC bin dir
+        const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
+        cc.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ cl_dir_win, current_path }));
+        cc.setEnvironmentVariable("INCLUDE", include_var);
+        cc.addArg("-c");
+        cc.addArg("-O3");
+        cc.addArg("-std=c++17");
+        cc.addArg("--extended-lambda");
+        cc.addArg("--use-local-env");
+        cc.addArg("-ccbin");
+        cc.addArg(cl_path_win);
+
+        cc.addArg("-Xcompiler");
+        cc.addArg("/bigobj");
+        cc.addArg("-Xcompiler");
+        cc.addArg("/std:c++17");
+        cc.addArg("-Xcompiler");
+        cc.addArg("/w");
+
+        cc.addArg("-DGGML_USE_CUDA");
+        cc.addArg("-D_CRT_SECURE_NO_WARNINGS");
+        cc.addArg("-DGGML_VERSION=100");
+        cc.addArg("-DGGML_COMMIT=unknown");
+
+        // CUDA include path
+        cc.addArg("-I");
+        cc.addArg(b.pathJoin(&.{ cuda_root, "include" }));
+
+        // llama.cpp paths
+        const inc2 = llama_cpp_dep.path("ggml/include").getPath(b);
+        const inc3 = llama_cpp_dep.path("ggml/src").getPath(b);
+
+        cc.addArg("-I");
+        cc.addArg(ggml_cuda_path_abs);
+        cc.addArg("-I");
+        cc.addArg(inc2);
+        cc.addArg("-I");
+        cc.addArg(inc3);
+
+        const source_path = b.fmt("{s}/{s}", .{ ggml_cuda_path_abs, entry.path });
+        cc.addArg(source_path);
+
+        cc.addArg("-o");
+        const obj_name = b.fmt("{s}.obj", .{entry.path});
+        const obj = cc.addOutputFileArg(obj_name);
+
+        ggml_lib.addObjectFile(obj);
+    }
 }
