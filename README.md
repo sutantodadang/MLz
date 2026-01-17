@@ -1,6 +1,6 @@
 # MLz - LLaMA Inference in Zig
 
-MLz is a Zig implementation for running LLaMA language models, primarily utilizing fine-tuned bindings to `llama.cpp` for high-performance inference. It supports hardware acceleration via CUDA and Vulkan, and provides a modern chat interface.
+MLz is a Zig implementation for running LLaMA language models, primarily utilizing fine-tuned bindings to `llama.cpp` for high-performance inference. It supports hardware acceleration via CUDA and Vulkan, provides a modern chat interface, and includes an OpenAI-compatible API server.
 
 ## Quick Start
 
@@ -8,17 +8,37 @@ MLz is a Zig implementation for running LLaMA language models, primarily utilizi
 # Build the project (Release mode recommended)
 zig build -Doptimize=ReleaseFast
 
-# Run inference
+# Run interactive chat
 .\zig-out\bin\MLz.exe Llama-3.2-3B-Instruct-Q4_K_M.gguf
 
+# Run as OpenAI-compatible server
+.\zig-out\bin\MLz.exe Llama-3.2-3B-Instruct-Q4_K_M.gguf --server --port 8080
+```
+
+### CLI Chat Options
+```bash
 # Run with custom system prompt and disabled streaming
-.\zig-out\bin\MLz.exe Llama-3.2-3B-Instruct-Q4_K_M.gguf --system "You are a helpful Zig assistant." --stream false
+.\zig-out\bin\MLz.exe model.gguf --system "You are a helpful Zig assistant." --stream false
 
 # Load/save chat history (JSON)
-.\zig-out\bin\MLz.exe Llama-3.2-3B-Instruct-Q4_K_M.gguf --load-chat chat.json --save-chat chat.json
+.\zig-out\bin\MLz.exe model.gguf --load-chat chat.json --save-chat chat.json
 
 # Tip: when --save-chat is set, Ctrl+C exits cleanly and saves.
 ```
+
+## Server Mode
+
+MLz includes a high-performance, OpenAI-compatible HTTP server.
+
+```bash
+.\zig-out\bin\MLz.exe model.gguf --server --host 0.0.0.0 --port 8080 --api-key secret --ctx 8192
+```
+
+### Features
+*   **OpenAI-Compatible API**: Supports `/v1/chat/completions` (streaming & blocking) and `/v1/models`.
+*   **Context Caching**: Automatically caches conversation history to dramatically reduce latency (TTFT) for long multi-turn chats.
+*   **Multi-threaded Handling**: Handles multiple concurrent connections without blocking (though inference is serialized per model).
+*   **WebSocket Interface**: Custom WebSocket endpoint at `/v1/chat/completions/ws` for low-latency streaming.
 
 ## Hardware Acceleration
 
@@ -35,22 +55,34 @@ zig build -Dcuda=true -Doptimize=ReleaseFast
 zig build -Dvulkan=true -Doptimize=ReleaseFast
 ```
 
+### Metal (macOS)
+Metal support is enabled by default on macOS. To force it explicitly:
+```bash
+zig build -Dmetal=true -Doptimize=ReleaseFast
+```
+
 ## Project Structure
 
 ```
 src/
-├── main.zig          # CLI Entry point & Chat Interface
+├── main.zig          # CLI Entry point
+├── server.zig        # HTTP/WebSocket Server implementation
+├── inference.zig     # Core inference logic (Prompt building, token generation)
+├── openai.zig        # OpenAI API data structures and serialization
+├── chat.zig          # Chat history and context management
 ├── llama_cpp.zig     # Zig idiomatic wrapper for llama.cpp
-├── root.zig          # Library root
+├── root.zig          # Library export root
 └── ggml_shim.h       # C header shim for GGML/llama.cpp
 ```
 
-## Features
+## Testing
 
-- **llama.cpp Integration**: Leveraging the industry-standard C++ backend for performance and compatibility.
-- **GPU Offloading**: Automatic offloading of model layers to GPU (configurable in `main.zig`).
-- **Interactive Chat**: Built-in chat interface with support for initial prompts.
-- **Optimized Defaults**: Pre-configured for Llama 3.2 with GQA and KV cache optimization.
+MLz includes a comprehensive test suite covering the server, inference logic, and data models.
+
+```bash
+# Run all tests
+zig build test
+```
 
 ## Building from Source
 

@@ -90,6 +90,10 @@ pub const GenerateOptions = struct {
     /// Optional abort check. If it returns true, generation stops.
     shouldStopCtx: ?*anyopaque = null,
     shouldStopFn: ?*const fn (ctx: *anyopaque) bool = null,
+
+    /// Number of tokens already processed in the KV cache.
+    /// The prompt will be evaluated starting from this index.
+    n_past: usize = 0,
 };
 
 fn shouldStop(opts: GenerateOptions) bool {
@@ -114,7 +118,7 @@ pub fn generate(
     opts: GenerateOptions,
 ) !GenerationResult {
     // Evaluate prompt (decode all tokens in chunks)
-    var i: usize = 0;
+    var i: usize = opts.n_past;
     while (i < prompt_tokens.len) {
         batch.clear();
         const chunk_size: usize = @min(prompt_tokens.len - i, @as(usize, @intCast(batch.capacity)));

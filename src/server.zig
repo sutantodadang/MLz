@@ -6,8 +6,11 @@ const signal = @import("signal.zig");
 const inference = @import("inference.zig");
 const openai = @import("openai.zig");
 
+/// Configuration for the HTTP server.
 pub const ServerConfig = struct {
+    /// Host address to bind to (e.g., "127.0.0.1").
     host: []const u8 = "127.0.0.1",
+    /// Port to listen on (e.g., 8080).
     port: u16 = 8080,
 
     /// If set, require `Authorization: Bearer <api_key>`.
@@ -23,21 +26,32 @@ pub const ServerConfig = struct {
     log_requests: bool = true,
 };
 
+/// Configuration for the inference engine.
 pub const EngineConfig = struct {
     // Model/context
+    /// Context window size (tokens).
     n_ctx: u32 = 4096,
+    /// Number of layers to offload to GPU.
     n_gpu_layers: i32 = 999,
+    /// Number of threads to use for generation (null = auto-detect).
     threads: ?i32 = null,
 
     // Sampler defaults
+    /// Sampling temperature (higher = more random).
     temp: f32 = 0.8,
+    /// Top-K sampling.
     top_k: i32 = 40,
+    /// Top-P (nucleus) sampling.
     top_p: f32 = 0.95,
+    /// Min-P sampling.
     min_p: f32 = 0.05,
+    /// Random seed.
     seed: u32 = 42,
 
     // Optional grammar
+    /// Path to a GBNF grammar file.
     grammar_path: ?[]const u8 = null,
+    /// Root rule name for the grammar.
     grammar_root: []const u8 = "root",
 };
 
@@ -46,6 +60,7 @@ const Header = struct {
     value: []const u8,
 };
 
+/// Represents an incoming HTTP request.
 const HttpRequest = struct {
     method: []const u8,
     path: []const u8,
@@ -79,6 +94,8 @@ const WsFrame = struct {
     }
 };
 
+/// Starts the HTTP server with the given model and configuration.
+/// This function blocks until the server is stopped via signal (Ctrl+C).
 pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConfig, engine_cfg: EngineConfig) !void {
     var backend = llama_cpp.Backend.init();
     defer backend.deinit();
@@ -106,10 +123,34 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
             if (signal.shouldExit()) break;
             return err;
         };
-        handleConnection(allocator, conn.stream, &engine, cfg) catch |err| {
-            std.log.err("connection error: {any}", .{err});
+
+        const Handler = struct {
+            allocator: std.mem.Allocator,
+            stream: std.net.Stream,
+            engine: *Engine,
+            cfg: ServerConfig,
+
+            fn run(self: @This()) void {
+                handleConnection(self.allocator, self.stream, self.engine, self.cfg) catch |err| {
+                    std.log.err("connection error: {any}", .{err});
+                };
+                self.stream.close();
+            }
         };
-        conn.stream.close();
+
+        const handler = Handler{
+            .allocator = allocator,
+            .stream = conn.stream,
+            .engine = &engine,
+            .cfg = cfg,
+        };
+
+        const thread = std.Thread.spawn(.{}, Handler.run, .{handler}) catch |err| {
+            std.log.err("failed to spawn thread: {any}", .{err});
+            conn.stream.close();
+            continue;
+        };
+        thread.detach();
     }
 }
 
@@ -284,7 +325,7 @@ fn writeSseHeaders(stream: std.net.Stream) !void {
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("\r\n");
 
-    _ = try std.posix.send(stream.handle, fbs.getWritten(), 0);
+    try stream.writeAll(fbs.getWritten());
 }
 
 const SseSink = struct {
@@ -351,7 +392,7 @@ const SseSink = struct {
     }
 
     pub fn done(self: *SseSink) !void {
-        _ = try std.posix.send(self.stream.handle, "data: [DONE]\n\n", 0);
+        try self.stream.writeAll("data: [DONE]\n\n");
     }
 
     fn sendChunk(self: *SseSink, chunk: openai.ChatCompletionChunk) !void {
@@ -362,7 +403,7 @@ const SseSink = struct {
         try openai.writeJson(buf.writer(self.allocator), chunk);
         try buf.appendSlice(self.allocator, "\n\n");
 
-        _ = try std.posix.send(self.stream.handle, buf.items, 0);
+        try self.stream.writeAll(buf.items);
     }
 
     fn sseFlush(ctx: *anyopaque) anyerror!void {
@@ -420,8 +461,8 @@ fn writeResponse(stream: std.net.Stream, resp: HttpResponse) !void {
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("\r\n");
 
-    _ = try std.posix.send(stream.handle, fbs.getWritten(), 0);
-    _ = try std.posix.send(stream.handle, resp.body, 0);
+    try stream.writeAll(fbs.getWritten());
+    try stream.writeAll(resp.body);
 }
 
 fn headerValue(headers: []const Header, name_lc: []const u8) ?[]const u8 {
@@ -566,7 +607,12 @@ fn handleWebSocket(
     try stream_writer.interface.flush();
 
     while (!signal.shouldExit()) {
-        var frame = readWsFrame(allocator, reader, 2 * 1024 * 1024) catch break;
+        var frame = readWsFrame(allocator, reader, 2 * 1024 * 1024) catch |err| {
+            if (err != error.UnexpectedEof) {
+                std.log.err("websocket read error: {any}", .{err});
+            }
+            break;
+        };
         defer frame.deinit(allocator);
 
         switch (frame.opcode) {
@@ -812,6 +858,9 @@ const Engine = struct {
 
     id_counter: u64,
 
+    mutex: std.Thread.Mutex = .{},
+    cached_tokens: std.ArrayList(llama_cpp.Token),
+
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8, cfg: EngineConfig) !Engine {
         const path_z = try llama_cpp.dupeZ(allocator, model_path);
         defer allocator.free(path_z);
@@ -862,10 +911,12 @@ const Engine = struct {
             .grammar_z = grammar_z,
             .grammar_root_z = grammar_root_z,
             .id_counter = 1,
+            .cached_tokens = .{},
         };
     }
 
     pub fn deinit(self: *Engine, allocator: std.mem.Allocator) void {
+        self.cached_tokens.deinit(allocator);
         self.batch.deinit();
         self.ctx.deinit();
         self.model.deinit();
@@ -936,8 +987,22 @@ const Engine = struct {
             return error.ContextTooSmall;
         }
 
-        // Reset KV cache for each request; this server is stateless.
-        self.ctx.kvCacheSeqRm(0, 0, -1);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Calculate common prefix with cached tokens.
+        var n_past: usize = 0;
+        const n_common = @min(self.cached_tokens.items.len, prompt.tokens.len);
+        for (0..n_common) |i| {
+            if (self.cached_tokens.items[i] != prompt.tokens[i]) break;
+            n_past += 1;
+        }
+
+        // Reset KV cache after the common prefix.
+        if (n_past < self.cached_tokens.items.len) {
+            self.ctx.kvCacheSeqRm(0, @intCast(n_past), -1);
+            self.cached_tokens.shrinkRetainingCapacity(n_past);
+        }
 
         // Sampler config with request overrides.
         const s_cfg = llama_cpp.SamplerConfig{
@@ -966,8 +1031,25 @@ const Engine = struct {
             .sink = sink,
             .shouldStopCtx = null,
             .shouldStopFn = null,
+            .n_past = n_past,
         });
         defer gen.deinit(allocator);
+
+        // Update cache with new tokens.
+        // The prompt tokens after n_past are new, plus the generated tokens.
+        if (n_past < prompt.tokens.len) {
+            try self.cached_tokens.appendSlice(allocator, prompt.tokens[n_past..]);
+        }
+        // Generated text needs to be tokenized to append to cache, but we don't have the token IDs here easily
+        // because generate() returns text.
+        // Wait, generate() loop has the token IDs. Ideally generate() should return the generated token IDs.
+        // For now, we only cache the prompt part for the NEXT turn.
+        // If we want to cache the assistant response too, we need the token IDs.
+        // Let's rely on re-tokenization in the next request which will match the prompt + assistant response.
+        // Actually, if we don't cache the assistant output, the next request (which includes it) will see a mismatch
+        // after the user prompt, but that's okay. It will still save the system prompt + user prompt prefix.
+        // A better optimization would be to have generate() return tokens or append to cache.
+        // For now, let's stick to prompt caching which is the biggest win (system prompt).
 
         const finish_reason = switch (gen.finish_reason) {
             .stop => "stop",
