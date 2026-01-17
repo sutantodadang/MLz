@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
@@ -48,9 +51,32 @@ jobs:
       - name: Test
         if: matrix.test
         run: zig build test -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="zig-out/bin/MLz"
+          # Ensure binary is executable
+          chmod +x "$BIN" || true
+          # Create archive name
+          OUT="dist/MLz-${{ matrix.target }}.tar.gz"
+          # Archive
+          tar -C "$(dirname "$BIN")" -czf "$OUT" "$(basename "$BIN")"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bin = "zig-out/bin/MLz.exe"
+          $out = "dist/MLz-${{ matrix.target }}.zip"
+          Compress-Archive -Path $bin -DestinationPath $out -Force
         
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: zig-out/bin/*
+          files: dist/*
           fail_on_unmatched_files: true
