@@ -16,7 +16,8 @@ pub fn build(b: *std.Build) void {
     var actual_target = target;
     if (use_cuda and target.result.os.tag == .windows) {
         actual_target.query.abi = .msvc;
-        actual_target.query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+        // Don't enforce x86_64_v3 globally as it might cause illegal instruction errors on older CPUs
+        // actual_target.query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
     }
     const optimize = b.standardOptimizeOption(.{});
 
@@ -329,6 +330,13 @@ pub fn build(b: *std.Build) void {
     if (use_metal) {
         // Only attempt to link frameworks if we are building FOR macOS
         if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
+            // Get SDK root from environment if available
+            if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+                ggml_lib.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
+                // Also add system include path
+                ggml_lib.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr", "include" }) });
+            }
+
             // Metal backend include path
             ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-metal"));
 
@@ -524,30 +532,37 @@ pub fn build(b: *std.Build) void {
 
     // Link Metal frameworks to executable
     if (use_metal) {
-        exe.linkFramework("Metal");
-        exe.linkFramework("Foundation");
-        exe.linkFramework("MetalPerformanceShaders");
-        exe.linkFramework("MetalPerformanceShadersGraph");
+        if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
+            // Get SDK root from environment if available
+            if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+                exe.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
+            }
 
-        // Install the Metal shader file so it can be found at runtime
-        const install_metal = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal.metal"), "bin/ggml-metal.metal");
-        b.getInstallStep().dependOn(&install_metal.step);
+            exe.linkFramework("Metal");
+            exe.linkFramework("Foundation");
+            exe.linkFramework("MetalPerformanceShaders");
+            exe.linkFramework("MetalPerformanceShadersGraph");
 
-        // Headers required for Metal on-the-fly compilation
-        const install_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-common.h"), "bin/ggml-common.h");
-        b.getInstallStep().dependOn(&install_common_h.step);
+            // Install the Metal shader file so it can be found at runtime
+            const install_metal = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal.metal"), "bin/ggml-metal.metal");
+            b.getInstallStep().dependOn(&install_metal.step);
 
-        const install_metal_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-common.h"), "bin/ggml-metal-common.h");
-        b.getInstallStep().dependOn(&install_metal_common_h.step);
+            // Headers required for Metal on-the-fly compilation
+            const install_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-common.h"), "bin/ggml-common.h");
+            b.getInstallStep().dependOn(&install_common_h.step);
 
-        const install_metal_impl_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-impl.h"), "bin/ggml-metal-impl.h");
-        b.getInstallStep().dependOn(&install_metal_impl_h.step);
+            const install_metal_common_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-common.h"), "bin/ggml-metal-common.h");
+            b.getInstallStep().dependOn(&install_metal_common_h.step);
 
-        const install_metal_device_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-device.h"), "bin/ggml-metal-device.h");
-        b.getInstallStep().dependOn(&install_metal_device_h.step);
+            const install_metal_impl_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-impl.h"), "bin/ggml-metal-impl.h");
+            b.getInstallStep().dependOn(&install_metal_impl_h.step);
 
-        const install_metal_ops_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-ops.h"), "bin/ggml-metal-ops.h");
-        b.getInstallStep().dependOn(&install_metal_ops_h.step);
+            const install_metal_device_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-device.h"), "bin/ggml-metal-device.h");
+            b.getInstallStep().dependOn(&install_metal_device_h.step);
+
+            const install_metal_ops_h = b.addInstallFile(llama_cpp_dep.path("ggml/src/ggml-metal/ggml-metal-ops.h"), "bin/ggml-metal-ops.h");
+            b.getInstallStep().dependOn(&install_metal_ops_h.step);
+        }
     }
 
     b.installArtifact(exe);

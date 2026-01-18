@@ -37,13 +37,21 @@ pub fn main() !void {
     var server_port: u16 = 8080;
     var server_api_key: ?[]const u8 = null;
 
+    var prompt_mode: bool = false;
+    var user_prompt: ?[]const u8 = null;
+
     var arg_idx: usize = 1;
     while (arg_idx < args.len) : (arg_idx += 1) {
         const arg = args[arg_idx];
         if (std.mem.eql(u8, arg, "--temp")) {
             arg_idx += 1;
             if (arg_idx < args.len) temp = std.fmt.parseFloat(f32, args[arg_idx]) catch temp;
-        } else if (std.mem.eql(u8, arg, "--top-k")) {
+        } else if (std.mem.eql(u8, arg, "--prompt")) {
+            arg_idx += 1;
+            if (arg_idx < args.len) {
+                user_prompt = args[arg_idx];
+                prompt_mode = true;
+            }
             arg_idx += 1;
             if (arg_idx < args.len) top_k = std.fmt.parseInt(i32, args[arg_idx], 10) catch top_k;
         } else if (std.mem.eql(u8, arg, "--top-p")) {
@@ -111,7 +119,8 @@ pub fn main() !void {
             \\  <model_path>       Path to GGUF model file
             \\
             \\Options:
-            \\  --temp <float>       Temperature (default: 0.8)
+            \\  --prompt <string>     Single prompt mode (non-interactive)
+            \\  --temp <float>        Temperature (default: 0.8)
             \\  --top-k <int>         Top-K (default: 40)
             \\  --top-p <float>       Top-P (default: 0.95)
             \\  --min-p <float>       Min-P (default: 0.05)
@@ -254,6 +263,75 @@ pub fn main() !void {
     const stdin_reader = std.fs.File.stdin().deprecatedReader();
     const stdin_is_tty = std.fs.File.stdin().isTty();
     const use_color = terminal.enableAnsiColors();
+
+    if (prompt_mode) {
+        if (user_prompt) |input| {
+            // Allocate user message with errdefer for safety
+            const user_z = try chat.dupeZ(allocator, input);
+            errdefer allocator.free(user_z);
+            try msgs.append(allocator, .{ .role = .user, .content = user_z });
+
+            // Build prompt
+            const ctx_reserve: usize = 256;
+            const ctx_limit: usize = @as(usize, @intCast(cparams.n_ctx)) - ctx_reserve;
+            var prompt = try buildPrompt(allocator, tmpl, vocab, msgs.items);
+            if (prompt.tokens.len > ctx_limit) {
+                std.debug.print("[Input too large for context]\n", .{});
+                prompt.deinit(allocator);
+                return;
+            }
+            defer prompt.deinit(allocator);
+
+            const prompt_tokens = prompt.tokens;
+
+            // Decode prompt
+            var i: usize = 0;
+            while (i < prompt_tokens.len) {
+                batch.clear();
+                const chunk_size = @min(prompt_tokens.len - i, @as(usize, @intCast(cparams.n_batch)));
+                for (0..chunk_size) |j| {
+                    try batch.add(prompt_tokens[i + j], @intCast(i + j), &[_]i32{0}, i + j == prompt_tokens.len - 1);
+                }
+                try ctx.decode(batch.handle);
+                i += chunk_size;
+            }
+            try eval_tokens.appendSlice(allocator, prompt_tokens);
+
+            // Generate response
+            var n_gen: usize = 0;
+            while (n_gen < 4096) : (n_gen += 1) {
+                if (signal.shouldExit()) break;
+                if (eval_tokens.items.len >= cparams.n_ctx) break;
+
+                const token = sampler.sampleLast(ctx);
+                if (llama_cpp.c.llama_vocab_is_eog(vocab, token)) break;
+
+                // Use stack buffer for common case, heap for rare large tokens
+                var piece_buf: [256]u8 = undefined;
+                const n = llama_cpp.c.llama_token_to_piece(vocab, token, &piece_buf, piece_buf.len, 0, false);
+                if (n > 0) {
+                    const piece = piece_buf[0..@intCast(n)];
+                    try stdout.writeAll(piece);
+                } else if (n < 0) {
+                    const actual_n: usize = @intCast(-n);
+                    const large_buf = try allocator.alloc(u8, actual_n);
+                    defer allocator.free(large_buf);
+                    const n2 = llama_cpp.c.llama_token_to_piece(vocab, token, large_buf.ptr, @intCast(large_buf.len), 0, false);
+                    if (n2 > 0) {
+                        const piece = large_buf[0..@intCast(n2)];
+                        try stdout.writeAll(piece);
+                    }
+                }
+
+                batch.clear();
+                try batch.add(token, @intCast(eval_tokens.items.len), &[_]i32{0}, true);
+                try ctx.decode(batch.handle);
+                try eval_tokens.append(allocator, token);
+            }
+            try stdout.writeAll("\n");
+        }
+        return;
+    }
 
     try stdout.print("\nMLz Llama Chat Interface\n", .{});
     try stdout.print("Model context training length: {d}\n", .{model.nCtxTrain()});
