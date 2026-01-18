@@ -78,7 +78,7 @@ jobs:
         if: matrix.cuda
         uses: Jimver/cuda-toolkit@v0.2.14
         with:
-          cuda: '12.4.1'
+          cuda: '12.4.0'
 
       - name: Setup Vulkan (Linux)
         if: matrix.vulkan && runner.os == 'Linux'
@@ -86,13 +86,23 @@ jobs:
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-jammy.list https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-jammy.list
           sudo apt update
+          # Install dependencies required by Vulkan SDK
+          sudo apt install -y libyaml-cpp-dev
           sudo apt install -y vulkan-sdk
 
       - name: Setup Vulkan (Windows)
         if: matrix.vulkan && runner.os == 'Windows'
         run: |
-          curl -L "https://sdk.lunarg.com/sdk/download/1.3.250.0/windows/VulkanSDK-1.3.250.0-Installer.exe" -o vulkan-sdk.exe
-          ./vulkan-sdk.exe --accept-licenses --default-answer --confirm-command install
+          $url = "https://sdk.lunarg.com/sdk/download/1.3.250.0/windows/VulkanSDK-1.3.250.0-Installer.exe"
+          $output = "vulkan-sdk.exe"
+          
+          # Use .NET WebClient for reliable download
+          $webClient = New-Object System.Net.WebClient
+          $webClient.DownloadFile($url, $output)
+          
+          # Run installer
+          Start-Process -FilePath ".\$output" -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
+          
           echo "VULKAN_SDK=C:\VulkanSDK\1.3.250.0" >> $env:GITHUB_ENV
         shell: pwsh
 
@@ -101,6 +111,7 @@ jobs:
           ZIG_FLAGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
           if [[ "${{ matrix.cuda }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dcuda=true"; fi
           if [[ "${{ matrix.vulkan }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dvulkan=true"; fi
+          # Explicitly set C++ standard to c++17 for all builds to match flags in build.zig
           zig build $ZIG_FLAGS
         shell: bash
 
