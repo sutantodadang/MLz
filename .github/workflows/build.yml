@@ -25,11 +25,11 @@ jobs:
             os: ubuntu-latest
             test: false
           - name: Windows x86_64
-            target: x86_64-windows
+            target: x86_64-windows-msvc
             os: windows-latest
             test: true
           - name: Windows aarch64
-            target: aarch64-windows
+            target: aarch64-windows-msvc
             os: windows-latest
             test: false
           - name: macOS ARM64
@@ -44,6 +44,10 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+
+      - name: Set SDKROOT (macOS)
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> $GITHUB_ENV
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
