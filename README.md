@@ -13,6 +13,9 @@ zig build -Doptimize=ReleaseFast
 
 # Run as OpenAI-compatible server
 .\zig-out\bin\MLz.exe Llama-3.2-3B-Instruct-Q4_K_M.gguf --server --port 8080
+
+# Run non-interactive prompt
+.\zig-out\bin\MLz.exe model.gguf --prompt "Explain quantum computing"
 ```
 
 ### CLI Chat Options
@@ -22,6 +25,9 @@ zig build -Doptimize=ReleaseFast
 
 # Load/save chat history (JSON)
 .\zig-out\bin\MLz.exe model.gguf --load-chat chat.json --save-chat chat.json
+
+# Run single prompt (non-interactive mode)
+.\zig-out\bin\MLz.exe model.gguf --prompt "Write a hello world in Zig"
 
 # Tip: when --save-chat is set, Ctrl+C exits cleanly and saves.
 ```
@@ -48,24 +54,25 @@ MLz supports GPU acceleration out of the box. You can enable it during the build
 ```bash
 zig build -Dcuda=true -Doptimize=ReleaseFast
 ```
-*Note: On Windows, this requires the CUDA Toolkit and will automatically target the MSVC ABI for compatibility.*
+*Note: On Windows, this requires the CUDA Toolkit (v12.x) and MSVC. The build system will automatically detect the CUDA path if `CUDA_PATH` or `CUDA_HOME` is set.*
 
-### Vulkan
+### Vulkan (Cross-Platform)
 ```bash
 zig build -Dvulkan=true -Doptimize=ReleaseFast
 ```
+*Requires Vulkan SDK to be installed.*
 
 ### Metal (macOS)
-Metal support is enabled by default on macOS. To force it explicitly:
+Metal support is enabled by default on macOS/iOS builds.
 ```bash
-zig build -Dmetal=true -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Project Structure
 
 ```
 src/
-├── main.zig          # CLI Entry point
+├── main.zig          # CLI Entry point (Interactive/Prompt/Server)
 ├── server.zig        # HTTP/WebSocket Server implementation
 ├── inference.zig     # Core inference logic (Prompt building, token generation)
 ├── openai.zig        # OpenAI API data structures and serialization
