@@ -30,6 +30,7 @@ pub fn main() !void {
     var load_chat_path: ?[]const u8 = null;
     var grammar_path: ?[]const u8 = null;
     var grammar_root: []const u8 = "root";
+    var draft_model_path: ?[]const u8 = null;
 
     // Server mode configuration
     var server_mode: bool = false;
@@ -93,6 +94,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--grammar-root")) {
             arg_idx += 1;
             if (arg_idx < args.len) grammar_root = args[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--draft-model")) {
+            arg_idx += 1;
+            if (arg_idx < args.len) draft_model_path = args[arg_idx];
         } else if (std.mem.eql(u8, arg, "--server")) {
             server_mode = true;
         } else if (std.mem.eql(u8, arg, "--host")) {
@@ -134,6 +138,7 @@ pub fn main() !void {
             \\  --save-chat <file>    Save conversation to JSON
             \\  --grammar <file>      Constrain output with a GBNF grammar file
             \\  --grammar-root <name> Start rule name for grammar (default: root)
+            \\  --draft-model <path>  Path to draft model for speculative decoding
             \\  --server              Run as an OpenAI-compatible server
             \\  --host <string>        Server host (default: 127.0.0.1)
             \\  --port <int>           Server port (default: 8080)
@@ -156,11 +161,11 @@ pub fn main() !void {
             .threads = threads,
             .temp = temp,
             .top_k = top_k,
-            .top_p = top_p,
             .min_p = min_p,
             .seed = seed,
             .grammar_path = grammar_path,
             .grammar_root = grammar_root,
+            .draft_model_path = draft_model_path,
         });
         return;
     }

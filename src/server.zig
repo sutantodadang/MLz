@@ -53,6 +53,9 @@ pub const EngineConfig = struct {
     grammar_path: ?[]const u8 = null,
     /// Root rule name for the grammar.
     grammar_root: []const u8 = "root",
+
+    /// Path to a draft model for speculative decoding.
+    draft_model_path: ?[]const u8 = null,
 };
 
 const Header = struct {
@@ -852,6 +855,11 @@ const Engine = struct {
 
     batch: llama_cpp.Batch,
 
+    draft_model: ?llama_cpp.Model = null,
+    draft_ctx: ?llama_cpp.Context = null,
+    draft_batch: ?llama_cpp.Batch = null,
+    draft_sampler: ?llama_cpp.Sampler = null,
+
     cfg: EngineConfig,
     grammar_z: ?[:0]u8,
     grammar_root_z: ?[:0]u8,
@@ -900,6 +908,34 @@ const Engine = struct {
             grammar_root_z = try chat.dupeZ(allocator, cfg.grammar_root);
         }
 
+        var draft_model: ?llama_cpp.Model = null;
+        var draft_ctx: ?llama_cpp.Context = null;
+        var draft_batch: ?llama_cpp.Batch = null;
+        var draft_sampler: ?llama_cpp.Sampler = null;
+
+        if (cfg.draft_model_path) |draft_path| {
+            const draft_path_z = try llama_cpp.dupeZ(allocator, draft_path);
+            defer allocator.free(draft_path_z);
+
+            var draft_params = mparams;
+            draft_params.n_gpu_layers = -1; // Try to retain some for main model, or simple defaults
+
+            draft_model = try llama_cpp.Model.load(draft_path_z, draft_params);
+
+            var draft_cparams = cparams;
+            draft_cparams.n_batch = 512; // Smaller batch for draft
+
+            draft_ctx = try llama_cpp.Context.init(draft_model.?, draft_cparams);
+            draft_batch = llama_cpp.Batch.init(512, 0, 1);
+
+            // Greedier sampling for draft usually works better for speculation efficiency
+            draft_sampler = try llama_cpp.Sampler.initAdvanced(0.0, 1, 1.0, 42);
+        }
+        errdefer if (draft_model) |m| m.deinit();
+        errdefer if (draft_ctx) |c| c.deinit();
+        errdefer if (draft_batch) |b| b.deinit();
+        errdefer if (draft_sampler) |s| s.deinit();
+
         return .{
             .model_path = model_path,
             .model = model,
@@ -907,6 +943,10 @@ const Engine = struct {
             .vocab = vocab,
             .tmpl = tmpl,
             .batch = llama_cpp.Batch.init(1024, 0, 1),
+            .draft_model = draft_model,
+            .draft_ctx = draft_ctx,
+            .draft_batch = draft_batch,
+            .draft_sampler = draft_sampler,
             .cfg = cfg,
             .grammar_z = grammar_z,
             .grammar_root_z = grammar_root_z,
@@ -918,6 +958,10 @@ const Engine = struct {
     pub fn deinit(self: *Engine, allocator: std.mem.Allocator) void {
         self.cached_tokens.deinit(allocator);
         self.batch.deinit();
+        if (self.draft_sampler) |s| s.deinit();
+        if (self.draft_batch) |b| b.deinit();
+        if (self.draft_ctx) |c| c.deinit();
+        if (self.draft_model) |m| m.deinit();
         self.ctx.deinit();
         self.model.deinit();
         if (self.grammar_z) |g| allocator.free(g);
@@ -1040,16 +1084,8 @@ const Engine = struct {
         if (n_past < prompt.tokens.len) {
             try self.cached_tokens.appendSlice(allocator, prompt.tokens[n_past..]);
         }
-        // Generated text needs to be tokenized to append to cache, but we don't have the token IDs here easily
-        // because generate() returns text.
-        // Wait, generate() loop has the token IDs. Ideally generate() should return the generated token IDs.
-        // For now, we only cache the prompt part for the NEXT turn.
-        // If we want to cache the assistant response too, we need the token IDs.
-        // Let's rely on re-tokenization in the next request which will match the prompt + assistant response.
-        // Actually, if we don't cache the assistant output, the next request (which includes it) will see a mismatch
-        // after the user prompt, but that's okay. It will still save the system prompt + user prompt prefix.
-        // A better optimization would be to have generate() return tokens or append to cache.
-        // For now, let's stick to prompt caching which is the biggest win (system prompt).
+        // Cache the generated assistant tokens for the next turn.
+        try self.cached_tokens.appendSlice(allocator, gen.tokens);
 
         const finish_reason = switch (gen.finish_reason) {
             .stop => "stop",

@@ -23,9 +23,13 @@ pub fn build(b: *std.Build) void {
 
     const use_vulkan = b.option(bool, "vulkan", "Use Vulkan for GPU acceleration") orelse false;
 
-    // Metal is auto-enabled on macOS/iOS unless explicitly disabled
     const use_metal_default = target.result.os.tag == .macos or target.result.os.tag == .ios;
     const use_metal = b.option(bool, "metal", "Use Metal for GPU acceleration (macOS/iOS)") orelse use_metal_default;
+
+    // Use SDKROOT from environment if available (fixes CI builds on macOS)
+    if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+        b.sysroot = sdk_root;
+    }
 
     // ggml's C sources intentionally do pointer arithmetic on null pointers
     // (e.g. for size calculations). In Debug this can trap under Zig/clang's
