@@ -26,9 +26,28 @@ pub fn build(b: *std.Build) void {
     const use_metal_default = target.result.os.tag == .macos or target.result.os.tag == .ios;
     const use_metal = b.option(bool, "metal", "Use Metal for GPU acceleration (macOS/iOS)") orelse use_metal_default;
 
-    // Use SDKROOT from environment if available (fixes CI builds on macOS)
-    if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
-        b.sysroot = sdk_root;
+    // Handle macOS SDK root detection
+    if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
+        if (b.sysroot == null) {
+            if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+                b.sysroot = sdk_root;
+            } else {
+                // Try to detect via xcrun on macOS hosts
+                const argv = &[_][]const u8{ "xcrun", "--show-sdk-path" };
+                if (std.process.Child.run(.{ .allocator = b.allocator, .argv = argv })) |res| {
+                    defer {
+                        b.allocator.free(res.stdout);
+                        b.allocator.free(res.stderr);
+                    }
+                    if (res.term == .Exited and res.term.Exited == 0) {
+                        const trimmed = std.mem.trim(u8, res.stdout, " \n\r");
+                        if (trimmed.len > 0) {
+                            b.sysroot = b.allocator.dupe(u8, trimmed) catch @panic("OOM");
+                        }
+                    }
+                } else |_| {}
+            }
+        }
     }
 
     // ggml's C sources intentionally do pointer arithmetic on null pointers
@@ -334,8 +353,8 @@ pub fn build(b: *std.Build) void {
     if (use_metal) {
         // Only attempt to link frameworks if we are building FOR macOS
         if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
-            // Get SDK root from sysroot or environment
-            if (b.sysroot orelse b.graph.env_map.get("SDKROOT")) |sdk_root| {
+            // Get SDK root from sysroot (populated above)
+            if (b.sysroot) |sdk_root| {
                 ggml_lib.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
                 // Also add system include path
                 ggml_lib.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr", "include" }) });
@@ -537,8 +556,8 @@ pub fn build(b: *std.Build) void {
     // Link Metal frameworks to executable
     if (use_metal) {
         if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
-            // Get SDK root from sysroot or environment
-            if (b.sysroot orelse b.graph.env_map.get("SDKROOT")) |sdk_root| {
+            // Get SDK root from sysroot
+            if (b.sysroot) |sdk_root| {
                 exe.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
             }
 
