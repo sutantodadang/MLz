@@ -13,154 +13,63 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var path: ?[]const u8 = null;
-
-    // Default configuration
-    var temp: f32 = 0.8;
-    var top_k: i32 = 40;
-    var top_p: f32 = 0.95;
-    var min_p: f32 = 0.05;
-    var seed: u32 = 42;
-    var n_ctx: u32 = 4096;
-    var n_gpu_layers: i32 = 999;
-    var threads: ?i32 = null;
-    var stream: bool = true;
-    var system_prompt: ?[]const u8 = null;
-    var save_chat_path: ?[]const u8 = null;
-    var load_chat_path: ?[]const u8 = null;
-    var grammar_path: ?[]const u8 = null;
-    var grammar_root: []const u8 = "root";
-
-    // Server mode configuration
-    var server_mode: bool = false;
-    var server_host: []const u8 = "127.0.0.1";
-    var server_port: u16 = 8080;
-    var server_api_key: ?[]const u8 = null;
-
-    var prompt_mode: bool = false;
-    var user_prompt: ?[]const u8 = null;
-
-    var arg_idx: usize = 1;
-    while (arg_idx < args.len) : (arg_idx += 1) {
-        const arg = args[arg_idx];
-        if (std.mem.eql(u8, arg, "--temp")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) temp = std.fmt.parseFloat(f32, args[arg_idx]) catch temp;
-        } else if (std.mem.eql(u8, arg, "--prompt")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) {
-                user_prompt = args[arg_idx];
-                prompt_mode = true;
-            }
-            arg_idx += 1;
-            if (arg_idx < args.len) top_k = std.fmt.parseInt(i32, args[arg_idx], 10) catch top_k;
-        } else if (std.mem.eql(u8, arg, "--top-p")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) top_p = std.fmt.parseFloat(f32, args[arg_idx]) catch top_p;
-        } else if (std.mem.eql(u8, arg, "--min-p")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) min_p = std.fmt.parseFloat(f32, args[arg_idx]) catch min_p;
-        } else if (std.mem.eql(u8, arg, "--seed")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) seed = std.fmt.parseInt(u32, args[arg_idx], 10) catch seed;
-        } else if (std.mem.eql(u8, arg, "--ctx")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) n_ctx = std.fmt.parseInt(u32, args[arg_idx], 10) catch n_ctx;
-        } else if (std.mem.eql(u8, arg, "--ngl")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) n_gpu_layers = std.fmt.parseInt(i32, args[arg_idx], 10) catch n_gpu_layers;
-        } else if (std.mem.eql(u8, arg, "--threads")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) threads = std.fmt.parseInt(i32, args[arg_idx], 10) catch threads;
-        } else if (std.mem.eql(u8, arg, "--stream")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) {
-                const val = args[arg_idx];
-                stream = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
-            }
-        } else if (std.mem.eql(u8, arg, "--system")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) system_prompt = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--save-chat")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) save_chat_path = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--load-chat")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) load_chat_path = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--grammar")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) grammar_path = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--grammar-root")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) grammar_root = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--server")) {
-            server_mode = true;
-        } else if (std.mem.eql(u8, arg, "--host")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) server_host = args[arg_idx];
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) server_port = std.fmt.parseInt(u16, args[arg_idx], 10) catch server_port;
-        } else if (std.mem.eql(u8, arg, "--api-key")) {
-            arg_idx += 1;
-            if (arg_idx < args.len) server_api_key = args[arg_idx];
-        } else if (!std.mem.startsWith(u8, arg, "--")) {
-            if (path == null) {
-                path = arg;
-            }
+    const config = @import("config.zig");
+    // Parse configuration
+    const cfg = config.Config.parse(allocator, args) catch |err| {
+        switch (err) {
+            error.MissingModelPath => {
+                std.debug.print(
+                    \\Usage: {s} <model_path> [options]
+                    \\
+                    \\Positional:
+                    \\  <model_path>       Path to GGUF model file
+                    \\
+                    \\Options:
+                    \\  --prompt <string>     Single prompt mode (non-interactive)
+                    \\  --temp <float>        Temperature (default: 0.8)
+                    \\  --top-k <int>         Top-K (default: 40)
+                    \\  --top-p <float>       Top-P (default: 0.95)
+                    \\  --min-p <float>       Min-P (default: 0.05)
+                    \\  --seed <int>          Seed (default: 42)
+                    \\  --ctx <int>           Context size (default: 4096)
+                    \\  --ngl <int>           GPU layers (default: 999)
+                    \\  --threads <int>       Number of threads (default: CPU count)
+                    \\  --stream <bool>       Stream output (default: true)
+                    \\  --system <string>     System prompt
+                    \\  --load-chat <file>    Load conversation from JSON
+                    \\  --save-chat <file>    Save conversation to JSON
+                    \\  --grammar <file>      Constrain output with a GBNF grammar file
+                    \\  --grammar-root <name> Start rule name for grammar (default: root)
+                    \\  --server              Run as an OpenAI-compatible server
+                    \\  --host <string>        Server host (default: 127.0.0.1)
+                    \\  --port <int>           Server port (default: 8080)
+                    \\  --api-key <string>     Require Authorization: Bearer <api-key>
+                    \\
+                , .{args[0]});
+                return;
+            },
+            else => return err,
         }
-    }
+    };
 
-    if (path == null) {
-        std.debug.print(
-            \\Usage: {s} <model_path> [options]
-            \\
-            \\Positional:
-            \\  <model_path>       Path to GGUF model file
-            \\
-            \\Options:
-            \\  --prompt <string>     Single prompt mode (non-interactive)
-            \\  --temp <float>        Temperature (default: 0.8)
-            \\  --top-k <int>         Top-K (default: 40)
-            \\  --top-p <float>       Top-P (default: 0.95)
-            \\  --min-p <float>       Min-P (default: 0.05)
-            \\  --seed <int>          Seed (default: 42)
-            \\  --ctx <int>           Context size (default: 4096)
-            \\  --ngl <int>           GPU layers (default: 999)
-            \\  --threads <int>       Number of threads (default: CPU count)
-            \\  --stream <bool>       Stream output (default: true)
-            \\  --system <string>     System prompt
-            \\  --load-chat <file>    Load conversation from JSON
-            \\  --save-chat <file>    Save conversation to JSON
-            \\  --grammar <file>      Constrain output with a GBNF grammar file
-            \\  --grammar-root <name> Start rule name for grammar (default: root)
-            \\  --server              Run as an OpenAI-compatible server
-            \\  --host <string>        Server host (default: 127.0.0.1)
-            \\  --port <int>           Server port (default: 8080)
-            \\  --api-key <string>     Require Authorization: Bearer <api-key>
-            \\
-        , .{args[0]});
-        return;
-    }
+    const model_path = cfg.model_path;
 
-    const model_path = path.?;
-
-    if (server_mode) {
+    if (cfg.server_mode) {
         try server.run(allocator, model_path, .{
-            .host = server_host,
-            .port = server_port,
-            .api_key = server_api_key,
+            .host = cfg.server_host,
+            .port = cfg.server_port,
+            .api_key = cfg.server_api_key,
         }, .{
-            .n_ctx = n_ctx,
-            .n_gpu_layers = n_gpu_layers,
-            .threads = threads,
-            .temp = temp,
-            .top_k = top_k,
-            .top_p = top_p,
-            .min_p = min_p,
-            .seed = seed,
-            .grammar_path = grammar_path,
-            .grammar_root = grammar_root,
+            .n_ctx = cfg.n_ctx,
+            .n_gpu_layers = cfg.n_gpu_layers,
+            .threads = cfg.threads,
+            .temp = cfg.temp,
+            .top_k = cfg.top_k,
+            .top_p = cfg.top_p,
+            .min_p = cfg.min_p,
+            .seed = cfg.seed,
+            .grammar_path = cfg.grammar_path,
+            .grammar_root = cfg.grammar_root,
         });
         return;
     }
@@ -181,7 +90,7 @@ pub fn main() !void {
 
     // Optimized model parameters
     var mparams = llama_cpp.c.llama_model_default_params();
-    mparams.n_gpu_layers = n_gpu_layers;
+    mparams.n_gpu_layers = cfg.n_gpu_layers;
     mparams.use_mmap = true;
     mparams.use_mlock = false;
 
@@ -191,7 +100,7 @@ pub fn main() !void {
 
     // Optimized context parameters
     var cparams = llama_cpp.c.llama_context_default_params();
-    cparams.n_ctx = n_ctx;
+    cparams.n_ctx = cfg.n_ctx;
     cparams.n_batch = 1024;
     cparams.n_ubatch = 512;
     cparams.n_seq_max = 1;
@@ -199,7 +108,7 @@ pub fn main() !void {
 
     // Threading optimization
     const cpu_count: i32 = @intCast(std.Thread.getCpuCount() catch 4);
-    const final_threads = threads orelse cpu_count;
+    const final_threads = cfg.threads orelse cpu_count;
     cparams.n_threads = final_threads;
     cparams.n_threads_batch = final_threads;
 
@@ -216,11 +125,11 @@ pub fn main() !void {
 
     // Configurable sampler
     const sampler_config = llama_cpp.SamplerConfig{
-        .temp = temp,
-        .top_k = top_k,
-        .top_p = top_p,
-        .min_p = min_p,
-        .seed = seed,
+        .temp = cfg.temp,
+        .top_k = cfg.top_k,
+        .top_p = cfg.top_p,
+        .min_p = cfg.min_p,
+        .seed = cfg.seed,
     };
 
     var grammar_z: ?[:0]u8 = null;
@@ -229,12 +138,12 @@ pub fn main() !void {
     defer if (grammar_root_z) |r| allocator.free(r);
 
     var sampler: llama_cpp.Sampler = undefined;
-    if (grammar_path) |gp| {
+    if (cfg.grammar_path) |gp| {
         const grammar_bytes = try std.fs.cwd().readFileAlloc(allocator, gp, 4 * 1024 * 1024);
         defer allocator.free(grammar_bytes);
 
         grammar_z = try chat.dupeZ(allocator, grammar_bytes);
-        grammar_root_z = try chat.dupeZ(allocator, grammar_root);
+        grammar_root_z = try chat.dupeZ(allocator, cfg.grammar_root);
 
         sampler = try llama_cpp.Sampler.initWithConfigAndGrammar(sampler_config, vocab, grammar_z.?, grammar_root_z.?);
     } else {
@@ -246,16 +155,16 @@ pub fn main() !void {
     defer eval_tokens.deinit(allocator);
 
     var msgs: std.ArrayList(chat.Message) = .empty;
-    if (load_chat_path) |load_path| {
+    if (cfg.load_chat_path) |load_path| {
         msgs = chat.loadJson(allocator, load_path) catch |err| switch (err) {
             error.FileNotFound => .empty,
             else => return err,
         };
     }
     defer chat.deinitMessages(allocator, &msgs);
-    defer maybeSaveChat(allocator, save_chat_path, msgs.items);
+    defer maybeSaveChat(allocator, cfg.save_chat_path, msgs.items);
 
-    if (system_prompt) |sys| {
+    if (cfg.system_prompt) |sys| {
         try chat.setOrPrependSystemPrompt(allocator, &msgs, sys);
     }
 
@@ -264,8 +173,8 @@ pub fn main() !void {
     const stdin_is_tty = std.fs.File.stdin().isTty();
     const use_color = terminal.enableAnsiColors();
 
-    if (prompt_mode) {
-        if (user_prompt) |input| {
+    if (cfg.prompt_mode) {
+        if (cfg.user_prompt) |input| {
             // Allocate user message with errdefer for safety
             const user_z = try chat.dupeZ(allocator, input);
             errdefer allocator.free(user_z);
@@ -341,12 +250,12 @@ pub fn main() !void {
         sampler_config.top_p,
         sampler_config.min_p,
         sampler_config.seed,
-        stream,
+        cfg.stream,
     });
-    if (grammar_path) |gp| {
-        try stdout.print("Grammar: {s} (root: {s})\n", .{ gp, grammar_root });
+    if (cfg.grammar_path) |gp| {
+        try stdout.print("Grammar: {s} (root: {s})\n", .{ gp, cfg.grammar_root });
     }
-    if (system_prompt) |sys| {
+    if (cfg.system_prompt) |sys| {
         try stdout.print("System Prompt: {s}\n", .{sys});
     }
     try stdout.print("Commands: /clear, /reset, exit\n\n", .{});
@@ -380,7 +289,7 @@ pub fn main() !void {
             ctx.kvCacheSeqRm(0, 0, -1);
             eval_tokens.clearRetainingCapacity();
             sampler.reset();
-            maybeSaveChat(allocator, save_chat_path, msgs.items);
+            maybeSaveChat(allocator, cfg.save_chat_path, msgs.items);
             try writeDim(stdout, use_color);
             try stdout.writeAll("[conversation cleared]\n\n");
             try writeReset(stdout, use_color);
@@ -481,7 +390,7 @@ pub fn main() !void {
             const n = llama_cpp.c.llama_token_to_piece(vocab, token, &piece_buf, piece_buf.len, 0, false);
             if (n > 0) {
                 const piece = piece_buf[0..@intCast(n)];
-                if (stream) try stdout.writeAll(piece);
+                if (cfg.stream) try stdout.writeAll(piece);
                 try assistant_buf.appendSlice(allocator, piece);
             } else if (n < 0) {
                 // Buffer too small, use heap
@@ -491,7 +400,7 @@ pub fn main() !void {
                 const n2 = llama_cpp.c.llama_token_to_piece(vocab, token, large_buf.ptr, @intCast(large_buf.len), 0, false);
                 if (n2 > 0) {
                     const piece = large_buf[0..@intCast(n2)];
-                    if (stream) try stdout.writeAll(piece);
+                    if (cfg.stream) try stdout.writeAll(piece);
                     try assistant_buf.appendSlice(allocator, piece);
                 }
             }
@@ -501,7 +410,7 @@ pub fn main() !void {
             try ctx.decode(batch.handle);
             try eval_tokens.append(allocator, token);
         }
-        if (!stream) try stdout.writeAll(assistant_buf.items);
+        if (!cfg.stream) try stdout.writeAll(assistant_buf.items);
         try stdout.writeAll("\n\n");
 
         const gen_total_ns: u64 = gen_timer.read();
@@ -523,7 +432,7 @@ pub fn main() !void {
         errdefer allocator.free(asst_z);
         try msgs.append(allocator, .{ .role = .assistant, .content = asst_z });
 
-        maybeSaveChat(allocator, save_chat_path, msgs.items);
+        maybeSaveChat(allocator, cfg.save_chat_path, msgs.items);
     }
 }
 
