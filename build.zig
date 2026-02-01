@@ -459,6 +459,15 @@ pub fn build(b: *std.Build) void {
         llama_lib.linkSystemLibrary("cuda");
     }
 
+    if (use_metal) {
+        if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
+            if (b.sysroot) |sdk_root| {
+                llama_lib.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
+                llama_lib.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr", "include" }) });
+            }
+        }
+    }
+
     // Add all .cpp files from llama.cpp/src recursively (includes model registry).
     // This mirrors the upstream CMakeLists (simpler than keeping a huge list in sync).
     const llama_src_abs = llama_cpp_dep.path("src").getPath(b);
