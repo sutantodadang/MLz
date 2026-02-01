@@ -334,8 +334,8 @@ pub fn build(b: *std.Build) void {
     if (use_metal) {
         // Only attempt to link frameworks if we are building FOR macOS
         if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
-            // Get SDK root from environment if available
-            if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+            // Get SDK root from sysroot or environment
+            if (b.sysroot orelse b.graph.env_map.get("SDKROOT")) |sdk_root| {
                 ggml_lib.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
                 // Also add system include path
                 ggml_lib.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr", "include" }) });
@@ -537,8 +537,8 @@ pub fn build(b: *std.Build) void {
     // Link Metal frameworks to executable
     if (use_metal) {
         if (actual_target.result.os.tag == .macos or actual_target.result.os.tag == .ios) {
-            // Get SDK root from environment if available
-            if (b.graph.env_map.get("SDKROOT")) |sdk_root| {
+            // Get SDK root from sysroot or environment
+            if (b.sysroot orelse b.graph.env_map.get("SDKROOT")) |sdk_root| {
                 exe.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" }) });
             }
 
