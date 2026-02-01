@@ -26,18 +26,31 @@ pub const Config = struct {
     prompt_mode: bool = false,
     user_prompt: ?[]const u8 = null,
 
+    // Speculative Decoding
+    draft_model_path: ?[]const u8 = null,
+
     // Server Config
     server_mode: bool = false,
     server_host: []const u8 = "127.0.0.1",
     server_port: u16 = 8080,
     server_api_key: ?[]const u8 = null,
 
+    // prompt memory management
+    _allocated_prompt: ?[]u8 = null,
+
     pub const ParseError = error{
         MissingModelPath,
         InvalidFloat,
         InvalidInt,
         MissingArgument,
+        OutOfMemory,
     };
+
+    pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
+        if (self._allocated_prompt) |p| {
+            allocator.free(p);
+        }
+    }
 
     pub fn parse(allocator: std.mem.Allocator, args: []const [:0]u8) !Config {
         var cfg = Config{};
@@ -52,7 +65,26 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--prompt")) {
                 i += 1;
                 if (i < args.len) {
-                    cfg.user_prompt = args[i];
+                    var prompt_parts = std.ArrayList([]const u8){};
+                    defer prompt_parts.deinit(allocator);
+
+                    try prompt_parts.append(allocator, args[i]);
+
+                    // Greedily consume subsequent arguments if they don't look like flags
+                    while (i + 1 < args.len) {
+                        const next_arg = args[i + 1];
+                        if (std.mem.startsWith(u8, next_arg, "-")) break;
+                        i += 1;
+                        try prompt_parts.append(allocator, args[i]);
+                    }
+
+                    if (prompt_parts.items.len == 1) {
+                        cfg.user_prompt = prompt_parts.items[0];
+                    } else {
+                        const joined = try std.mem.join(allocator, " ", prompt_parts.items);
+                        cfg._allocated_prompt = joined;
+                        cfg.user_prompt = joined;
+                    }
                     cfg.prompt_mode = true;
                 } else {
                     return ParseError.MissingArgument;
@@ -87,6 +119,8 @@ pub const Config = struct {
                 cfg.grammar_path = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--grammar-root")) {
                 cfg.grammar_root = try getNextArg(&i, args) orelse "root";
+            } else if (std.mem.eql(u8, arg, "--draft-model")) {
+                cfg.draft_model_path = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--server")) {
                 cfg.server_mode = true;
             } else if (std.mem.eql(u8, arg, "--host")) {
@@ -106,7 +140,6 @@ pub const Config = struct {
         }
 
         if (!path_set) return ParseError.MissingModelPath;
-        _ = allocator;
         return cfg;
     }
 
