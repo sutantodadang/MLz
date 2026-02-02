@@ -76,7 +76,7 @@ jobs:
 
       - name: Setup CUDA
         if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.14
+        uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.4.0'
 
@@ -84,7 +84,7 @@ jobs:
         if: matrix.vulkan && runner.os == 'Linux'
         run: |
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-jammy.list https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-jammy.list
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-noble.list https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-noble.list
           sudo apt update
           # Install dependencies required by Vulkan SDK
           sudo apt install -y libyaml-cpp-dev
