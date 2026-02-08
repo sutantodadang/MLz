@@ -114,8 +114,11 @@ pub fn build(b: *std.Build) void {
     cpp_flags.append(b.allocator, "-DGGML_VERSION=\"100\"") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_COMMIT=\"unknown\"") catch @panic("OOM");
 
-    // x86_64-specific flags (AVX512 disabled for compatibility)
-    if (actual_target.result.cpu.arch == .x86_64) {
+    // x86_64-specific flags
+    // AVX512 is enabled by default for better performance on supported CPUs
+    // Use -Dno-avx512=true to disable for compatibility with older CPUs
+    const no_avx512 = b.option(bool, "no-avx512", "Disable AVX512 for compatibility with older CPUs") orelse false;
+    if (actual_target.result.cpu.arch == .x86_64 and no_avx512) {
         c_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
     }

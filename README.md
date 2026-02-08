@@ -68,6 +68,12 @@ Metal support is enabled by default on macOS/iOS builds.
 zig build -Doptimize=ReleaseFast
 ```
 
+### CPU SIMD Optimizations (x86_64)
+AVX512 SIMD instructions are enabled by default on x86_64 for maximum performance. If you need to run on older CPUs that don't support AVX512 (pre-Skylake-X Intel or pre-Zen4 AMD):
+```bash
+zig build -Dno-avx512=true -Doptimize=ReleaseFast
+```
+
 ## Project Structure
 
 ```
