@@ -12,6 +12,8 @@
 // License: MIT
 // ===========================================================================
 
+#include "neon_common.h"
+
 #define KERNEL_NAME     simd_flash_attn_q5_k_neon
 #define K_BLOCK_BYTES   Q5_K_BLOCK_BYTES
 #define V_BLOCK_BYTES   Q5_K_BLOCK_BYTES

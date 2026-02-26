@@ -7,6 +7,8 @@
 // License: MIT
 // ===========================================================================
 
+#include "neon_common.h"
+
 #define KERNEL_NAME     simd_flash_attn_f16_neon
 #define K_BLOCK_BYTES   F16_BLOCK_BYTES
 #define V_BLOCK_BYTES   F16_BLOCK_BYTES

@@ -19,12 +19,12 @@ jobs:
           # ── Standard builds ──
           - name: Linux x86_64
             target: x86_64-linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             test: true
             simd: true
           - name: Linux aarch64
             target: aarch64-linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             test: false
             simd: true
           - name: Windows x86_64
@@ -46,7 +46,7 @@ jobs:
           # ── CUDA Variants ──
           - name: Linux x86_64 CUDA
             target: x86_64-linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             test: false
             cuda: true
             simd: true
@@ -60,7 +60,7 @@ jobs:
           # ── Vulkan Variants ──
           - name: Linux x86_64 Vulkan
             target: x86_64-linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             test: false
             vulkan: true
             simd: true
@@ -109,7 +109,7 @@ jobs:
         with:
           cuda: '12.4.0'
           method: network
-          sub-packages: '["cudart", "nvcc", "cublas", "cublas_dev", "cuda_cudart", "cuda_nvcc"]'
+          sub-packages: '["cudart", "nvcc", "cublas", "cublas-dev"]'
 
       # ── Vulkan setup ──
       - name: Setup Vulkan (Linux)
@@ -122,17 +122,11 @@ jobs:
 
       - name: Setup Vulkan (Windows)
         if: matrix.vulkan && runner.os == 'Windows'
-        run: |
-          $url = "https://sdk.lunarg.com/sdk/download/1.3.250.0/windows/VulkanSDK-1.3.250.0-Installer.exe"
-          $output = "vulkan-sdk.exe"
-          
-          $webClient = New-Object System.Net.WebClient
-          $webClient.DownloadFile($url, $output)
-          
-          Start-Process -FilePath ".\$output" -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
-          
-          echo "VULKAN_SDK=C:\VulkanSDK\1.3.250.0" >> $env:GITHUB_ENV
-        shell: pwsh
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.290.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
 
       # ── Build ──
       - name: Build

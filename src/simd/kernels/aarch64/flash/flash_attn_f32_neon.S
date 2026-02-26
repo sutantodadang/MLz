@@ -42,10 +42,10 @@
     .section .rodata
     .align 4
 neon_neg_inf:
-    .float 0xFF800000           // -infinity (IEEE 754)
-    .float 0xFF800000
-    .float 0xFF800000
-    .float 0xFF800000
+    .long 0xFF800000           // -infinity (IEEE 754)
+    .long 0xFF800000
+    .long 0xFF800000
+    .long 0xFF800000
 neon_neg_inf_scalar:
     .word  0xFF800000           // -infinity as 32-bit word
 neon_exp_log2e:

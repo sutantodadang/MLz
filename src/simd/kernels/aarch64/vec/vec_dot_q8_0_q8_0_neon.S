@@ -16,7 +16,7 @@
 
     .text
     .align 4
-    GLOBAL_SYMBOL simd_vec_dot_q8_0_q8_0_neon
+    GLOBAL_SYMBOL(simd_vec_dot_q8_0_q8_0_neon)
 
 simd_vec_dot_q8_0_q8_0_neon:
     stp     x29, x30, [sp, #-48]!
@@ -84,4 +84,4 @@ simd_vec_dot_q8_0_q8_0_neon:
     ldp     x29, x30, [sp], #48
     ret
 
-    END_FUNCTION simd_vec_dot_q8_0_q8_0_neon
+    END_FUNCTION(simd_vec_dot_q8_0_q8_0_neon)
