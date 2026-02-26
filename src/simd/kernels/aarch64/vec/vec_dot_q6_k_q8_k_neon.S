@@ -19,7 +19,7 @@
 
     .text
     .align 4
-    GLOBAL_SYMBOL simd_vec_dot_q6_k_q8_k_neon
+    GLOBAL_SYMBOL(simd_vec_dot_q6_k_q8_k_neon)
 
 simd_vec_dot_q6_k_q8_k_neon:
     stp     x29, x30, [sp, #-96]!
@@ -71,7 +71,7 @@ simd_vec_dot_q6_k_q8_k_neon:
     cmp     w12, #16
     b.ge    .Lq6k_val_done
 
-    mov     w13, w9, lsl #4
+    lsl     w13, w9, #4
     add     w13, w13, w12               // global value index
 
     // Get ql (low 4 bits contribute to q6)
@@ -134,4 +134,4 @@ simd_vec_dot_q6_k_q8_k_neon:
     ldp     x29, x30, [sp], #96
     ret
 
-    END_FUNCTION simd_vec_dot_q6_k_q8_k_neon
+    END_FUNCTION(simd_vec_dot_q6_k_q8_k_neon)

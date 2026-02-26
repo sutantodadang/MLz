@@ -15,7 +15,7 @@
 
     .text
     .align 4
-    GLOBAL_SYMBOL matrix_mult_neon
+    GLOBAL_SYMBOL(matrix_mult_neon)
 
 matrix_mult_neon:
     // Prologue: save callee-saved registers
@@ -173,4 +173,4 @@ matrix_mult_neon:
     ldp     x29, x30, [sp], #112
     ret
 
-    END_FUNCTION matrix_mult_neon
+    END_FUNCTION(matrix_mult_neon)

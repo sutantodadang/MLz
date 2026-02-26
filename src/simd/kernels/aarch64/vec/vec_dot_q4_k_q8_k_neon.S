@@ -18,7 +18,7 @@
 
     .text
     .align 4
-    GLOBAL_SYMBOL simd_vec_dot_q4_k_q8_k_neon
+    GLOBAL_SYMBOL(simd_vec_dot_q4_k_q8_k_neon)
 
 simd_vec_dot_q4_k_q8_k_neon:
     stp     x29, x30, [sp, #-96]!
@@ -86,19 +86,19 @@ simd_vec_dot_q4_k_q8_k_neon:
     // Extract m from scales[8 + sb/2]
     add     w10, w9, #8
     lsr     w10, w10, #1
-    ldrb    w12, [x5, w10]
+    ldrb    w12, [x5, w10, uxtw]
     tst     w9, #1
     b.ne    .Lq4k_m_hi
     and     w12, w12, #0x3F
     b       .Lq4k_m_done
 .Lq4k_m_hi:
     lsr     w12, w12, #0
-    ldrb    w12, [x5, w10]
+    ldrb    w12, [x5, w10, uxtw]
     and     w12, w12, #0x3F
 .Lq4k_m_done:
 
     // bsum contribution: m * (bsums[2*sb] + bsums[2*sb+1])
-    mov     w10, w9, lsl #2             // byte offset = sb*4 in bsums (2 int16)
+    lsl     w10, w9, #2             // byte offset = sb*4 in bsums (2 int16)
     ldrsh   w13, [x8, x10]
     add     w10, w10, #2
     ldrsh   w14, [x8, x10]
@@ -110,7 +110,7 @@ simd_vec_dot_q4_k_q8_k_neon:
     // Process 32 Q4 values (16 bytes of packed nibbles)
     mov     w14, #0                     // value counter
     mov     w23, #0                     // integer dot
-    mov     w24, w9, lsl #4             // quant byte offset = sb * 16
+    lsl     w24, w9, #4             // quant byte offset = sb * 16
 .Lq4k_val:
     cmp     w14, #32
     b.ge    .Lq4k_val_done
@@ -128,7 +128,7 @@ simd_vec_dot_q4_k_q8_k_neon:
 .Lq4k_nibble_done:
 
     // Q8_K quant
-    mov     w25, w9, lsl #5             // Q8_K offset = sb * 32
+    lsl     w25, w9, #5             // Q8_K offset = sb * 32
     add     w25, w25, w14
     ldrsb   w4, [x7, w25, uxtw]
 
@@ -172,4 +172,4 @@ simd_vec_dot_q4_k_q8_k_neon:
     ldp     x29, x30, [sp], #96
     ret
 
-    END_FUNCTION simd_vec_dot_q4_k_q8_k_neon
+    END_FUNCTION(simd_vec_dot_q4_k_q8_k_neon)

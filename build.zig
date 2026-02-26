@@ -324,6 +324,12 @@ pub fn build(b: *std.Build) void {
                     ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
                     const inc_path = b.pathJoin(&.{ sdk_path, "include" });
                     ggml_lib.addSystemIncludePath(.{ .cwd_relative = inc_path });
+                } else {
+                    // Fallback: add standard multiarch library paths for cross-compilation
+                    // Zig's cross-compile linker doesn't search /usr/lib/<triple> by default
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+                    ggml_lib.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
                 }
                 ggml_lib.linkSystemLibrary("vulkan");
             },
@@ -459,10 +465,11 @@ pub fn build(b: *std.Build) void {
         simd_cpp_flags.append(b.allocator, "-std=c++17") catch @panic("OOM");
         simd_cpp_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
 
-        // x86_64-specific C++ compiler flags (AVX2/FMA/AVX-512)
+        // x86_64-specific C++ compiler flags (AVX2/FMA/F16C/AVX-512)
         if (actual_target.result.cpu.arch == .x86_64) {
             simd_cpp_flags.append(b.allocator, "-mavx2") catch @panic("OOM");
             simd_cpp_flags.append(b.allocator, "-mfma") catch @panic("OOM");
+            simd_cpp_flags.append(b.allocator, "-mf16c") catch @panic("OOM");
             if (!no_avx512) {
                 simd_cpp_flags.append(b.allocator, "-mavx512f") catch @panic("OOM");
             }

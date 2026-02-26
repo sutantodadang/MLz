@@ -18,7 +18,7 @@
 
     .text
     .align 4
-    GLOBAL_SYMBOL simd_vec_dot_q2_k_q8_k_neon
+    GLOBAL_SYMBOL(simd_vec_dot_q2_k_q8_k_neon)
 
 simd_vec_dot_q2_k_q8_k_neon:
     stp     x29, x30, [sp, #-96]!
@@ -87,7 +87,7 @@ simd_vec_dot_q2_k_q8_k_neon:
     mov     w14, #0                     // value counter
     mov     w23, #0                     // dot accumulator (integer)
     // 16 values = 4 quant bytes
-    mov     w24, x9, lsl #2            // byte offset = sb * 4
+    lsl     w24, w9, #2            // byte offset = sb * 4
 .Lq2k_val:
     cmp     w14, #16
     b.ge    .Lq2k_val_done
@@ -103,7 +103,7 @@ simd_vec_dot_q2_k_q8_k_neon:
 
     // Load Q8_K quant
     // Q8_K quant index = sb * 16 + val
-    mov     w25, w9, lsl #4
+    lsl     w25, w9, #4
     add     w25, w25, w14
     ldrsb   w26, [x7, x25]
 
@@ -150,4 +150,4 @@ simd_vec_dot_q2_k_q8_k_neon:
     ldp     x29, x30, [sp], #96
     ret
 
-    END_FUNCTION simd_vec_dot_q2_k_q8_k_neon
+    END_FUNCTION(simd_vec_dot_q2_k_q8_k_neon)
