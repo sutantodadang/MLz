@@ -102,14 +102,27 @@ jobs:
         if: matrix.cuda && runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # ── CUDA setup (minimal install to avoid disk space issues) ──
-      - name: Setup CUDA
-        if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.4.0'
-          method: network
-          sub-packages: '["cudart", "nvcc", "cublas", "cublas-dev"]'
+      # ── CUDA setup ──
+      - name: Setup CUDA (Linux)
+        if: matrix.cuda && runner.os == 'Linux'
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-cudart-dev-12-4 cuda-nvcc-12-4 libcublas-dev-12-4
+          echo "/usr/local/cuda-12.4/bin" >> $GITHUB_PATH
+          echo "CUDA_PATH=/usr/local/cuda-12.4" >> $GITHUB_ENV
+
+      - name: Setup CUDA (Windows)
+        if: matrix.cuda && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "12.4.0"
+          $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
+          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s", "cudart_$ver", "nvcc_$ver", "cublas_$ver", "cublas_dev_$ver" -Wait -NoNewWindow
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" >> $env:GITHUB_ENV
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin" >> $env:GITHUB_PATH
 
       # ── Vulkan setup ──
       - name: Setup Vulkan (Linux)
@@ -122,11 +135,13 @@ jobs:
 
       - name: Setup Vulkan (Windows)
         if: matrix.vulkan && runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
-        with:
-          vulkan-query-version: 1.3.290.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader
-          vulkan-use-cache: true
+        shell: pwsh
+        run: |
+          $ver = "1.3.290.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe -UseBasicParsing
+          Start-Process -FilePath .\vulkan-sdk.exe -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
 
       # ── Build ──
       - name: Build
