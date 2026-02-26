@@ -74,6 +74,14 @@ AVX512 SIMD instructions are enabled by default on x86_64 for maximum performanc
 zig build -Dno-avx512=true -Doptimize=ReleaseFast
 ```
 
+### Custom SIMD Backend (Experimental)
+For enhanced F32 and F16 matrix multiplication performance, you can enable the custom SIMD backend with hand-optimized AVX2/AVX-512 assembly:
+```bash
+# Requires NASM assembler: scoop install nasm / choco install nasm / apt install nasm
+zig build -Dsimd-backend=true -Doptimize=ReleaseFast
+```
+> **Supported formats:** F32 (native) and F16 (via F16C conversion). Quantized models (Q4_K_M, etc.) use GGML's built-in kernels.
+
 ## Project Structure
 
 ```

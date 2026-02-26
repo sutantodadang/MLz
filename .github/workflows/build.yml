@@ -16,47 +16,60 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── Standard builds ──
           - name: Linux x86_64
             target: x86_64-linux
             os: ubuntu-latest
             test: true
+            simd: true
           - name: Linux aarch64
             target: aarch64-linux
             os: ubuntu-latest
             test: false
+            simd: true
           - name: Windows x86_64
             target: x86_64-windows-msvc
             os: windows-latest
             test: true
+            simd: true
           - name: Windows aarch64
             target: aarch64-windows-msvc
             os: windows-latest
             test: false
+            simd: true
           - name: macOS ARM64
             target: aarch64-macos
             os: macos-latest
             test: true
-          # CUDA/Vulkan Variants
+            simd: true
+
+          # ── CUDA Variants ──
           - name: Linux x86_64 CUDA
             target: x86_64-linux
             os: ubuntu-latest
             test: false
             cuda: true
-          - name: Linux x86_64 Vulkan
-            target: x86_64-linux
-            os: ubuntu-latest
-            test: false
-            vulkan: true
+            simd: true
           - name: Windows x86_64 CUDA
             target: x86_64-windows-msvc
             os: windows-latest
             test: false
             cuda: true
+            simd: true
+
+          # ── Vulkan Variants ──
+          - name: Linux x86_64 Vulkan
+            target: x86_64-linux
+            os: ubuntu-latest
+            test: false
+            vulkan: true
+            simd: true
           - name: Windows x86_64 Vulkan
             target: x86_64-windows-msvc
             os: windows-latest
             test: false
             vulkan: true
+            simd: true
 
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +79,21 @@ jobs:
         with:
           version: 0.15.2
 
+      # ── NASM for x86_64 SIMD builds ──
+      - name: Install NASM (Linux)
+        if: matrix.simd && contains(matrix.target, 'x86_64') && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Install NASM (Windows)
+        if: matrix.simd && contains(matrix.target, 'x86_64') && runner.os == 'Windows'
+        run: choco install nasm -y
+        shell: pwsh
+
+      - name: Install NASM (macOS)
+        if: matrix.simd && contains(matrix.target, 'x86_64') && runner.os == 'macOS'
+        run: brew install nasm
+
+      # ── Platform SDK setup ──
       - name: Set SDKROOT (macOS)
         if: runner.os == 'macOS'
         run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> $GITHUB_ENV
@@ -74,21 +102,23 @@ jobs:
         if: matrix.cuda && runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # ── CUDA setup (minimal install to avoid disk space issues) ──
       - name: Setup CUDA
         if: matrix.cuda
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.4.0'
+          method: network
+          sub-packages: '["cudart", "nvcc", "cublas", "cublas_dev", "cuda_cudart", "cuda_nvcc"]'
 
+      # ── Vulkan setup ──
       - name: Setup Vulkan (Linux)
         if: matrix.vulkan && runner.os == 'Linux'
         run: |
-          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.296-noble.list https://packages.lunarg.com/vulkan/1.3.296/lunarg-vulkan-1.3.296-noble.list
-          sudo apt update
-          # Install dependencies required by Vulkan SDK
-          sudo apt install -y libyaml-cpp-dev
-          sudo apt install -y vulkan-sdk
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev vulkan-tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
 
       - name: Setup Vulkan (Windows)
         if: matrix.vulkan && runner.os == 'Windows'
@@ -96,22 +126,21 @@ jobs:
           $url = "https://sdk.lunarg.com/sdk/download/1.3.250.0/windows/VulkanSDK-1.3.250.0-Installer.exe"
           $output = "vulkan-sdk.exe"
           
-          # Use .NET WebClient for reliable download
           $webClient = New-Object System.Net.WebClient
           $webClient.DownloadFile($url, $output)
           
-          # Run installer
           Start-Process -FilePath ".\$output" -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
           
           echo "VULKAN_SDK=C:\VulkanSDK\1.3.250.0" >> $env:GITHUB_ENV
         shell: pwsh
 
+      # ── Build ──
       - name: Build
         run: |
           ZIG_FLAGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
           if [[ "${{ matrix.cuda }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dcuda=true"; fi
           if [[ "${{ matrix.vulkan }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dvulkan=true"; fi
-          # Explicitly set C++ standard to c++17 for all builds to match flags in build.zig
+          if [[ "${{ matrix.simd }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dsimd-backend=true"; fi
           zig build $ZIG_FLAGS
         shell: bash
 
@@ -119,6 +148,7 @@ jobs:
         if: matrix.test
         run: zig build test -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
 
+      # ── Packaging ──
       - name: Package (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -126,17 +156,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           BIN="zig-out/bin/MLz"
-          # Ensure binary is executable
           chmod +x "$BIN" || true
           
-          # Determine suffix
           SUFFIX=""
           if [[ "${{ matrix.cuda }}" == "true" ]]; then SUFFIX="-cuda"; fi
           if [[ "${{ matrix.vulkan }}" == "true" ]]; then SUFFIX="-vulkan"; fi
           
-          # Create archive name
           OUT="dist/MLz-${{ matrix.target }}${SUFFIX}.tar.gz"
-          # Archive
           tar -C "$(dirname "$BIN")" -czf "$OUT" "$(basename "$BIN")"
 
       - name: Package (Windows)
@@ -153,7 +179,6 @@ jobs:
           $out = "dist/MLz-${{ matrix.target }}$suffix.zip"
           Compress-Archive -Path $bin -DestinationPath $out -Force
 
-        
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
         with:

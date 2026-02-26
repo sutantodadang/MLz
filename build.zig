@@ -194,14 +194,34 @@ pub fn build(b: *std.Build) void {
     });
 
     // CPU backend (linked statically into ggml when GGML_BACKEND_DL is off)
+    // When simd-backend is enabled, we use a patched version of ggml-cpu.c
+    // that calls our custom SIMD kernels before the default implementation
+    const use_simd_backend = b.option(bool, "simd-backend", "Use custom SIMD backend for F32 matrix multiplication (x86_64 and aarch64)") orelse false;
+
+    // The SIMD backend uses a patched version of ggml-cpu.c with hook call inserted.
+    // When disabled, use the original from llama.cpp dependency.
+    const ggml_cpu_c_source = if (use_simd_backend and (actual_target.result.cpu.arch == .x86_64 or actual_target.result.cpu.arch == .aarch64))
+        b.path("src/simd/ggml-cpu-simd.c")
+    else
+        llama_cpp_dep.path("ggml/src/ggml-cpu/ggml-cpu.c");
+
     ggml_lib.addCSourceFile(.{
-        .file = llama_cpp_dep.path("ggml/src/ggml-cpu/ggml-cpu.c"),
+        .file = ggml_cpu_c_source,
         .flags = c_flags.items,
     });
+
     ggml_lib.addCSourceFile(.{
         .file = llama_cpp_dep.path("ggml/src/ggml-cpu/quants.c"),
         .flags = c_flags.items,
     });
+
+    // x86-specific optimized quantization kernels (AVX2/AVX-512)
+    if (actual_target.result.cpu.arch == .x86_64) {
+        ggml_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-cpu/arch/x86/quants.c"),
+            .flags = c_flags.items,
+        });
+    }
     ggml_lib.addCSourceFile(.{
         .file = llama_cpp_dep.path("ggml/src/ggml-cpu/ggml-cpu.cpp"),
         .flags = cpp_flags.items,
@@ -298,6 +318,13 @@ pub fn build(b: *std.Build) void {
                 ggml_lib.linkSystemLibrary("vulkan-1");
             },
             .linux => {
+                // Use VULKAN_SDK if available, otherwise try system paths
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    const lib_path = b.pathJoin(&.{ sdk_path, "lib" });
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
+                    const inc_path = b.pathJoin(&.{ sdk_path, "include" });
+                    ggml_lib.addSystemIncludePath(.{ .cwd_relative = inc_path });
+                }
                 ggml_lib.linkSystemLibrary("vulkan");
             },
             .macos => {
@@ -417,6 +444,671 @@ pub fn build(b: *std.Build) void {
             ggml_lib.linkFramework("Foundation");
             ggml_lib.linkFramework("MetalPerformanceShaders");
             ggml_lib.linkFramework("MetalPerformanceShadersGraph");
+        }
+    }
+
+    // Custom SIMD backend for high-performance matrix multiplication
+    // Uses hand-optimized AVX2/AVX-512 assembly (x86_64) or NEON assembly (aarch64)
+    // Note: use_simd_backend is defined earlier when patching ggml-cpu.c
+    if (use_simd_backend and (actual_target.result.cpu.arch == .x86_64 or actual_target.result.cpu.arch == .aarch64)) {
+        c_flags.append(b.allocator, "-DGGML_USE_SIMD_BACKEND") catch @panic("OOM");
+        cpp_flags.append(b.allocator, "-DGGML_USE_SIMD_BACKEND") catch @panic("OOM");
+
+        // SIMD backend C++ sources
+        var simd_cpp_flags: std.ArrayList([]const u8) = .empty;
+        simd_cpp_flags.append(b.allocator, "-std=c++17") catch @panic("OOM");
+        simd_cpp_flags.append(b.allocator, "-D_CRT_SECURE_NO_WARNINGS") catch @panic("OOM");
+
+        // x86_64-specific C++ compiler flags (AVX2/FMA/AVX-512)
+        if (actual_target.result.cpu.arch == .x86_64) {
+            simd_cpp_flags.append(b.allocator, "-mavx2") catch @panic("OOM");
+            simd_cpp_flags.append(b.allocator, "-mfma") catch @panic("OOM");
+            if (!no_avx512) {
+                simd_cpp_flags.append(b.allocator, "-mavx512f") catch @panic("OOM");
+            }
+        }
+
+        // Add SIMD backend C++ sources
+        ggml_lib.addCSourceFile(.{
+            .file = b.path("src/simd/simd_matmul.cpp"),
+            .flags = simd_cpp_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = b.path("src/simd/ggml_simd_hook.cpp"),
+            .flags = simd_cpp_flags.items,
+        });
+        ggml_lib.addCSourceFile(.{
+            .file = b.path("src/simd/flash_attention.cpp"),
+            .flags = simd_cpp_flags.items,
+        });
+
+        // Add include path for SIMD headers
+        ggml_lib.addIncludePath(b.path("src/simd"));
+
+        // Architecture-specific assembly compilation
+        if (actual_target.result.cpu.arch == .x86_64) {
+            // Compile NASM assembly sources
+            // Note: Zig's build system can compile .asm files using system NASM
+            const nasm_format = switch (actual_target.result.os.tag) {
+                .windows => "win64",
+                .macos => "macho64",
+                else => "elf64",
+            };
+
+            // AVX2 assembly
+            const avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-o",
+            });
+            const avx2_obj = avx2_asm.addOutputFileArg("matrix_mult_avx2.o");
+            avx2_asm.addFileArg(b.path("src/simd/kernels/x86/matrix_mult_avx2.asm"));
+            ggml_lib.addObjectFile(avx2_obj);
+
+            // AVX512 assembly (only if not disabled)
+            if (!no_avx512) {
+                const avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-o",
+                });
+                const avx512_obj = avx512_asm.addOutputFileArg("matrix_mult_avx512.o");
+                avx512_asm.addFileArg(b.path("src/simd/kernels/x86/matrix_mult_avx512.asm"));
+                ggml_lib.addObjectFile(avx512_obj);
+
+                // AVX-512 Quantized Kernels
+                const q4_q8_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q4_q8_avx512_obj = q4_q8_avx512_asm.addOutputFileArg("vec_dot_q4_0_q8_0_avx512.o");
+                q4_q8_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q4_0_q8_0_avx512.asm"));
+                ggml_lib.addObjectFile(q4_q8_avx512_obj);
+
+                const q8_q8_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q8_q8_avx512_obj = q8_q8_avx512_asm.addOutputFileArg("vec_dot_q8_0_q8_0_avx512.o");
+                q8_q8_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q8_0_q8_0_avx512.asm"));
+                ggml_lib.addObjectFile(q8_q8_avx512_obj);
+
+                // AVX-512 K-Quant Kernels
+                const q2_q8_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q2_q8_avx512_obj = q2_q8_avx512_asm.addOutputFileArg("vec_dot_q2_k_q8_k_avx512.o");
+                q2_q8_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q2_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q2_q8_avx512_obj);
+
+                const q6_q8_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q6_q8_avx512_obj = q6_q8_avx512_asm.addOutputFileArg("vec_dot_q6_k_q8_k_avx512.o");
+                q6_q8_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q6_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q6_q8_avx512_obj);
+
+                const q4_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q4_k_avx512_obj = q4_k_avx512_asm.addOutputFileArg("vec_dot_q4_k_q8_k_avx512.o");
+                q4_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q4_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q4_k_avx512_obj);
+
+                const q8_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q8_k_avx512_obj = q8_k_avx512_asm.addOutputFileArg("vec_dot_q8_k_q8_k_avx512.o");
+                q8_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q8_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q8_k_avx512_obj);
+
+                const q3_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q3_k_avx512_obj = q3_k_avx512_asm.addOutputFileArg("vec_dot_q3_k_q8_k_avx512.o");
+                q3_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q3_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q3_k_avx512_obj);
+
+                // Flash Attention F32 - AVX-512
+                const fa_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const fa_avx512_obj = fa_avx512_asm.addOutputFileArg("flash_attn_f32_avx512.o");
+                fa_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_f32_avx512.asm"));
+                ggml_lib.addObjectFile(fa_avx512_obj);
+
+                // Flash Attention Q4_0 - AVX-512
+                const fa_q4_0_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q4_0_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q4_0_avx512_asm.addArg("-o");
+                const fa_q4_0_avx512_obj = fa_q4_0_avx512_asm.addOutputFileArg("flash_attn_q4_0_avx512.o");
+                fa_q4_0_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_0_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q4_0_avx512_obj);
+
+                // Flash Attention Q8_0 - AVX-512
+                const fa_q8_0_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q8_0_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q8_0_avx512_asm.addArg("-o");
+                const fa_q8_0_avx512_obj = fa_q8_0_avx512_asm.addOutputFileArg("flash_attn_q8_0_avx512.o");
+                fa_q8_0_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q8_0_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q8_0_avx512_obj);
+
+                // Flash Attention F16 - AVX-512
+                const fa_f16_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_f16_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_f16_avx512_asm.addArg("-o");
+                const fa_f16_avx512_obj = fa_f16_avx512_asm.addOutputFileArg("flash_attn_f16_avx512.o");
+                fa_f16_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_f16_avx512.asm"));
+                ggml_lib.addObjectFile(fa_f16_avx512_obj);
+
+                // Flash Attention Q4_1 - AVX-512
+                const fa_q4_1_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q4_1_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q4_1_avx512_asm.addArg("-o");
+                const fa_q4_1_avx512_obj = fa_q4_1_avx512_asm.addOutputFileArg("flash_attn_q4_1_avx512.o");
+                fa_q4_1_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_1_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q4_1_avx512_obj);
+
+                // Flash Attention Q5_0 - AVX-512
+                const fa_q5_0_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q5_0_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q5_0_avx512_asm.addArg("-o");
+                const fa_q5_0_avx512_obj = fa_q5_0_avx512_asm.addOutputFileArg("flash_attn_q5_0_avx512.o");
+                fa_q5_0_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_0_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q5_0_avx512_obj);
+
+                // Flash Attention Q5_1 - AVX-512
+                const fa_q5_1_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q5_1_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q5_1_avx512_asm.addArg("-o");
+                const fa_q5_1_avx512_obj = fa_q5_1_avx512_asm.addOutputFileArg("flash_attn_q5_1_avx512.o");
+                fa_q5_1_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_1_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q5_1_avx512_obj);
+
+                // Flash Attention IQ4_NL - AVX-512
+                const fa_iq4_nl_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_iq4_nl_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_iq4_nl_avx512_asm.addArg("-o");
+                const fa_iq4_nl_avx512_obj = fa_iq4_nl_avx512_asm.addOutputFileArg("flash_attn_iq4_nl_avx512.o");
+                fa_iq4_nl_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_iq4_nl_avx512.asm"));
+                ggml_lib.addObjectFile(fa_iq4_nl_avx512_obj);
+
+                // Flash Attention Q2_K - AVX-512
+                const fa_q2_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q2_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q2_k_avx512_asm.addArg("-o");
+                const fa_q2_k_avx512_obj = fa_q2_k_avx512_asm.addOutputFileArg("flash_attn_q2_k_avx512.o");
+                fa_q2_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q2_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q2_k_avx512_obj);
+
+                // Flash Attention Q3_K - AVX-512
+                const fa_q3_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q3_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q3_k_avx512_asm.addArg("-o");
+                const fa_q3_k_avx512_obj = fa_q3_k_avx512_asm.addOutputFileArg("flash_attn_q3_k_avx512.o");
+                fa_q3_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q3_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q3_k_avx512_obj);
+
+                // Flash Attention Q4_K - AVX-512
+                const fa_q4_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q4_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q4_k_avx512_asm.addArg("-o");
+                const fa_q4_k_avx512_obj = fa_q4_k_avx512_asm.addOutputFileArg("flash_attn_q4_k_avx512.o");
+                fa_q4_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q4_k_avx512_obj);
+
+                // Flash Attention Q5_K - AVX-512
+                const fa_q5_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q5_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q5_k_avx512_asm.addArg("-o");
+                const fa_q5_k_avx512_obj = fa_q5_k_avx512_asm.addOutputFileArg("flash_attn_q5_k_avx512.o");
+                fa_q5_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q5_k_avx512_obj);
+
+                // Flash Attention Q6_K - AVX-512
+                const fa_q6_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q6_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q6_k_avx512_asm.addArg("-o");
+                const fa_q6_k_avx512_obj = fa_q6_k_avx512_asm.addOutputFileArg("flash_attn_q6_k_avx512.o");
+                fa_q6_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q6_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q6_k_avx512_obj);
+
+                // Flash Attention Q8_K - AVX-512
+                const fa_q8_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                });
+                fa_q8_k_avx512_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+                fa_q8_k_avx512_asm.addArg("-o");
+                const fa_q8_k_avx512_obj = fa_q8_k_avx512_asm.addOutputFileArg("flash_attn_q8_k_avx512.o");
+                fa_q8_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(fa_q8_k_avx512_obj);
+            }
+
+            // Quantized dot product kernels (Q4_0, Q8_0) - AVX2
+            const q4_q8_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS", // Define WINDOWS for calling convention
+                "-o",
+            });
+            const q4_q8_obj = q4_q8_asm.addOutputFileArg("vec_dot_q4_0_q8_0_avx2.o");
+            q4_q8_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q4_0_q8_0_avx2.asm"));
+            ggml_lib.addObjectFile(q4_q8_obj);
+
+            const q8_q8_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS", // Define WINDOWS for calling convention
+                "-o",
+            });
+            const q8_q8_obj = q8_q8_asm.addOutputFileArg("vec_dot_q8_0_q8_0_avx2.o");
+            q8_q8_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q8_0_q8_0_avx2.asm"));
+            ggml_lib.addObjectFile(q8_q8_obj);
+
+            // Quantized dot product kernels (Q2_K, Q6_K) - AVX2
+            const q2_q8_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q2_q8_obj = q2_q8_asm.addOutputFileArg("vec_dot_q2_k_q8_k_avx2.o");
+            q2_q8_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q2_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q2_q8_obj);
+
+            const q6_q8_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q6_q8_obj = q6_q8_asm.addOutputFileArg("vec_dot_q6_k_q8_k_avx2.o");
+            q6_q8_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q6_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q6_q8_obj);
+
+            // Quantized dot product kernels (Q4_K, Q8_K) - AVX2
+            const q4_k_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q4_k_obj = q4_k_asm.addOutputFileArg("vec_dot_q4_k_q8_k_avx2.o");
+            q4_k_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q4_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q4_k_obj);
+
+            const q8_k_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q8_k_obj = q8_k_asm.addOutputFileArg("vec_dot_q8_k_q8_k_avx2.o");
+            q8_k_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q8_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q8_k_obj);
+
+            const q3_k_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q3_k_obj = q3_k_asm.addOutputFileArg("vec_dot_q3_k_q8_k_avx2.o");
+            q3_k_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q3_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q3_k_obj);
+
+            // Flash Attention F32 - AVX2
+            const fa_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const fa_avx2_obj = fa_avx2_asm.addOutputFileArg("flash_attn_f32_avx2.o");
+            fa_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_f32_avx2.asm"));
+            ggml_lib.addObjectFile(fa_avx2_obj);
+
+            // Flash Attention Q4_0 - AVX2
+            const fa_q4_0_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q4_0_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q4_0_avx2_asm.addArg("-o");
+            const fa_q4_0_avx2_obj = fa_q4_0_avx2_asm.addOutputFileArg("flash_attn_q4_0_avx2.o");
+            fa_q4_0_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_0_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q4_0_avx2_obj);
+
+            // Flash Attention Q8_0 - AVX2
+            const fa_q8_0_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q8_0_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q8_0_avx2_asm.addArg("-o");
+            const fa_q8_0_avx2_obj = fa_q8_0_avx2_asm.addOutputFileArg("flash_attn_q8_0_avx2.o");
+            fa_q8_0_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q8_0_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q8_0_avx2_obj);
+
+            // Flash Attention F16 - AVX2
+            const fa_f16_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_f16_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_f16_avx2_asm.addArg("-o");
+            const fa_f16_avx2_obj = fa_f16_avx2_asm.addOutputFileArg("flash_attn_f16_avx2.o");
+            fa_f16_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_f16_avx2.asm"));
+            ggml_lib.addObjectFile(fa_f16_avx2_obj);
+
+            // Flash Attention Q4_1 - AVX2
+            const fa_q4_1_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q4_1_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q4_1_avx2_asm.addArg("-o");
+            const fa_q4_1_avx2_obj = fa_q4_1_avx2_asm.addOutputFileArg("flash_attn_q4_1_avx2.o");
+            fa_q4_1_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_1_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q4_1_avx2_obj);
+
+            // Flash Attention Q5_0 - AVX2
+            const fa_q5_0_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q5_0_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q5_0_avx2_asm.addArg("-o");
+            const fa_q5_0_avx2_obj = fa_q5_0_avx2_asm.addOutputFileArg("flash_attn_q5_0_avx2.o");
+            fa_q5_0_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_0_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q5_0_avx2_obj);
+
+            // Flash Attention Q5_1 - AVX2
+            const fa_q5_1_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q5_1_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q5_1_avx2_asm.addArg("-o");
+            const fa_q5_1_avx2_obj = fa_q5_1_avx2_asm.addOutputFileArg("flash_attn_q5_1_avx2.o");
+            fa_q5_1_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_1_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q5_1_avx2_obj);
+
+            // Flash Attention IQ4_NL - AVX2
+            const fa_iq4_nl_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_iq4_nl_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_iq4_nl_avx2_asm.addArg("-o");
+            const fa_iq4_nl_avx2_obj = fa_iq4_nl_avx2_asm.addOutputFileArg("flash_attn_iq4_nl_avx2.o");
+            fa_iq4_nl_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_iq4_nl_avx2.asm"));
+            ggml_lib.addObjectFile(fa_iq4_nl_avx2_obj);
+
+            // Flash Attention Q2_K - AVX2
+            const fa_q2_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q2_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q2_k_avx2_asm.addArg("-o");
+            const fa_q2_k_avx2_obj = fa_q2_k_avx2_asm.addOutputFileArg("flash_attn_q2_k_avx2.o");
+            fa_q2_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q2_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q2_k_avx2_obj);
+
+            // Flash Attention Q3_K - AVX2
+            const fa_q3_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q3_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q3_k_avx2_asm.addArg("-o");
+            const fa_q3_k_avx2_obj = fa_q3_k_avx2_asm.addOutputFileArg("flash_attn_q3_k_avx2.o");
+            fa_q3_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q3_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q3_k_avx2_obj);
+
+            // Flash Attention Q4_K - AVX2
+            const fa_q4_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q4_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q4_k_avx2_asm.addArg("-o");
+            const fa_q4_k_avx2_obj = fa_q4_k_avx2_asm.addOutputFileArg("flash_attn_q4_k_avx2.o");
+            fa_q4_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q4_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q4_k_avx2_obj);
+
+            // Flash Attention Q5_K - AVX2
+            const fa_q5_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q5_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q5_k_avx2_asm.addArg("-o");
+            const fa_q5_k_avx2_obj = fa_q5_k_avx2_asm.addOutputFileArg("flash_attn_q5_k_avx2.o");
+            fa_q5_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q5_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q5_k_avx2_obj);
+
+            // Flash Attention Q6_K - AVX2
+            const fa_q6_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q6_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q6_k_avx2_asm.addArg("-o");
+            const fa_q6_k_avx2_obj = fa_q6_k_avx2_asm.addOutputFileArg("flash_attn_q6_k_avx2.o");
+            fa_q6_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q6_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q6_k_avx2_obj);
+
+            // Flash Attention Q8_K - AVX2
+            const fa_q8_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+            });
+            fa_q8_k_avx2_asm.addPrefixedDirectoryArg("-I", b.path("src/simd/kernels/x86/flash/"));
+            fa_q8_k_avx2_asm.addArg("-o");
+            const fa_q8_k_avx2_obj = fa_q8_k_avx2_asm.addOutputFileArg("flash_attn_q8_k_avx2.o");
+            fa_q8_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/flash/flash_attn_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(fa_q8_k_avx2_obj);
+
+            std.log.info("SIMD backend enabled for x86_64 with AVX2{s}", .{
+                if (no_avx512) "" else "+AVX512",
+            });
+        } else if (actual_target.result.cpu.arch == .aarch64) {
+            // -----------------------------------------------------------------
+            // ARM AArch64 NEON assembly (.S files compiled via built-in clang)
+            // -----------------------------------------------------------------
+            // Include path for neon_common.h and skeleton includes
+            ggml_lib.addIncludePath(b.path("src/simd/kernels/aarch64"));
+            ggml_lib.addIncludePath(b.path("src/simd/kernels/aarch64/flash"));
+
+            // List of all ARM NEON GAS assembly source files
+            const neon_asm_sources = [_][]const u8{
+                // Flash Attention kernels (14 total)
+                "src/simd/kernels/aarch64/flash/flash_attn_f32_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_f16_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q4_0_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q4_1_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q5_0_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q5_1_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q8_0_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_iq4_nl_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q2_k_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q3_k_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q4_k_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q5_k_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q6_k_neon.S",
+                "src/simd/kernels/aarch64/flash/flash_attn_q8_k_neon.S",
+                // Vec dot kernels (7 total)
+                "src/simd/kernels/aarch64/vec/vec_dot_q4_0_q8_0_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q8_0_q8_0_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q2_k_q8_k_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q3_k_q8_k_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q4_k_q8_k_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q6_k_q8_k_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q8_k_q8_k_neon.S",
+                // Matrix multiplication kernel
+                "src/simd/kernels/aarch64/matrix_mult_neon.S",
+            };
+
+            for (neon_asm_sources) |asm_src| {
+                ggml_lib.addCSourceFile(.{
+                    .file = b.path(asm_src),
+                    .flags = &.{},
+                });
+            }
+
+            std.log.info("SIMD backend enabled for aarch64 with NEON", .{});
         }
     }
 
@@ -617,6 +1309,25 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
     run_step.dependOn(&run_cmd.step);
+
+    // Benchmark Step
+    const bench_exe = b.addExecutable(.{
+        .name = "bench_simd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_simd.zig"),
+            .target = actual_target,
+            .optimize = optimize,
+        }),
+    });
+    bench_exe.linkLibrary(ggml_lib);
+
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        bench_run.addArgs(args);
+    }
+
+    const bench_step = b.step("bench", "Run SIMD benchmarks");
+    bench_step.dependOn(&bench_run.step);
 
     if (use_cuda) {
         if (getCudaPath(b)) |cuda_path| {
