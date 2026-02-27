@@ -109,7 +109,7 @@ jobs:
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y cuda-cudart-dev-12-4 cuda-nvcc-12-4 libcublas-dev-12-4
+          sudo apt-get install -y cuda-cudart-dev-12-4 cuda-nvcc-12-4 libcublas-dev-12-4 cuda-driver-dev-12-4
           echo "/usr/local/cuda-12.4/bin" >> $GITHUB_PATH
           echo "CUDA_PATH=/usr/local/cuda-12.4" >> $GITHUB_ENV
 
@@ -118,9 +118,11 @@ jobs:
         shell: pwsh
         run: |
           $ver = "12.4.0"
+          # NVIDIA component names use major.minor only (e.g. cudart_12.4)
+          $comp = "12.4"
           $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
           Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
-          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s", "cudart_$ver", "nvcc_$ver", "cublas_$ver", "cublas_dev_$ver" -Wait -NoNewWindow
+          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s", "cudart_$comp", "nvcc_$comp", "cublas_$comp", "cublas_dev_$comp", "cuda_driver_dev_$comp" -Wait -NoNewWindow
           echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" >> $env:GITHUB_ENV
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin" >> $env:GITHUB_PATH
 
@@ -128,8 +130,10 @@ jobs:
       - name: Setup Vulkan (Linux)
         if: matrix.vulkan && runner.os == 'Linux'
         run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev vulkan-tools
+          sudo apt-get install -y libvulkan-dev vulkan-headers shaderc
         env:
           DEBIAN_FRONTEND: noninteractive
 
@@ -142,11 +146,18 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe -UseBasicParsing
           Start-Process -FilePath .\vulkan-sdk.exe -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
 
       # ── Build ──
       - name: Build
         run: |
-          ZIG_FLAGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
+          ZIG_FLAGS="-Doptimize=ReleaseFast"
+          # CUDA on Linux: build native (no -Dtarget) because nvcc+g++ produce
+          # GNU libstdc++-dependent objects that are ABI-incompatible with Zig's
+          # bundled musl + LLVM libc++ cross-compilation sysroot.
+          if [[ "${{ matrix.cuda }}" != "true" || "${{ runner.os }}" != "Linux" ]]; then
+            ZIG_FLAGS="$ZIG_FLAGS -Dtarget=${{ matrix.target }}"
+          fi
           if [[ "${{ matrix.cuda }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dcuda=true"; fi
           if [[ "${{ matrix.vulkan }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dvulkan=true"; fi
           if [[ "${{ matrix.simd }}" == "true" ]]; then ZIG_FLAGS="$ZIG_FLAGS -Dsimd-backend=true"; fi
@@ -172,7 +183,12 @@ jobs:
           if [[ "${{ matrix.vulkan }}" == "true" ]]; then SUFFIX="-vulkan"; fi
           
           OUT="dist/MLz-${{ matrix.target }}${SUFFIX}.tar.gz"
-          tar -C "$(dirname "$BIN")" -czf "$OUT" "$(basename "$BIN")"
+          # Include CUDA shared library when present (Linux CUDA builds)
+          FILES="$(basename "$BIN")"
+          if [[ -f "$(dirname "$BIN")/libggml-cuda.so" ]]; then
+            FILES="$FILES libggml-cuda.so"
+          fi
+          tar -C "$(dirname "$BIN")" -czf "$OUT" $FILES
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
