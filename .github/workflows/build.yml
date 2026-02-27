@@ -118,13 +118,22 @@ jobs:
         shell: pwsh
         run: |
           $ver = "12.4.0"
-          # NVIDIA component names use major.minor only (e.g. cudart_12.4)
+          # NVIDIA silent-install component names use major.minor only (e.g. cudart_12.4).
+          # See: https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/
+          # Note: there is NO cuda_driver_dev component on Windows (that's Linux-only).
+          # cuda.lib (driver API stub) is included with cudart on Windows.
           $comp = "12.4"
           $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
           Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
-          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s", "cudart_$comp", "nvcc_$comp", "cublas_$comp", "cublas_dev_$comp", "cuda_driver_dev_$comp" -Wait -NoNewWindow
-          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" >> $env:GITHUB_ENV
-          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin" >> $env:GITHUB_PATH
+          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s", "cudart_$comp", "nvcc_$comp", "cublas_$comp", "cublas_dev_$comp" -Wait -NoNewWindow
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
+            Write-Error "CUDA installation failed: nvcc.exe not found at $cudaPath\bin\nvcc.exe"
+            Get-ChildItem "$cudaPath" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20
+            exit 1
+          }
+          echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+          echo "$cudaPath\bin" >> $env:GITHUB_PATH
 
       # ── Vulkan setup ──
       - name: Setup Vulkan (Linux)
@@ -147,6 +156,24 @@ jobs:
           Start-Process -FilePath .\vulkan-sdk.exe -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+
+      # ── Fetch dependencies (with retry for transient GitHub 503s) ──
+      - name: Fetch Zig dependencies
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt: zig build --fetch"
+            if zig build --fetch; then
+              echo "Dependencies fetched successfully"
+              break
+            fi
+            if [ $attempt -eq 3 ]; then
+              echo "Failed to fetch dependencies after 3 attempts"
+              exit 1
+            fi
+            echo "Fetch failed, retrying in 15s..."
+            sleep 15
+          done
 
       # ── Build ──
       - name: Build

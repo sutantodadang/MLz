@@ -174,20 +174,26 @@
  * Helper Macros for GAS AArch64 Assembly
  * ============================================================================ */
 
-/* Symbol visibility for ELF targets */
-#ifdef __APPLE__
-#define GLOBAL_SYMBOL(name) .globl _##name ; _##name:
-#define SYMBOL_REF(name) _##name
+/* Platform-specific section, symbol, and function macros.
+ * Mach-O (macOS), COFF (Windows), and ELF (Linux) all differ. */
+#if defined(__APPLE__)
+  /* Mach-O: __TEXT,__const for read-only data, underscore-prefixed symbols */
+  #define RODATA_SECTION .section __TEXT,__const
+  #define GLOBAL_SYMBOL(name) .globl _##name ; _##name:
+  #define SYMBOL_REF(name) _##name
+  #define END_FUNCTION(name)
+#elif defined(_WIN32)
+  /* COFF: .rdata for read-only data, no .type/.size directives */
+  #define RODATA_SECTION .section .rdata,"dr"
+  #define GLOBAL_SYMBOL(name) .globl name ; name:
+  #define SYMBOL_REF(name) name
+  #define END_FUNCTION(name)
 #else
-#define GLOBAL_SYMBOL(name) .globl name ; .type name, %function ; name:
-#define SYMBOL_REF(name) name
-#endif
-
-/* Function end marker for ELF */
-#ifdef __APPLE__
-#define END_FUNCTION(name)
-#else
-#define END_FUNCTION(name) .size name, .-name
+  /* ELF (Linux): .rodata for read-only data, .type/.size for function markers */
+  #define RODATA_SECTION .section .rodata
+  #define GLOBAL_SYMBOL(name) .globl name ; .type name, %function ; name:
+  #define SYMBOL_REF(name) name
+  #define END_FUNCTION(name) .size name, .-name
 #endif
 
 #endif /* NEON_COMMON_H */

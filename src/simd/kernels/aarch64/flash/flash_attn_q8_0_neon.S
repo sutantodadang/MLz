@@ -11,7 +11,7 @@
     .text
     .align 4
 
-    .section .rodata
+    RODATA_SECTION
     .align 4
 q8_0_neon_exp_clamp_hi: .float 88.7228
 q8_0_neon_exp_clamp_lo: .float -103.278
