@@ -286,14 +286,24 @@ static void convert_f32_to_f16(const float *src, uint16_t *dst, size_t count) {
   }
 }
 
-// Use posix_memalign on Linux/ARM
+// Aligned allocation for aarch64
 #include <cstdlib>
 static inline void* simd_aligned_alloc(size_t size, size_t align) {
+#ifdef _WIN32
+  return _aligned_malloc(size, align);
+#else
   void* ptr = nullptr;
   if (posix_memalign(&ptr, align, size) != 0) return nullptr;
   return ptr;
+#endif
 }
-static inline void simd_aligned_free(void* ptr) { free(ptr); }
+static inline void simd_aligned_free(void* ptr) {
+#ifdef _WIN32
+  _aligned_free(ptr);
+#else
+  free(ptr);
+#endif
+}
 
 #else  // x86_64
 

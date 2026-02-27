@@ -17,7 +17,7 @@
 #define V_BLOCK_VALUES  IQ4_NL_BLOCK_VALUES
 
 // IQ4_NL lookup table (int8 values, 16 entries)
-    .section .rodata
+    RODATA_SECTION
     .align 4
 .Liq4nl_lut:
     .byte   0xE1    // -31
