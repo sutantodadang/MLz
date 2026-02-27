@@ -16,8 +16,6 @@
     .text
     .align 4
     GLOBAL_SYMBOL(matrix_mult_neon)
-
-matrix_mult_neon:
     // Prologue: save callee-saved registers
     stp     x29, x30, [sp, #-112]!
     mov     x29, sp

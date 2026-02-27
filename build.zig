@@ -131,6 +131,11 @@ pub fn build(b: *std.Build) void {
         cpp_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("OOM");
     }
 
+    // On Linux CUDA builds, compileCudaSources returns a LazyPath to
+    // libggml-cuda.so that must be installed alongside the executable.
+    // Declared here so it's accessible across the cuda setup and install scopes.
+    var cuda_so_output: ?std.Build.LazyPath = null;
+
     if (use_vulkan) {
         c_flags.append(b.allocator, "-DGGML_USE_VULKAN") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-DGGML_USE_VULKAN") catch @panic("OOM");
@@ -300,22 +305,113 @@ pub fn build(b: *std.Build) void {
     }
 
     if (use_vulkan) {
+        // ── Vulkan Shader Generation ──
+        // The ggml-vulkan backend requires SPIR-V shaders embedded as C++ source/headers.
+        // We compile the upstream vulkan-shaders-gen tool (host-native) and run it at
+        // build time against every .comp shader to produce ggml-vulkan-shaders.{hpp,cpp}.
+
+        // Step 1: Build the shader generator as a native host executable
+        const shader_gen_exe = b.addExecutable(.{
+            .name = "vulkan-shaders-gen",
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        shader_gen_exe.addCSourceFile(.{
+            .file = llama_cpp_dep.path("ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
+        shader_gen_exe.linkLibCpp();
+        shader_gen_exe.linkLibC();
+
+        // Step 2: Enumerate all .comp shader source files from the dependency
+        const shader_dir_path = llama_cpp_dep.path("ggml/src/ggml-vulkan/vulkan-shaders");
+        const shader_dir_abs = shader_dir_path.getPath(b);
+        var shader_src_dir = if (std.fs.path.isAbsolute(shader_dir_abs))
+            std.fs.openDirAbsolute(shader_dir_abs, .{ .iterate = true }) catch |err| {
+                std.debug.panic("failed to open Vulkan shader dir (absolute): {s}: {any}", .{ shader_dir_abs, err });
+            }
+        else
+            std.fs.cwd().openDir(shader_dir_abs, .{ .iterate = true }) catch |err| {
+                std.debug.panic("failed to open Vulkan shader dir (relative): {s}: {any}", .{ shader_dir_abs, err });
+            };
+        defer shader_src_dir.close();
+
+        var comp_files: std.ArrayList([]const u8) = .empty;
+        var dir_iter = shader_src_dir.iterate();
+        while (dir_iter.next() catch @panic("iterate vulkan shader dir failed")) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".comp")) {
+                comp_files.append(b.allocator, b.allocator.dupe(u8, entry.name) catch @panic("OOM")) catch @panic("OOM");
+            }
+        }
+
+        // Step 3: For each .comp file, run the shader generator to compile
+        //         GLSL → SPIR-V and embed data into a .cpp translation unit.
+        //         The generated .cpp files #include the generated hpp header
+        //         (ggml-vulkan-shaders.hpp) which itself #include <cstdint>.
+        //         NOTE: Do NOT use "-include cstdint" here — Zig 0.15's
+        //         cross-compile C compilation caching chokes on the
+        //         -include flag with system headers, producing spurious
+        //         CacheCheckFailed errors for every .comp.cpp file.
+        var shader_data_cpp_flags: std.ArrayList([]const u8) = .empty;
+        shader_data_cpp_flags.append(b.allocator, "-std=c++17") catch @panic("OOM");
+
+        for (comp_files.items) |comp_file| {
+            const rel_path = b.fmt("ggml/src/ggml-vulkan/vulkan-shaders/{s}", .{comp_file});
+            const run_gen = b.addRunArtifact(shader_gen_exe);
+            run_gen.addArg("--glslc");
+            run_gen.addArg("glslc");
+            run_gen.addArg("--source");
+            run_gen.addFileArg(llama_cpp_dep.path(rel_path));
+            run_gen.addArg("--output-dir");
+            _ = run_gen.addOutputDirectoryArg(b.fmt("vk-spirv-{s}", .{comp_file}));
+            // The tool uses basename(target_hpp) to emit #include "..." in
+            // each generated .cpp.  Without this, the .cpp starts with
+            // #include "" which is a compile error.
+            run_gen.addArg("--target-hpp");
+            run_gen.addArg("ggml-vulkan-shaders.hpp");
+            run_gen.addArg("--target-cpp");
+            const gen_cpp = run_gen.addOutputFileArg(b.fmt("{s}.cpp", .{comp_file}));
+            ggml_lib.addCSourceFile(.{
+                .file = gen_cpp,
+                .flags = shader_data_cpp_flags.items,
+            });
+        }
+
+        // Step 4: Run the shader generator once without --source to produce
+        //         the header file with extern declarations for all shaders.
+        const run_gen_hpp = b.addRunArtifact(shader_gen_exe);
+        run_gen_hpp.addArg("--output-dir");
+        _ = run_gen_hpp.addOutputDirectoryArg("vk-spirv-hpp");
+        run_gen_hpp.addArg("--target-hpp");
+        const generated_hpp = run_gen_hpp.addOutputFileArg("ggml-vulkan-shaders.hpp");
+
+        // Add generated header directory so #include "ggml-vulkan-shaders.hpp" resolves
+        ggml_lib.addIncludePath(generated_hpp.dirname());
+
+        // ── Vulkan Backend Source ──
         ggml_lib.addCSourceFile(.{
             .file = llama_cpp_dep.path("ggml/src/ggml-vulkan/ggml-vulkan.cpp"),
             .flags = cpp_flags.items,
         });
         ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-vulkan"));
 
-        // Platform-specific Vulkan SDK handling
+        // Platform-specific Vulkan SDK handling — include paths and library
+        // search paths for compilation.  Do NOT linkSystemLibrary here because
+        // ggml_lib is a static archive and LLD will warn about .so members in
+        // the .a file.  The final exe links vulkan directly (see below).
         switch (target.result.os.tag) {
             .windows => {
                 if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
                     const lib_path = b.pathJoin(&.{ sdk_path, "Lib" });
                     ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
+                    // Vulkan headers are at <VULKAN_SDK>/Include (not in default search paths)
+                    const inc_path = b.pathJoin(&.{ sdk_path, "Include" });
+                    ggml_lib.addSystemIncludePath(.{ .cwd_relative = inc_path });
                 } else {
                     std.log.warn("VULKAN_SDK environment variable not set. Vulkan build may fail.", .{});
                 }
-                ggml_lib.linkSystemLibrary("vulkan-1");
             },
             .linux => {
                 // Use VULKAN_SDK if available, otherwise try system paths
@@ -325,25 +421,27 @@ pub fn build(b: *std.Build) void {
                     const inc_path = b.pathJoin(&.{ sdk_path, "include" });
                     ggml_lib.addSystemIncludePath(.{ .cwd_relative = inc_path });
                 } else {
-                    // Fallback: add standard multiarch library paths for cross-compilation
-                    // Zig's cross-compile linker doesn't search /usr/lib/<triple> by default
-                    ggml_lib.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-                    ggml_lib.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+                    // Fallback: add standard multiarch library path for cross-compilation
+                    // Zig's cross-compile linker doesn't search /usr/lib/<triple> by default.
+                    // Only add the path matching the target arch to avoid FileNotFound warnings.
+                    const linux_multiarch_dir: []const u8 = switch (target.result.cpu.arch) {
+                        .aarch64 => "/usr/lib/aarch64-linux-gnu",
+                        else => "/usr/lib/x86_64-linux-gnu",
+                    };
+                    ggml_lib.addLibraryPath(.{ .cwd_relative = linux_multiarch_dir });
                     ggml_lib.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
                 }
-                ggml_lib.linkSystemLibrary("vulkan");
             },
             .macos => {
                 // macOS uses MoltenVK via Vulkan SDK
                 if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
                     const lib_path = b.pathJoin(&.{ sdk_path, "lib" });
                     ggml_lib.addLibraryPath(.{ .cwd_relative = lib_path });
+                    const inc_path = b.pathJoin(&.{ sdk_path, "include" });
+                    ggml_lib.addSystemIncludePath(.{ .cwd_relative = inc_path });
                 }
-                ggml_lib.linkSystemLibrary("vulkan");
             },
-            else => {
-                ggml_lib.linkSystemLibrary("vulkan");
-            },
+            else => {},
         }
     } else if (use_cuda) {
         // CUDA support - detect paths from environment variables
@@ -368,21 +466,22 @@ pub fn build(b: *std.Build) void {
         };
         ggml_lib.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
 
-        // Link CUDA libraries
-        if (target.result.os.tag == .windows) {
-            ggml_lib.linkSystemLibrary("cudart");
-            ggml_lib.linkSystemLibrary("cublas");
-            ggml_lib.linkSystemLibrary("cuda");
-        } else {
-            ggml_lib.linkSystemLibrary("cudart");
-            ggml_lib.linkSystemLibrary("cublas");
-            ggml_lib.linkSystemLibrary("cuda");
+        // On Linux, add CUDA stubs path for libcuda.so driver API stub.
+        // The CUDA toolkit ships stub libraries for CI/build environments
+        // that don't have a physical GPU or NVIDIA driver installed.
+        if (target.result.os.tag != .windows) {
+            const cuda_stubs_path = b.pathJoin(&.{ cuda_root, "lib64", "stubs" });
+            ggml_lib.addLibraryPath(.{ .cwd_relative = cuda_stubs_path });
         }
 
-        // Compile CUDA sources with nvcc (Windows-specific for now)
-        if (target.result.os.tag == .windows) {
-            compileCudaSources(b, ggml_lib, llama_cpp_dep, cuda_root, ggml_cuda_path_abs);
-        }
+        // NOTE: Do NOT linkSystemLibrary for CUDA on ggml_lib (static archive).
+        // LLD will warn/error about .so members in .a files.  The final exe
+        // links CUDA libraries directly (see below).  On Linux, libstdc++ is
+        // handled by the CUDA shared library (see compileCudaSources).
+
+        // Compile CUDA sources with nvcc.  On Linux, this returns a LazyPath
+        // to libggml-cuda.so which must be installed alongside the executable.
+        cuda_so_output = compileCudaSources(b, ggml_lib, llama_cpp_dep, cuda_root, ggml_cuda_path_abs, target.result.os.tag);
     }
 
     // Metal backend for Apple Silicon GPU acceleration
@@ -1152,13 +1251,15 @@ pub fn build(b: *std.Build) void {
             else => b.pathJoin(&.{ cuda_path, "lib64" }),
         };
         llama_lib.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
-        if (target.result.os.tag == .windows) {
-            llama_lib.linkSystemLibrary("cudart_static");
-        } else {
-            llama_lib.linkSystemLibrary("cudart");
+        // Add CUDA stubs path for CI/build environments without a GPU driver.
+        // The CUDA toolkit ships stub libraries (libcuda.so) needed at link time.
+        if (target.result.os.tag != .windows) {
+            const llama_cuda_stubs = b.pathJoin(&.{ cuda_path, "lib64", "stubs" });
+            llama_lib.addLibraryPath(.{ .cwd_relative = llama_cuda_stubs });
         }
-        llama_lib.linkSystemLibrary("cublas");
-        llama_lib.linkSystemLibrary("cuda");
+        // NOTE: Do NOT linkSystemLibrary for CUDA on llama_lib (static archive).
+        // Same reasoning as ggml_lib — LLD warns about .so members in .a files.
+        // The final exe links all CUDA libraries directly.
     }
 
     if (use_metal) {
@@ -1208,6 +1309,36 @@ pub fn build(b: *std.Build) void {
     }
     llama_lib.linkLibrary(ggml_lib);
 
+    // Zig 0.15 does not propagate addLibraryPath from static archives linked
+    // via linkLibrary.  Duplicate the platform-specific library paths so that
+    // llama can resolve ggml's transitive system library deps (e.g. Vulkan).
+    if (use_vulkan) {
+        switch (target.result.os.tag) {
+            .linux => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    llama_lib.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "lib" }) });
+                } else {
+                    const llama_multiarch_dir: []const u8 = switch (target.result.cpu.arch) {
+                        .aarch64 => "/usr/lib/aarch64-linux-gnu",
+                        else => "/usr/lib/x86_64-linux-gnu",
+                    };
+                    llama_lib.addLibraryPath(.{ .cwd_relative = llama_multiarch_dir });
+                }
+            },
+            .windows => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    llama_lib.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Lib" }) });
+                }
+            },
+            .macos => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    llama_lib.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "lib" }) });
+                }
+            },
+            else => {},
+        }
+    }
+
     const exe = b.addExecutable(.{
         .name = "MLz",
         .root_module = b.createModule(.{
@@ -1239,6 +1370,11 @@ pub fn build(b: *std.Build) void {
             else => b.pathJoin(&.{ cuda_path, "lib64" }),
         };
         exe.addLibraryPath(.{ .cwd_relative = cuda_lib_path });
+        // Add CUDA stubs path for CI/build environments without a GPU driver.
+        if (target.result.os.tag != .windows) {
+            const exe_cuda_stubs = b.pathJoin(&.{ cuda_path, "lib64", "stubs" });
+            exe.addLibraryPath(.{ .cwd_relative = exe_cuda_stubs });
+        }
 
         if (target.result.os.tag == .windows) {
             exe.linkSystemLibrary("cudart_static");
@@ -1259,9 +1395,56 @@ pub fn build(b: *std.Build) void {
             }
         } else {
             exe.linkSystemLibrary("cudart");
+            // On Linux, CUDA objects live in libggml-cuda.so (built by
+            // compileCudaSources with g++ -shared -lstdc++).  Link the
+            // .so directly to the exe so lld can resolve CUDA symbols.
+            // Static archives (ggml_lib) cannot contain .so files.
+            if (cuda_so_output) |cuda_so| {
+                exe.addObjectFile(cuda_so);
+            }
+            // Set RPATH so the binary can find libggml-cuda.so at runtime
+            // in the same directory as the executable.
+            exe.root_module.addRPathSpecial("$ORIGIN");
         }
         exe.linkSystemLibrary("cublas");
         exe.linkSystemLibrary("cuda");
+    }
+
+    // Vulkan: link the system library on the executable only.  Do NOT put
+    // linkSystemLibrary on static archives (ggml_lib/llama_lib) because LLD
+    // will try to include the .so as an archive member and warn/error.
+    // Zig 0.15 also does not propagate addLibraryPath from linkLibrary'd
+    // static archives, so we duplicate the search paths here.
+    if (use_vulkan) {
+        switch (target.result.os.tag) {
+            .linux => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    exe.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "lib" }) });
+                } else {
+                    const exe_multiarch_dir: []const u8 = switch (target.result.cpu.arch) {
+                        .aarch64 => "/usr/lib/aarch64-linux-gnu",
+                        else => "/usr/lib/x86_64-linux-gnu",
+                    };
+                    exe.addLibraryPath(.{ .cwd_relative = exe_multiarch_dir });
+                }
+                exe.linkSystemLibrary("vulkan");
+            },
+            .windows => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    exe.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Lib" }) });
+                }
+                exe.linkSystemLibrary("vulkan-1");
+            },
+            .macos => {
+                if (b.graph.env_map.get("VULKAN_SDK")) |sdk_path| {
+                    exe.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "lib" }) });
+                }
+                exe.linkSystemLibrary("vulkan");
+            },
+            else => {
+                exe.linkSystemLibrary("vulkan");
+            },
+        }
     }
 
     // Link Metal frameworks to executable
@@ -1300,6 +1483,14 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+
+    // Install CUDA shared library alongside the executable (Linux only).
+    // The .so encapsulates GNU libstdc++ dependencies and is found at
+    // runtime via the $ORIGIN RPATH set on the executable.
+    if (cuda_so_output) |cuda_so| {
+        const install_cuda_so = b.addInstallFile(cuda_so, "bin/libggml-cuda.so");
+        b.getInstallStep().dependOn(&install_cuda_so.step);
+    }
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
@@ -1412,38 +1603,70 @@ fn getWindowsSdkLibPath(b: *std.Build, lib_type: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Compile CUDA source files with nvcc (Windows).
+/// Compile CUDA source files (.cu) with nvcc.
+/// Supports both Windows (MSVC host compiler) and Linux (g++) targets.
+///
+/// On Linux, CUDA objects are linked into a shared library (libggml-cuda.so)
+/// with `-lstdc++` to isolate GNU libstdc++ from Zig's LLVM libc++.  The
+/// returned `LazyPath` (non-null on Linux) must be installed alongside the
+/// executable so the dynamic linker can find it at runtime.
+///
+/// On Windows, objects are added directly to `ggml_lib` and `null` is returned.
 fn compileCudaSources(
     b: *std.Build,
     ggml_lib: *std.Build.Step.Compile,
     llama_cpp_dep: *std.Build.Dependency,
     cuda_root: []const u8,
     ggml_cuda_path_abs: []const u8,
-) void {
-    const nvcc_path = b.pathJoin(&.{ cuda_root, "bin", "nvcc.exe" });
+    target_os: std.Target.Os.Tag,
+) ?std.Build.LazyPath {
+    const nvcc_path = if (target_os == .windows)
+        b.pathJoin(&.{ cuda_root, "bin", "nvcc.exe" })
+    else
+        b.pathJoin(&.{ cuda_root, "bin", "nvcc" });
 
-    // Get MSVC paths from environment or use defaults
-    const msvc_base = b.graph.env_map.get("VCToolsInstallDir") orelse
-        "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207";
-    const sdk_include = b.graph.env_map.get("WindowsSdkDir") orelse
-        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0";
+    // MSVC host-compiler paths (Windows only)
+    var msvc_base: []const u8 = "";
+    var sdk_include: []const u8 = "";
+    var cl_path_win: []const u8 = "";
+    var cl_dir_win: []const u8 = "";
+    var include_var: []const u8 = "";
 
-    const cl_path_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64", "cl.exe" });
-    const cl_dir_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64" });
+    if (target_os == .windows) {
+        msvc_base = b.graph.env_map.get("VCToolsInstallDir") orelse
+            "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207";
+        sdk_include = b.graph.env_map.get("WindowsSdkDir") orelse
+            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0";
+        cl_path_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64", "cl.exe" });
+        cl_dir_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64" });
+        include_var = b.fmt(
+            "{s}/include;{s}/ucrt;{s}/shared;{s}/um",
+            .{ msvc_base, sdk_include, sdk_include, sdk_include },
+        );
+    }
 
-    const include_var = b.fmt(
-        "{s}/include;{s}/ucrt;{s}/shared;{s}/um",
-        .{ msvc_base, sdk_include, sdk_include, sdk_include },
-    );
-
-    // Discover and compile all .cu files
-    var cuda_dir = std.fs.openDirAbsolute(ggml_cuda_path_abs, .{ .iterate = true }) catch |err| {
+    // Discover and compile all .cu files.
+    // Use cwd().openDir() instead of openDirAbsolute() because the
+    // dependency-resolved path may be relative (e.g. .zig-cache/p/…).
+    // On POSIX, openat(AT_FDCWD, path) handles both absolute and relative paths.
+    var cuda_dir = std.fs.cwd().openDir(ggml_cuda_path_abs, .{ .iterate = true }) catch |err| {
         std.debug.panic("failed to open ggml-cuda dir: {s}: {any}", .{ ggml_cuda_path_abs, err });
     };
     defer cuda_dir.close();
 
     var walker = cuda_dir.walk(b.allocator) catch @panic("oom walking ggml-cuda");
     defer walker.deinit();
+
+    // llama.cpp include paths (computed once)
+    const inc_ggml_include = llama_cpp_dep.path("ggml/include").getPath(b);
+    const inc_ggml_src = llama_cpp_dep.path("ggml/src").getPath(b);
+
+    // On Linux, collect CUDA objects to link into a shared library with
+    // libstdc++.  This isolates GNU libstdc++ symbols from the main binary's
+    // LLVM libc++ to avoid duplicate/undefined symbol conflicts.  On Windows,
+    // CUDA objects link directly into ggml_lib (MSVC runtime has no
+    // such conflict with Zig's C++ runtime).
+    var linux_cuda_objs: std.ArrayList(std.Build.LazyPath) = .empty;
 
     while (true) {
         const entry_opt = walker.next() catch @panic("walk failed");
@@ -1454,52 +1677,96 @@ fn compileCudaSources(
 
         const cc = b.addSystemCommand(&.{nvcc_path});
 
-        // Explicitly set PATH to include MSVC bin dir
-        const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
-        cc.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ cl_dir_win, current_path }));
-        cc.setEnvironmentVariable("INCLUDE", include_var);
-        cc.addArg("-c");
-        cc.addArg("-O3");
-        cc.addArg("-std=c++17");
-        cc.addArg("--extended-lambda");
-        cc.addArg("--use-local-env");
-        cc.addArg("-ccbin");
-        cc.addArg(cl_path_win);
+        if (target_os == .windows) {
+            // Windows: use MSVC as host compiler
+            const current_path = std.process.getEnvVarOwned(b.allocator, "PATH") catch "";
+            cc.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ cl_dir_win, current_path }));
+            cc.setEnvironmentVariable("INCLUDE", include_var);
+            cc.addArg("-c");
+            cc.addArg("-O3");
+            cc.addArg("-std=c++17");
+            cc.addArg("--extended-lambda");
+            cc.addArg("--use-local-env");
+            cc.addArg("-ccbin");
+            cc.addArg(cl_path_win);
+            cc.addArg("-Xcompiler");
+            cc.addArg("/bigobj");
+            cc.addArg("-Xcompiler");
+            cc.addArg("/std:c++17");
+            cc.addArg("-Xcompiler");
+            cc.addArg("/w");
+        } else {
+            // Linux: use g++ as host compiler (nvcc default).
+            // The resulting .o files reference GNU libstdc++ symbols.
+            // We handle the libc++/libstdc++ conflict by linking these
+            // objects into a shared library (see below) rather than
+            // adding them directly to the static ggml_lib.
+            cc.addArg("-c");
+            cc.addArg("-O3");
+            cc.addArg("-std=c++17");
+            cc.addArg("--extended-lambda");
+            cc.addArg("-Xcompiler");
+            cc.addArg("-fPIC");
+            cc.addArg("-Xcompiler");
+            cc.addArg("-w");
+            // Disable glibc fortification to avoid __fprintf_chk / __*_chk
+            // references that Zig's bundled libc does not expose.
+            cc.addArg("-Xcompiler");
+            cc.addArg("-U_FORTIFY_SOURCE");
+            cc.addArg("-Xcompiler");
+            cc.addArg("-D_FORTIFY_SOURCE=0");
+        }
 
-        cc.addArg("-Xcompiler");
-        cc.addArg("/bigobj");
-        cc.addArg("-Xcompiler");
-        cc.addArg("/std:c++17");
-        cc.addArg("-Xcompiler");
-        cc.addArg("/w");
-
+        // Common flags
         cc.addArg("-DGGML_USE_CUDA");
         cc.addArg("-D_CRT_SECURE_NO_WARNINGS");
         cc.addArg("-DGGML_VERSION=100");
         cc.addArg("-DGGML_COMMIT=unknown");
 
-        // CUDA include path
+        // Include paths
         cc.addArg("-I");
         cc.addArg(b.pathJoin(&.{ cuda_root, "include" }));
-
-        // llama.cpp paths
-        const inc2 = llama_cpp_dep.path("ggml/include").getPath(b);
-        const inc3 = llama_cpp_dep.path("ggml/src").getPath(b);
-
         cc.addArg("-I");
         cc.addArg(ggml_cuda_path_abs);
         cc.addArg("-I");
-        cc.addArg(inc2);
+        cc.addArg(inc_ggml_include);
         cc.addArg("-I");
-        cc.addArg(inc3);
+        cc.addArg(inc_ggml_src);
 
         const source_path = b.fmt("{s}/{s}", .{ ggml_cuda_path_abs, entry.path });
         cc.addArg(source_path);
 
         cc.addArg("-o");
-        const obj_name = b.fmt("{s}.obj", .{entry.path});
+        const obj_ext = if (target_os == .windows) ".obj" else ".o";
+        const obj_name = b.fmt("{s}{s}", .{ entry.path, obj_ext });
         const obj = cc.addOutputFileArg(obj_name);
 
-        ggml_lib.addObjectFile(obj);
+        if (target_os == .windows) {
+            ggml_lib.addObjectFile(obj);
+        } else {
+            linux_cuda_objs.append(b.allocator, obj) catch @panic("oom");
+        }
     }
+
+    // On Linux: link CUDA objects into libggml-cuda.so with g++ to isolate
+    // GNU libstdc++ from Zig's LLVM libc++.  The shared library encapsulates
+    // all libstdc++ dependencies; the dynamic linker keeps them in a separate
+    // linking scope from the main binary's libc++.
+    if (target_os != .windows and linux_cuda_objs.items.len > 0) {
+        const cuda_lib_path = b.pathJoin(&.{ cuda_root, "lib64" });
+        const link_so = b.addSystemCommand(&.{ "g++", "-shared", "-o" });
+        const cuda_so = link_so.addOutputFileArg("libggml-cuda.so");
+        for (linux_cuda_objs.items) |obj| {
+            link_so.addFileArg(obj);
+        }
+        link_so.addArgs(&.{
+            "-L",       cuda_lib_path,
+            "-lcudart", "-lcublas",
+            "-lstdc++",
+        });
+        // Return the .so path — the caller adds it directly to the exe
+        // (not to ggml_lib, because static archives cannot contain .so files).
+        return cuda_so;
+    }
+    return null;
 }

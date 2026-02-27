@@ -19,8 +19,6 @@
     .text
     .align 4
     GLOBAL_SYMBOL(simd_vec_dot_q3_k_q8_k_neon)
-
-simd_vec_dot_q3_k_q8_k_neon:
     stp     x29, x30, [sp, #-96]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]

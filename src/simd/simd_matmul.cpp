@@ -304,6 +304,7 @@ static inline void simd_aligned_free(void* ptr) { free(ptr); }
 #endif
 
 // Convert FP16 array to FP32 using F16C instructions (8 elements at a time)
+__attribute__((target("avx2,fma,f16c")))
 static void convert_f16_to_f32(const uint16_t *src, float *dst, size_t count) {
   size_t i = 0;
 
@@ -354,6 +355,7 @@ static void convert_f16_to_f32(const uint16_t *src, float *dst, size_t count) {
 }
 
 // Convert FP32 array to FP16 using F16C instructions (8 elements at a time)
+__attribute__((target("avx2,fma,f16c")))
 static void convert_f32_to_f16(const float *src, uint16_t *dst, size_t count) {
   size_t i = 0;
 

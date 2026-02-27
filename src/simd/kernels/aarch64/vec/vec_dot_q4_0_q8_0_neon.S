@@ -20,8 +20,6 @@
     .text
     .align 4
     GLOBAL_SYMBOL(simd_vec_dot_q4_0_q8_0_neon)
-
-simd_vec_dot_q4_0_q8_0_neon:
     // Prologue
     stp     x29, x30, [sp, #-64]!
     mov     x29, sp
