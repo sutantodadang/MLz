@@ -557,12 +557,10 @@ GLOBAL_SYMBOL(simd_flash_attn_f32_neon)
 // ===========================================================================
 .Lf32_exp_scalar:
     // Clamp input
-    adrp    x7, neon_exp_clamp_hi
-    add     x7, x7, :lo12:neon_exp_clamp_hi
+    ADRP_LO12(x7, neon_exp_clamp_hi)
     ldr     s16, [x7]
     fmin    s2, s2, s16
-    adrp    x7, neon_exp_clamp_lo
-    add     x7, x7, :lo12:neon_exp_clamp_lo
+    ADRP_LO12(x7, neon_exp_clamp_lo)
     ldr     s16, [x7]
     fmax    s2, s2, s16
 
@@ -571,36 +569,29 @@ GLOBAL_SYMBOL(simd_flash_attn_f32_neon)
     // n = round(t)
     // r = x - n * ln(2)
     // exp(x) = 2^n * (1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120)
-    adrp    x7, neon_exp_log2e
-    add     x7, x7, :lo12:neon_exp_log2e
+    ADRP_LO12(x7, neon_exp_log2e)
     ldr     s16, [x7]
     fmul    s17, s2, s16             // t = x * log2(e)
     frintn  s18, s17                 // n = round(t)
 
     // r = x - n * ln(2)
-    adrp    x7, neon_exp_ln2
-    add     x7, x7, :lo12:neon_exp_ln2
+    ADRP_LO12(x7, neon_exp_ln2)
     ldr     s16, [x7]
     fnmsub  s19, s18, s16, s2        // r = x - n * ln(2)
 
     // Polynomial: p = 1 + r*(1 + r*(0.5 + r*(1/6 + r*(1/24 + r/120))))
-    adrp    x7, neon_exp_c3
-    add     x7, x7, :lo12:neon_exp_c3
+    ADRP_LO12(x7, neon_exp_c3)
     ldr     s0, [x7]                // 1/120
-    adrp    x7, neon_exp_c2
-    add     x7, x7, :lo12:neon_exp_c2
+    ADRP_LO12(x7, neon_exp_c2)
     ldr     s16, [x7]               // 1/24
     fmadd   s0, s0, s19, s16        // 1/24 + r/120
-    adrp    x7, neon_exp_c1
-    add     x7, x7, :lo12:neon_exp_c1
+    ADRP_LO12(x7, neon_exp_c1)
     ldr     s16, [x7]               // 1/6
     fmadd   s0, s0, s19, s16        // 1/6 + r*(1/24 + r/120)
-    adrp    x7, neon_half
-    add     x7, x7, :lo12:neon_half
+    ADRP_LO12(x7, neon_half)
     ldr     s16, [x7]               // 0.5
     fmadd   s0, s0, s19, s16        // 0.5 + r*(...)
-    adrp    x7, neon_one
-    add     x7, x7, :lo12:neon_one
+    ADRP_LO12(x7, neon_one)
     ldr     s16, [x7]               // 1.0
     fmadd   s0, s0, s19, s16        // 1.0 + r*(...)
     fmadd   s0, s0, s19, s16        // 1.0 + r*(1.0 + r*(...))

@@ -4,6 +4,7 @@
 #include "binary-ops.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "common.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -79,6 +80,9 @@
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
+
+// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
+float ggml_table_f32_e8m0_half[1 << 8];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -276,6 +280,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         {
             .from_float = quantize_row_mxfp4,
             .vec_dot = ggml_vec_dot_mxfp4_q8_0,
+            .vec_dot_type = GGML_TYPE_Q8_0,
+            .nrows = 1,
+        },
+    [GGML_TYPE_NVFP4] =
+        {
+            .from_float = quantize_row_nvfp4,
+            .vec_dot = ggml_vec_dot_nvfp4_q8_0,
             .vec_dot_type = GGML_TYPE_Q8_0,
             .nrows = 1,
         },
@@ -1988,6 +1999,9 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
   case GGML_OP_SOLVE_TRI: {
     ggml_compute_forward_solve_tri(params, tensor);
   } break;
+  case GGML_OP_GATED_DELTA_NET: {
+    ggml_compute_forward_gated_delta_net(params, tensor);
+  } break;
   case GGML_OP_MAP_CUSTOM1: {
     ggml_compute_forward_map_custom1(params, tensor);
   } break;
@@ -2145,7 +2159,8 @@ static int ggml_get_n_tasks(struct ggml_tensor *node, int n_threads) {
     n_tasks = 1;
   } break;
   case GGML_OP_COUNT_EQUAL:
-  case GGML_OP_SOLVE_TRI: {
+  case GGML_OP_SOLVE_TRI:
+  case GGML_OP_GATED_DELTA_NET: {
     n_tasks = n_threads;
   } break;
   case GGML_OP_REPEAT:
@@ -2840,11 +2855,20 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph *cgraph,
         cur += sizeof(int32_t) * node->src[0]->ne[0] * n_tasks;
       } break;
       case GGML_OP_FLASH_ATTN_EXT: {
-        const int64_t ne10 = node->src[1]->ne[0]; // DK
-        const int64_t ne20 = node->src[2]->ne[0]; // DV
+        const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+        const int64_t DK = node->src[1]->ne[0];
+        const int64_t DV = node->src[2]->ne[0];
 
-        cur = sizeof(float) * (1 * ne10 + 2 * ne20) *
-              n_tasks; // 1x head size K + 2x head size V (per thread)
+        // Tiled flash attention scratch (tile sizes defined in common.h)
+        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
+        size_t prefill = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+
+        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
+        // Per-thread: VKQ accumulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+        size_t n_chunks = n_tasks;
+        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+
+        cur += MAX(prefill, decode);
       } break;
       case GGML_OP_FLASH_ATTN_BACK: {
         const int64_t D = node->src[0]->ne[0];
@@ -2870,6 +2894,10 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph *cgraph,
       case GGML_OP_CROSS_ENTROPY_LOSS: {
         cur = ggml_type_size(node->type) *
               (n_tasks + node->src[0]->ne[0] * n_tasks);
+      } break;
+      case GGML_OP_GATED_DELTA_NET: {
+        const int64_t S_v = node->src[2]->ne[0];
+        cur = S_v * sizeof(float) * n_tasks;
       } break;
       case GGML_OP_COUNT: {
         GGML_ABORT("fatal error");
@@ -3680,6 +3708,11 @@ void ggml_cpu_init(void) {
         ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
         ggml_table_gelu_quick_f16[i] =
             GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
+      }
+
+      // initialize E8M0 half table (256 entries)
+      for (int i = 0; i < (1 << 8); ++i) {
+          ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
       }
 
       const uint64_t t_end = ggml_time_us();
