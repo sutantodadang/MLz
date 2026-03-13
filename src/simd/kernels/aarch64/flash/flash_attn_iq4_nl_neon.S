@@ -45,8 +45,7 @@
     add     x9, \k_ptr, #2            // nibble data
 
     // Load LUT address
-    adrp    x15, .Liq4nl_lut
-    add     x15, x15, :lo12:.Liq4nl_lut
+    ADRP_LO12(x15, .Liq4nl_lut)
 
     mov     x14, #0
 
@@ -81,8 +80,7 @@
     mov     x10, \o_ptr
     mov     x11, \nblk
 
-    adrp    x15, .Liq4nl_lut
-    add     x15, x15, :lo12:.Liq4nl_lut
+    ADRP_LO12(x15, .Liq4nl_lut)
 
 .Liq4_vb_\@:
     cbz     x11, .Liq4_ve_\@

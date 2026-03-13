@@ -218,8 +218,7 @@ GLOBAL_SYMBOL(simd_flash_attn_q4_0_neon)
     // Values 0-3
     uxtl    v2.4s, v20.4h
     ucvtf   v2.4s, v2.4s
-    adrp    x9, q4_0_neon_eight
-    add     x9, x9, :lo12:q4_0_neon_eight
+    ADRP_LO12(x9, q4_0_neon_eight)
     ld1r    {v3.4s}, [x9]
     fsub    v2.4s, v2.4s, v3.4s        // dequant values 0-3
     fmul    v2.4s, v2.4s, v8.s[0]     // * scale
@@ -424,8 +423,7 @@ GLOBAL_SYMBOL(simd_flash_attn_q4_0_neon)
     uxtl    v22.8h, v19.8b
     uxtl2   v23.8h, v19.16b
 
-    adrp    x9, q4_0_neon_eight
-    add     x9, x9, :lo12:q4_0_neon_eight
+    ADRP_LO12(x9, q4_0_neon_eight)
     ld1r    {v3.4s}, [x9]
 
     // Process 8 groups of 4 values each (32 total)
@@ -523,40 +521,31 @@ GLOBAL_SYMBOL(simd_flash_attn_q4_0_neon)
 
 // Scalar exp subroutine
 .Lq4_0_exp_scalar:
-    adrp    x7, q4_0_neon_exp_clamp_hi
-    add     x7, x7, :lo12:q4_0_neon_exp_clamp_hi
+    ADRP_LO12(x7, q4_0_neon_exp_clamp_hi)
     ldr     s16, [x7]
     fmin    s2, s2, s16
-    adrp    x7, q4_0_neon_exp_clamp_lo
-    add     x7, x7, :lo12:q4_0_neon_exp_clamp_lo
+    ADRP_LO12(x7, q4_0_neon_exp_clamp_lo)
     ldr     s16, [x7]
     fmax    s2, s2, s16
-    adrp    x7, q4_0_neon_exp_log2e
-    add     x7, x7, :lo12:q4_0_neon_exp_log2e
+    ADRP_LO12(x7, q4_0_neon_exp_log2e)
     ldr     s16, [x7]
     fmul    s17, s2, s16
     frintn  s18, s17
-    adrp    x7, q4_0_neon_exp_ln2
-    add     x7, x7, :lo12:q4_0_neon_exp_ln2
+    ADRP_LO12(x7, q4_0_neon_exp_ln2)
     ldr     s16, [x7]
     fnmsub  s19, s18, s16, s2
-    adrp    x7, q4_0_neon_exp_c3
-    add     x7, x7, :lo12:q4_0_neon_exp_c3
+    ADRP_LO12(x7, q4_0_neon_exp_c3)
     ldr     s0, [x7]
-    adrp    x7, q4_0_neon_exp_c2
-    add     x7, x7, :lo12:q4_0_neon_exp_c2
+    ADRP_LO12(x7, q4_0_neon_exp_c2)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, q4_0_neon_exp_c1
-    add     x7, x7, :lo12:q4_0_neon_exp_c1
+    ADRP_LO12(x7, q4_0_neon_exp_c1)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, q4_0_neon_half
-    add     x7, x7, :lo12:q4_0_neon_half
+    ADRP_LO12(x7, q4_0_neon_half)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, q4_0_neon_one
-    add     x7, x7, :lo12:q4_0_neon_one
+    ADRP_LO12(x7, q4_0_neon_one)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
     fmadd   s0, s0, s19, s16

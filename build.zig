@@ -193,6 +193,11 @@ pub fn build(b: *std.Build) void {
         .file = llama_cpp_dep.path("ggml/src/ggml-backend-reg.cpp"),
         .flags = cpp_flags.items,
     });
+    // ggml (dynamic loading support)
+    ggml_lib.addCSourceFile(.{
+        .file = llama_cpp_dep.path("ggml/src/ggml-backend-dl.cpp"),
+        .flags = cpp_flags.items,
+    });
     ggml_lib.addCSourceFile(.{
         .file = llama_cpp_dep.path("ggml/src/ggml-threading.cpp"),
         .flags = cpp_flags.items,

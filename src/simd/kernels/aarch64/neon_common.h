@@ -196,4 +196,12 @@
   #define END_FUNCTION(name) .size name, .-name
 #endif
 
+/* Cross-platform ADRP + ADD for loading a symbol address into a register.
+ * Mach-O (macOS) requires @PAGE/@PAGEOFF relocations; ELF uses :lo12:. */
+#if defined(__APPLE__)
+  #define ADRP_LO12(reg, symbol) adrp reg, symbol@PAGE ; add reg, reg, symbol@PAGEOFF
+#else
+  #define ADRP_LO12(reg, symbol) adrp reg, symbol ; add reg, reg, :lo12:symbol
+#endif
+
 #endif /* NEON_COMMON_H */

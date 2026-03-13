@@ -430,43 +430,34 @@ GLOBAL_SYMBOL(KERNEL_NAME)
 
 // Scalar exp subroutine
 .Lskel_exp_scalar:
-    adrp    x7, .Lskel_exp_clamp_hi
-    add     x7, x7, :lo12:.Lskel_exp_clamp_hi
+    ADRP_LO12(x7, .Lskel_exp_clamp_hi)
     ldr     s16, [x7]
     fmin    s2, s2, s16
-    adrp    x7, .Lskel_exp_clamp_lo
-    add     x7, x7, :lo12:.Lskel_exp_clamp_lo
+    ADRP_LO12(x7, .Lskel_exp_clamp_lo)
     ldr     s16, [x7]
     fmax    s2, s2, s16
 
-    adrp    x7, .Lskel_exp_log2e
-    add     x7, x7, :lo12:.Lskel_exp_log2e
+    ADRP_LO12(x7, .Lskel_exp_log2e)
     ldr     s16, [x7]
     fmul    s17, s2, s16
     frintn  s18, s17
 
-    adrp    x7, .Lskel_exp_ln2
-    add     x7, x7, :lo12:.Lskel_exp_ln2
+    ADRP_LO12(x7, .Lskel_exp_ln2)
     ldr     s16, [x7]
     fnmsub  s19, s18, s16, s2
 
-    adrp    x7, .Lskel_exp_c3
-    add     x7, x7, :lo12:.Lskel_exp_c3
+    ADRP_LO12(x7, .Lskel_exp_c3)
     ldr     s0, [x7]
-    adrp    x7, .Lskel_exp_c2
-    add     x7, x7, :lo12:.Lskel_exp_c2
+    ADRP_LO12(x7, .Lskel_exp_c2)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, .Lskel_exp_c1
-    add     x7, x7, :lo12:.Lskel_exp_c1
+    ADRP_LO12(x7, .Lskel_exp_c1)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, .Lskel_half
-    add     x7, x7, :lo12:.Lskel_half
+    ADRP_LO12(x7, .Lskel_half)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
-    adrp    x7, .Lskel_one
-    add     x7, x7, :lo12:.Lskel_one
+    ADRP_LO12(x7, .Lskel_one)
     ldr     s16, [x7]
     fmadd   s0, s0, s19, s16
     fmadd   s0, s0, s19, s16
