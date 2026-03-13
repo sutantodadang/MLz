@@ -3,14 +3,15 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-threading.h"
 #include "ggml-backend-impl.h"
+#include "quants.h"
 #include "simd_matmul.h"
 #include "flash_attention.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <vector>
 #include <algorithm>
+#include <mutex>
 
 // -----------------------------------------------------------------------------
 // Assembly Kernel Declarations
@@ -47,105 +48,55 @@ extern "C" {
 }
 
 // -----------------------------------------------------------------------------
-// Helper: Quantize F32 row to Q8_0
+// Activation Quantization Cache
 // -----------------------------------------------------------------------------
-// block_q8_0: 2 bytes (d: fp16) + 32 bytes (qs: int8) = 34 bytes
-static void quantize_row_q8_0_reference(const float* x, void* y, int k) {
-    const int block_size = 32;
-    struct block_q8_0 {
-        uint16_t d;     // fp16
-        int8_t qs[32];
-    };
-    
-    block_q8_0* y_blocks = (block_q8_0*)y;
-    int nb = k / block_size;
+// Avoids re-quantizing the same F32 activations (src1) across multiple matmul
+// calls within the same layer/token.  Two caches: one for Q8_0, one for Q8_K.
+//
+// Thread safety: ggml dispatches mul_mat with thread 0 doing the quantization
+// before the work starts (barrier), so the cache is only written by one thread
+// at a time.  We protect mutations with a lightweight spinlock anyway.
+// -----------------------------------------------------------------------------
 
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        float max = 0.0f;
+struct quant_cache {
+    uint8_t * buf      = nullptr;   // Quantised activation buffer
+    size_t    buf_cap  = 0;         // Allocated capacity in bytes
+    const void * src1_data = nullptr; // Pointer we quantised from
+    int64_t   K        = 0;
+    int64_t   N        = 0;
+    size_t    row_size  = 0;        // Bytes per quantised row
 
-        for (int j = 0; j < block_size; j++) {
-            float v = x[i * block_size + j];
-            if (std::abs(v) > amax) {
-                amax = std::abs(v);
-                max = v;
-            }
+    // Ensure buffer is at least `need` bytes; returns buf pointer.
+    uint8_t * ensure(size_t need) {
+        if (need > buf_cap) {
+            // Over-allocate by 25% to reduce future reallocs
+            size_t alloc = need + (need >> 2);
+            uint8_t * p = (uint8_t *)realloc(buf, alloc);
+            if (!p) { p = (uint8_t *)realloc(buf, need); alloc = need; }
+            buf = p;
+            buf_cap = alloc;
         }
-
-        const float d = amax / 127.0f;
-        const float id = d ? 1.0f / d : 0.0f;
-
-        // Simple float->fp16 conversion
-        uint16_t d_fp16;
-        {
-            uint32_t x_u32;
-            memcpy(&x_u32, &d, 4);
-            uint32_t sign = (x_u32 >> 16) & 0x8000;
-            int32_t exp = ((x_u32 >> 23) & 0xFF) - 127 + 15;
-            uint32_t mant = (x_u32 >> 13) & 0x3FF;
-            
-            if (exp <= 0) {
-                 d_fp16 = (uint16_t)(sign); 
-            } else if (exp >= 31) {
-                 d_fp16 = (uint16_t)(sign | 0x7C00);
-            } else {
-                 d_fp16 = (uint16_t)(sign | (exp << 10) | mant);
-            }
-        }
-        
-        y_blocks[i].d = d_fp16;
-
-        for (int j = 0; j < block_size; j++) {
-            const float x0 = x[i * block_size + j] * id;
-            y_blocks[i].qs[j] = (int8_t)std::round(x0);
-        }
+        return buf;
     }
-}
 
-// -----------------------------------------------------------------------------
-// Helper: Quantize F32 row to Q8_K
-// -----------------------------------------------------------------------------
-// block_q8_K: 4 bytes (d: float) + 256 bytes (qs: int8) + 32 bytes (bsums: int16) = 292 bytes
-static void quantize_row_q8_k_reference(const float* x, void* y, int k) {
-    const int block_size = 256;
-    struct block_q8_K {
-        float d;            // float32
-        int8_t qs[256];
-        int16_t bsums[16];
-    };
-
-    block_q8_K* y_blocks = (block_q8_K*)y;
-    int nb = k / block_size;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        float max = 0.0f;
-
-        for (int j = 0; j < block_size; j++) {
-            float v = x[i * block_size + j];
-            if (std::abs(v) > amax) amax = std::abs(v);
-        }
-
-        const float d = amax / 127.0f;
-        const float id = d ? 1.0f / d : 0.0f;
-        
-        y_blocks[i].d = d;
-
-        for (int j = 0; j < block_size; j++) {
-            const float x0 = x[i * block_size + j] * id;
-            y_blocks[i].qs[j] = (int8_t)std::round(x0);
-        }
-
-        // Calculate bsums (sum of 16 quants)
-        for (int j = 0; j < 16; j++) {
-            int sum = 0;
-            for (int l = 0; l < 16; l++) {
-                sum += y_blocks[i].qs[j * 16 + l];
-            }
-            y_blocks[i].bsums[j] = (int16_t)sum;
-        }
+    // Check whether the cache is still valid for this src1 tensor.
+    bool valid_for(const void * data, int64_t k, int64_t n) const {
+        return src1_data == data && K == k && N == n;
     }
-}
+
+    void tag(const void * data, int64_t k, int64_t n, size_t rs) {
+        src1_data = data;
+        K = k;
+        N = n;
+        row_size = rs;
+    }
+};
+
+// Per-format caches (one per quant family).
+// Static lifetime — buffer freed on program exit.
+static quant_cache g_cache_q8_0;
+static quant_cache g_cache_q8_k;
+static std::mutex  g_cache_mtx;
 
 // -----------------------------------------------------------------------------
 // Hook Implementation
@@ -191,25 +142,33 @@ extern "C" int ggml_simd_try_mul_mat(const struct ggml_compute_params * params, 
         // ---------------------------------------------------------------------
         const size_t q8_0_bs = 34;
         const int block_k = 32;
-        size_t q8_row_size = (K / block_k) * q8_0_bs;
-        
-        // Thread-local quantization buffer for src1 columns
-        std::vector<uint8_t> src1_q8(N * q8_row_size);
+        const size_t q8_row_size = (size_t)(K / block_k) * q8_0_bs;
+        const size_t total_size = (size_t)N * q8_row_size;
 
-        // Quantize src1 (F32 -> Q8_0)
-        for (int64_t j = 0; j < N; j++) {
-            const float* src1_col = (const float*)((char*)src1->data + j * src1->nb[1]);
-            void* dst_q = src1_q8.data() + j * q8_row_size;
-            quantize_row_q8_0_reference(src1_col, dst_q, K);
+        // Thread 0 handles quantization; others skip to compute after barrier
+        uint8_t * src1_q8;
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mtx);
+            if (!g_cache_q8_0.valid_for(src1->data, K, N)) {
+                src1_q8 = g_cache_q8_0.ensure(total_size);
+                for (int64_t j = 0; j < N; j++) {
+                    const float * src1_col = (const float *)((char *)src1->data + j * src1->nb[1]);
+                    void * dst_q = src1_q8 + j * q8_row_size;
+                    quantize_row_q8_0(src1_col, dst_q, K);
+                }
+                g_cache_q8_0.tag(src1->data, K, N, q8_row_size);
+            } else {
+                src1_q8 = g_cache_q8_0.buf;
+            }
         }
 
         // Compute
         for (int64_t m = m_start; m < m_end; m++) {
-            const void* w_row = (const char*)src0->data + m * src0->nb[1];
+            const void * w_row = (const char *)src0->data + m * src0->nb[1];
             for (int64_t n = 0; n < N; n++) {
-                const void* a_row = src1_q8.data() + n * q8_row_size;
-                float* dst_val = (float*)((char*)dst->data + m * dst->nb[1] + n * dst->nb[0]);
-                
+                const void * a_row = src1_q8 + n * q8_row_size;
+                float * dst_val = (float *)((char *)dst->data + m * dst->nb[1] + n * dst->nb[0]);
+
                 float sum = 0.0f;
                 if (src0->type == GGML_TYPE_Q4_0) {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -230,33 +189,42 @@ extern "C" int ggml_simd_try_mul_mat(const struct ggml_compute_params * params, 
             }
         }
         return 1;
-    } 
+    }
     else if (src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_K) {
         // ---------------------------------------------------------------------
         // K-Quants (Q2_K, Q3_K, Q4_K, Q6_K, Q8_K) -> Use Q8_K Activations
         // ---------------------------------------------------------------------
         const size_t q8_k_bs = 292; // 4 + 256 + 32
         const int block_k = 256;
-        
-        if (K % block_k != 0) return 0; // Should not happen for valid K-quant tensors
 
-        size_t q8_k_row_size = (K / block_k) * q8_k_bs;
-        std::vector<uint8_t> src1_q8k(N * q8_k_row_size);
+        if (K % block_k != 0) return 0;
 
-        // Quantize src1 (F32 -> Q8_K)
-        for (int64_t j = 0; j < N; j++) {
-            const float* src1_col = (const float*)((char*)src1->data + j * src1->nb[1]);
-            void* dst_q = src1_q8k.data() + j * q8_k_row_size;
-            quantize_row_q8_k_reference(src1_col, dst_q, K);
+        const size_t q8_k_row_size = (size_t)(K / block_k) * q8_k_bs;
+        const size_t total_size = (size_t)N * q8_k_row_size;
+
+        uint8_t * src1_q8k;
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mtx);
+            if (!g_cache_q8_k.valid_for(src1->data, K, N)) {
+                src1_q8k = g_cache_q8_k.ensure(total_size);
+                for (int64_t j = 0; j < N; j++) {
+                    const float * src1_col = (const float *)((char *)src1->data + j * src1->nb[1]);
+                    void * dst_q = src1_q8k + j * q8_k_row_size;
+                    quantize_row_q8_K(src1_col, dst_q, K);
+                }
+                g_cache_q8_k.tag(src1->data, K, N, q8_k_row_size);
+            } else {
+                src1_q8k = g_cache_q8_k.buf;
+            }
         }
 
         // Compute
         for (int64_t m = m_start; m < m_end; m++) {
-            const void* w_row = (const char*)src0->data + m * src0->nb[1];
+            const void * w_row = (const char *)src0->data + m * src0->nb[1];
             for (int64_t n = 0; n < N; n++) {
-                const void* a_row = src1_q8k.data() + n * q8_k_row_size;
-                float* dst_val = (float*)((char*)dst->data + m * dst->nb[1] + n * dst->nb[0]);
-                
+                const void * a_row = src1_q8k + n * q8_k_row_size;
+                float * dst_val = (float *)((char *)dst->data + m * dst->nb[1] + n * dst->nb[0]);
+
                 float sum = 0.0f;
                 if (src0->type == GGML_TYPE_Q2_K) {
 #if defined(__aarch64__) || defined(_M_ARM64)
