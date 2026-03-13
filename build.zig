@@ -123,6 +123,15 @@ pub fn build(b: *std.Build) void {
         cpp_flags.append(b.allocator, "-mno-avx512f") catch @panic("OOM");
     }
 
+    // Zig uses Clang in MSVC-compat mode which defines _MSC_VER. Upstream
+    // ggml.c skips #include <immintrin.h> under _MSC_VER, assuming real MSVC
+    // auto-provides intrinsics. Clang doesn't, so AVX512BF16 intrinsics like
+    // _mm512_cvtne2ps_pbh are undeclared. Undefine the feature macro to use
+    // the scalar fallback — the SIMD backend handles the hot paths anyway.
+    if (actual_target.result.cpu.arch == .x86_64 and actual_target.result.os.tag == .windows) {
+        c_flags.append(b.allocator, "-U__AVX512BF16__") catch @panic("OOM");
+    }
+
     c_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
 
@@ -1640,8 +1649,19 @@ fn compileCudaSources(
     if (target_os == .windows) {
         msvc_base = b.graph.env_map.get("VCToolsInstallDir") orelse
             "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207";
-        sdk_include = b.graph.env_map.get("WindowsSdkDir") orelse
-            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0";
+        // Construct the full SDK include path from WindowsSdkDir + WindowsSDKVersion.
+        // WindowsSdkDir is a base dir (e.g. "C:/Program Files (x86)/Windows Kits/10/"),
+        // so we need to append "Include/<version>" to reach ucrt/shared/um headers.
+        const sdk_dir = b.graph.env_map.get("WindowsSdkDir") orelse
+            "C:/Program Files (x86)/Windows Kits/10";
+        const sdk_ver = b.graph.env_map.get("WindowsSDKVersion") orelse
+            "10.0.26100.0";
+        // Strip trailing backslash from WindowsSDKVersion if present (VS sets it as "10.0.xxxxx.0\\")
+        const sdk_ver_clean = if (sdk_ver.len > 0 and sdk_ver[sdk_ver.len - 1] == '\\')
+            sdk_ver[0 .. sdk_ver.len - 1]
+        else
+            sdk_ver;
+        sdk_include = b.pathJoin(&.{ sdk_dir, "Include", sdk_ver_clean });
         cl_path_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64", "cl.exe" });
         cl_dir_win = b.pathJoin(&.{ msvc_base, "bin", "Hostx64", "x64" });
         include_var = b.fmt(
