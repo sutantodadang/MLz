@@ -27,6 +27,17 @@ pub const ServerConfig = struct {
 
     /// If true, logs basic request lines.
     log_requests: bool = true,
+
+    /// Maximum number of concurrently in-flight HTTP/WebSocket connections.
+    /// Excess connections are accepted then immediately closed (after the
+    /// kernel backlog also fills) so a slow attacker cannot exhaust threads
+    /// or file descriptors. Set to 0 to disable bounding (not recommended).
+    max_concurrent_connections: u32 = 256,
+
+    /// Per-recv timeout (milliseconds) applied to client sockets after accept.
+    /// Defends against slowloris-style attacks where a client opens a TCP
+    /// connection but never sends a full request. Set to 0 to disable.
+    recv_timeout_ms: u32 = 30_000,
 };
 
 const Header = struct {
@@ -92,39 +103,95 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
 
     std.log.info("server listening on {s}:{d}", .{ cfg.host, cfg.port });
 
+    // Bounded concurrency: tracks how many handler threads are currently in
+    // flight. The accept loop refuses new connections (closes them with a
+    // 503) once `max_concurrent_connections` is reached so a slow attacker
+    // cannot exhaust threads or file descriptors.
+    var conn_count = std.atomic.Value(u32).init(0);
+
     while (!signal.shouldExit()) {
         const conn = server.accept() catch |err| {
             if (signal.shouldExit()) break;
             return err;
         };
 
+        if (cfg.max_concurrent_connections != 0) {
+            const current = conn_count.load(.acquire);
+            if (current >= cfg.max_concurrent_connections) {
+                std.log.warn("connection limit reached ({d}); rejecting", .{cfg.max_concurrent_connections});
+                writeJsonError(allocator, conn.stream, 503, "Service Unavailable", "server_busy", "too many concurrent connections") catch {};
+                conn.stream.close();
+                continue;
+            }
+        }
+
+        // Apply a recv timeout so reads block at most `recv_timeout_ms`
+        // milliseconds — the slowloris defence. Best effort; ignore failures
+        // (some platforms return ENOPROTOOPT for these on certain socket types).
+        if (cfg.recv_timeout_ms != 0) applyRecvTimeout(conn.stream.handle, cfg.recv_timeout_ms);
+
         const Handler = struct {
             allocator: std.mem.Allocator,
             stream: std.net.Stream,
             engine: *Engine,
             cfg: ServerConfig,
+            conn_count: *std.atomic.Value(u32),
 
             fn run(self: @This()) void {
+                defer {
+                    self.stream.close();
+                    _ = self.conn_count.fetchSub(1, .release);
+                }
                 handleConnection(self.allocator, self.stream, self.engine, self.cfg) catch |err| {
                     std.log.err("connection error: {any}", .{err});
                 };
-                self.stream.close();
             }
         };
+
+        _ = conn_count.fetchAdd(1, .acq_rel);
 
         const handler = Handler{
             .allocator = allocator,
             .stream = conn.stream,
             .engine = &engine,
             .cfg = cfg,
+            .conn_count = &conn_count,
         };
 
         const thread = std.Thread.spawn(.{}, Handler.run, .{handler}) catch |err| {
             std.log.err("failed to spawn thread: {any}", .{err});
+            _ = conn_count.fetchSub(1, .release);
             conn.stream.close();
             continue;
         };
         thread.detach();
+    }
+}
+
+/// Best-effort SO_RCVTIMEO. Errors are swallowed because some platforms or
+/// non-IP sockets do not support it.
+fn applyRecvTimeout(handle: std.posix.socket_t, ms: u32) void {
+    if (@import("builtin").os.tag == .windows) {
+        const win = std.os.windows.ws2_32;
+        var timeout_ms: u32 = ms;
+        _ = win.setsockopt(
+            handle,
+            win.SOL.SOCKET,
+            win.SO.RCVTIMEO,
+            @ptrCast(&timeout_ms),
+            @sizeOf(u32),
+        );
+    } else {
+        const tv = std.posix.timeval{
+            .sec = @intCast(ms / 1000),
+            .usec = @intCast((ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch {};
     }
 }
 
@@ -157,8 +224,18 @@ fn handleConnection(
     defer req_buf.deinit(allocator);
 
     const req = readHttpRequest(allocator, stream, &req_buf, cfg.max_header_bytes, cfg.max_body_bytes) catch |err| {
+        // Translate parser errors to explicit HTTP responses before closing
+        // the socket so misbehaving clients see a real status code instead of
+        // a half-closed connection.
+        switch (err) {
+            error.HeaderTooLarge => writeJsonError(allocator, stream, 431, "Request Header Fields Too Large", "request_too_large", "request headers exceed configured limit") catch {},
+            error.BodyTooLarge => writeJsonError(allocator, stream, 413, "Payload Too Large", "request_too_large", "request body exceeds configured limit") catch {},
+            error.BadRequest => writeJsonError(allocator, stream, 400, "Bad Request", "invalid_request_error", "malformed request line or headers") catch {},
+            error.UnexpectedEof => {}, // Client hung up; nothing useful to send.
+            else => writeJsonError(allocator, stream, 400, "Bad Request", "invalid_request_error", "request reading failed") catch {},
+        }
         std.log.err("request reading failed: {any}", .{err});
-        return err;
+        return;
     };
     defer freeHeaders(allocator, req.headers);
 
@@ -240,11 +317,10 @@ fn handleChatCompletions(
     body: []const u8,
 ) !void {
     var parsed = openai.parseChatCompletionRequest(allocator, body) catch |err| {
-        const msg = switch (err) {
-            openai.ParseError.InvalidJson => "invalid JSON",
-            openai.ParseError.MissingMessages => "messages must be non-empty",
-        };
-        try writeJsonError(allocator, stream, 400, "Bad Request", "invalid_request_error", msg);
+        // Reject malformed requests with a proper field-level OpenAI error so
+        // SDK clients can surface the bad parameter instead of a 500.
+        const fe = openai.describeParseError(@errorCast(err));
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", fe.param, fe.message);
         return;
     };
     defer parsed.deinit();
@@ -253,7 +329,10 @@ fn handleChatCompletions(
     const stream_resp: bool = req.stream orelse false;
 
     if (!stream_resp) {
-        var resp = try engine.complete(allocator, req, null, null);
+        var resp = engine.complete(allocator, req, null, null) catch |err| {
+            try writeEngineError(allocator, stream, err);
+            return;
+        };
         defer resp.deinit(allocator);
 
         var buf: std.ArrayList(u8) = .empty;
@@ -280,12 +359,54 @@ fn handleChatCompletions(
     defer allocator.free(id);
     try sse.sendRole(id, "assistant");
 
-    var resp = try engine.complete(allocator, req, sse.tokenSink(), id);
+    var resp = engine.complete(allocator, req, sse.tokenSink(), id) catch |err| {
+        // SSE headers already sent — emit a final error chunk + DONE so the
+        // client sees a graceful stream termination rather than a TCP RST.
+        try sse.sendError(engineErrorMessage(err), engineErrorType(err));
+        try sse.done();
+        return;
+    };
     defer resp.deinit(allocator);
 
     // Final finish_reason chunk.
     try sse.sendFinish(resp.finishReasonString());
     try sse.done();
+}
+
+/// Map engine errors (from `engine.complete`) to (status, type, message)
+/// triples for HTTP responses. Unknown errors collapse to a generic 500.
+fn engineErrorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.InvalidRole => 400,
+        error.ContextTooSmall => 413,
+        else => 500,
+    };
+}
+
+fn engineErrorType(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidRole => "invalid_request_error",
+        error.ContextTooSmall => "request_too_large",
+        else => "internal_error",
+    };
+}
+
+fn engineErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidRole => "messages.role must be one of: system, user, assistant",
+        error.ContextTooSmall => "prompt + max_tokens exceeds the model context window",
+        else => "internal server error during generation",
+    };
+}
+
+fn writeEngineError(allocator: std.mem.Allocator, stream: std.net.Stream, err: anyerror) !void {
+    const status = engineErrorStatus(err);
+    const reason: []const u8 = switch (status) {
+        400 => "Bad Request",
+        413 => "Payload Too Large",
+        else => "Internal Server Error",
+    };
+    try writeJsonError(allocator, stream, status, reason, engineErrorType(err), engineErrorMessage(err));
 }
 
 fn writeSseHeaders(stream: std.net.Stream) !void {
@@ -369,6 +490,18 @@ const SseSink = struct {
         try self.stream.writeAll("data: [DONE]\n\n");
     }
 
+    /// Emit an OpenAI-style error frame mid-stream. Used when generation
+    /// fails after SSE headers have already been sent.
+    pub fn sendError(self: *SseSink, message: []const u8, err_type: []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const payload = openai.ErrorResponse{ .@"error" = .{ .message = message, .type = err_type } };
+        try buf.appendSlice(self.allocator, "data: ");
+        try openai.writeJson(buf.writer(self.allocator), payload);
+        try buf.appendSlice(self.allocator, "\n\n");
+        try self.stream.writeAll(buf.items);
+    }
+
     fn sendChunk(self: *SseSink, chunk: openai.ChatCompletionChunk) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -414,6 +547,31 @@ fn writeJsonError(
     defer buf.deinit(allocator);
 
     const payload = openai.ErrorResponse{ .@"error" = .{ .message = msg, .type = err_type } };
+    try openai.writeJson(buf.writer(allocator), payload);
+
+    try writeResponse(stream, .{
+        .status = status,
+        .reason = reason,
+        .content_type = "application/json",
+        .body = buf.items,
+    });
+}
+
+/// Like `writeJsonError` but populates `error.param` for field-level
+/// validation failures so SDKs can surface the exact bad parameter.
+fn writeJsonErrorParam(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    status: u16,
+    reason: []const u8,
+    err_type: []const u8,
+    param: []const u8,
+    msg: []const u8,
+) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const payload = openai.ErrorResponse{ .@"error" = .{ .message = msg, .type = err_type, .param = param } };
     try openai.writeJson(buf.writer(allocator), payload);
 
     try writeResponse(stream, .{
@@ -582,7 +740,12 @@ fn handleWebSocket(
 
     while (!signal.shouldExit()) {
         var frame = readWsFrame(allocator, reader, 2 * 1024 * 1024) catch |err| {
-            if (err != error.UnexpectedEof) {
+            if (err == error.WsProtocolError or err == error.PayloadTooLarge) {
+                // RFC 6455 close codes: 1002 protocol error, 1009 message too big.
+                const code: u16 = if (err == error.PayloadTooLarge) 1009 else 1002;
+                writeWsCloseFrame(writer, code) catch {};
+                writer.flush() catch {};
+            } else if (err != error.UnexpectedEof) {
                 std.log.err("websocket read error: {any}", .{err});
             }
             break;
@@ -597,8 +760,9 @@ fn handleWebSocket(
             },
             .text => {
                 // Payload is JSON request.
-                var parsed = openai.parseChatCompletionRequest(allocator, frame.payload) catch {
-                    const err_payload = openai.ErrorResponse{ .@"error" = .{ .message = "invalid JSON", .type = "invalid_request_error" } };
+                var parsed = openai.parseChatCompletionRequest(allocator, frame.payload) catch |err| {
+                    const fe = openai.describeParseError(@errorCast(err));
+                    const err_payload = openai.ErrorResponse{ .@"error" = .{ .message = fe.message, .type = "invalid_request_error", .param = fe.param } };
                     var buf: std.ArrayList(u8) = .empty;
                     defer buf.deinit(allocator);
                     try openai.writeJson(buf.writer(allocator), err_payload);
@@ -612,7 +776,15 @@ fn handleWebSocket(
                 const stream_resp: bool = req.stream orelse false;
 
                 if (!stream_resp) {
-                    var resp = try engine.complete(allocator, req, null, null);
+                    var resp = engine.complete(allocator, req, null, null) catch |err| {
+                        const err_payload = openai.ErrorResponse{ .@"error" = .{ .message = engineErrorMessage(err), .type = engineErrorType(err) } };
+                        var buf: std.ArrayList(u8) = .empty;
+                        defer buf.deinit(allocator);
+                        try openai.writeJson(buf.writer(allocator), err_payload);
+                        try writeWsFrame(writer, .text, buf.items);
+                        try writer.flush();
+                        continue;
+                    };
                     defer resp.deinit(allocator);
 
                     var buf: std.ArrayList(u8) = .empty;
@@ -627,7 +799,11 @@ fn handleWebSocket(
                     defer allocator.free(id);
                     try ws.sendRole(id, "assistant");
 
-                    var resp = try engine.complete(allocator, req, ws.tokenSink(), id);
+                    var resp = engine.complete(allocator, req, ws.tokenSink(), id) catch |err| {
+                        try ws.sendError(engineErrorMessage(err), engineErrorType(err));
+                        try ws.done();
+                        continue;
+                    };
                     defer resp.deinit(allocator);
 
                     try ws.sendFinish(resp.finishReasonString());
@@ -637,6 +813,12 @@ fn handleWebSocket(
             else => {},
         }
     }
+}
+
+/// Send an RFC 6455 close frame with the supplied status code.
+fn writeWsCloseFrame(writer: *std.Io.Writer, code: u16) !void {
+    var payload: [2]u8 = .{ @intCast((code >> 8) & 0xFF), @intCast(code & 0xFF) };
+    try writeWsFrame(writer, .close, payload[0..]);
 }
 
 fn computeWebSocketAccept(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
@@ -663,10 +845,34 @@ fn readWsFrame(allocator: std.mem.Allocator, reader: *std.io.Reader, max_payload
     var hdr: [2]u8 = undefined;
     try readNoEof(reader, &hdr);
 
+    // RFC 6455: RSV1/2/3 must be zero unless an extension was negotiated.
+    // We negotiate none, so any RSV bit set is a protocol error.
+    if ((hdr[0] & 0x70) != 0) return error.WsProtocolError;
+
     const fin = (hdr[0] & 0x80) != 0;
-    const opcode: WsOpcode = @enumFromInt(@as(u4, @intCast(hdr[0] & 0x0F)));
+    const opcode_bits: u4 = @intCast(hdr[0] & 0x0F);
+    const opcode: WsOpcode = switch (opcode_bits) {
+        0x0 => .continuation,
+        0x1 => .text,
+        0x2 => .binary,
+        0x8 => .close,
+        0x9 => .ping,
+        0xA => .pong,
+        // 0x3-0x7 reserved data, 0xB-0xF reserved control; reject before
+        // @enumFromInt would otherwise trap on an undefined enum value.
+        else => return error.WsProtocolError,
+    };
+
     const masked = (hdr[1] & 0x80) != 0;
+    // RFC 6455 §5.1: a server MUST close the connection on receipt of a
+    // frame that is not masked from the client.
+    if (!masked) return error.WsProtocolError;
+
     var len: u64 = hdr[1] & 0x7F;
+
+    // Control frames (opcode >= 0x8) MUST be <=125 bytes and MUST NOT be fragmented.
+    const is_control = (opcode_bits & 0x8) != 0;
+    if (is_control and (len > 125 or !fin)) return error.WsProtocolError;
 
     if (len == 126) {
         var ext: [2]u8 = undefined;
@@ -677,21 +883,21 @@ fn readWsFrame(allocator: std.mem.Allocator, reader: *std.io.Reader, max_payload
         try readNoEof(reader, &ext8);
         len = 0;
         for (ext8) |b| len = (len << 8) | b;
+        // Most-significant bit must be zero per RFC 6455.
+        if ((len & (@as(u64, 1) << 63)) != 0) return error.WsProtocolError;
     }
 
     if (len > max_payload) return error.PayloadTooLarge;
 
     var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
-    if (masked) try readNoEof(reader, &mask_key);
+    try readNoEof(reader, &mask_key);
 
     const payload = try allocator.alloc(u8, @intCast(len));
     errdefer allocator.free(payload);
     if (payload.len > 0) try readNoEof(reader, payload);
 
-    if (masked) {
-        for (payload, 0..) |*b, i| {
-            b.* ^= mask_key[i % 4];
-        }
+    for (payload, 0..) |*b, i| {
+        b.* ^= mask_key[i % 4];
     }
 
     return .{ .opcode = opcode, .payload = payload, .fin = fin };
@@ -785,6 +991,15 @@ const WsSink = struct {
         try self.writer.flush();
     }
 
+    pub fn sendError(self: *WsSink, message: []const u8, err_type: []const u8) !void {
+        const payload = openai.ErrorResponse{ .@"error" = .{ .message = message, .type = err_type } };
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try openai.writeJson(buf.writer(self.allocator), payload);
+        try writeWsFrame(self.writer, .text, buf.items);
+        try self.writer.flush();
+    }
+
     fn sendChunk(self: *WsSink, chunk: openai.ChatCompletionChunk) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -814,3 +1029,68 @@ const WsSink = struct {
         try self.sendChunk(chunk);
     }
 };
+
+// ---------------------------------------------------------------------------
+// WebSocket frame parser tests. These exercise the validation logic added in
+// readWsFrame to make sure malformed RFC 6455 frames are rejected before
+// reaching @enumFromInt (which would otherwise trap on undefined opcodes).
+// ---------------------------------------------------------------------------
+
+fn frameReader(bytes: []const u8) std.io.Reader {
+    return std.io.Reader.fixed(bytes);
+}
+
+test "ws: rejects unmasked client frame" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x81, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.WsProtocolError, readWsFrame(t.allocator, &r, 1024));
+}
+
+test "ws: rejects reserved opcode" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x83, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.WsProtocolError, readWsFrame(t.allocator, &r, 1024));
+}
+
+test "ws: rejects RSV bits set" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0xC1, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.WsProtocolError, readWsFrame(t.allocator, &r, 1024));
+}
+
+test "ws: rejects fragmented control frame" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x09, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.WsProtocolError, readWsFrame(t.allocator, &r, 1024));
+}
+
+test "ws: rejects oversize control frame" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x89, 0xFE, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.WsProtocolError, readWsFrame(t.allocator, &r, 1024));
+}
+
+test "ws: rejects payload over limit" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x81, 0xFE, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    var r = frameReader(&bytes);
+    try t.expectError(error.PayloadTooLarge, readWsFrame(t.allocator, &r, 256));
+}
+
+test "ws: accepts well-formed masked text frame" {
+    const t = std.testing;
+    const bytes = [_]u8{ 0x81, 0x82, 0xFF, 0x00, 0xFF, 0x00, 0xFE, 0x65 };
+    var r = frameReader(&bytes);
+    var frame = try readWsFrame(t.allocator, &r, 1024);
+    defer frame.deinit(t.allocator);
+    try t.expectEqual(WsOpcode.text, frame.opcode);
+    try t.expect(frame.fin);
+    try t.expectEqual(@as(usize, 2), frame.payload.len);
+    try t.expectEqual(@as(u8, 0x01), frame.payload[0]);
+    try t.expectEqual(@as(u8, 0x65), frame.payload[1]);
+}

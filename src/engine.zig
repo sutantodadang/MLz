@@ -69,7 +69,10 @@ pub const Engine = struct {
     grammar_z: ?[:0]u8,
     grammar_root_z: ?[:0]u8,
 
-    id_counter: u64,
+    /// Monotonic counter for completion IDs. Accessed lock-free across
+    /// concurrent request handlers (server.zig:279 calls nextIdAlloc outside
+    /// the engine mutex), so reads/writes must go through atomic operations.
+    id_counter: std.atomic.Value(u64),
 
     mutex: std.Thread.Mutex = .{},
     cached_tokens: std.ArrayList(llama.Token),
@@ -155,7 +158,7 @@ pub const Engine = struct {
             .cfg = cfg,
             .grammar_z = grammar_z,
             .grammar_root_z = grammar_root_z,
-            .id_counter = 1,
+            .id_counter = std.atomic.Value(u64).init(1),
             .cached_tokens = .{},
             .mutex = .{},
         };
@@ -187,11 +190,10 @@ pub const Engine = struct {
     }
 
     pub fn nextIdAlloc(self: *Engine, allocator: std.mem.Allocator) ![]u8 {
-        // Produces an ID like chatcmpl-000000000001 (hex).
-        var buf: [32]u8 = undefined;
-        const n = try std.fmt.bufPrint(&buf, "chatcmpl-{x:0>12}", .{self.id_counter});
-        self.id_counter += 1;
-        return try allocator.dupe(u8, n);
+        // Produces an ID like chatcmpl-000000000001 (hex). Lock-free atomic
+        // increment so concurrent request handlers never observe duplicate IDs.
+        const id = self.id_counter.fetchAdd(1, .monotonic);
+        return formatChatCompletionId(allocator, id);
     }
 
     pub const Completion = struct {
@@ -372,3 +374,57 @@ pub const Engine = struct {
         return .{ .value = resp, .finish_reason = finish_reason };
     }
 };
+
+/// Format a chat completion ID from a numeric counter value. Pulled out of
+/// `Engine.nextIdAlloc` so it can be tested without spinning up a model.
+pub fn formatChatCompletionId(allocator: std.mem.Allocator, id: u64) ![]u8 {
+    var buf: [32]u8 = undefined;
+    const n = try std.fmt.bufPrint(&buf, "chatcmpl-{x:0>12}", .{id});
+    return try allocator.dupe(u8, n);
+}
+
+test "formatChatCompletionId: deterministic format" {
+    const t = std.testing;
+    const a = try formatChatCompletionId(t.allocator, 1);
+    defer t.allocator.free(a);
+    try t.expectEqualStrings("chatcmpl-000000000001", a);
+
+    const b = try formatChatCompletionId(t.allocator, 0xdeadbeef);
+    defer t.allocator.free(b);
+    try t.expectEqualStrings("chatcmpl-0000deadbeef", b);
+}
+
+test "id_counter: concurrent fetchAdd never collides" {
+    const t = std.testing;
+    var counter = std.atomic.Value(u64).init(0);
+
+    const N = 8;
+    const PER = 200;
+
+    const Worker = struct {
+        fn run(c: *std.atomic.Value(u64), out: []u64) void {
+            for (out) |*slot| {
+                slot.* = c.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var slots: [N][PER]u64 = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (0..N) |i| {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ &counter, slots[i][0..] });
+    }
+    for (threads) |th| th.join();
+
+    var all = try t.allocator.alloc(u64, N * PER);
+    defer t.allocator.free(all);
+    var idx: usize = 0;
+    for (0..N) |i| {
+        for (slots[i]) |v| {
+            all[idx] = v;
+            idx += 1;
+        }
+    }
+    std.mem.sort(u64, all, {}, std.sort.asc(u64));
+    for (0..all.len) |i| try t.expectEqual(@as(u64, i), all[i]);
+}

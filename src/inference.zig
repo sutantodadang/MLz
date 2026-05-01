@@ -112,6 +112,35 @@ fn shouldStop(opts: GenerateOptions) bool {
     return false;
 }
 
+/// Convert a single token to its text piece, append it to `assistant_buf`,
+/// and forward the bytes to `sink` if streaming. Shared by the normal and
+/// speculative generation paths so both produce identical streaming output.
+fn emitTokenPiece(
+    allocator: std.mem.Allocator,
+    vocab: ?*const llama_cpp.c.llama_vocab,
+    sink: ?TokenSink,
+    assistant_buf: *std.ArrayList(u8),
+    token: llama_cpp.Token,
+) !void {
+    var piece_buf: [256]u8 = undefined;
+    const n = llama_cpp.c.llama_token_to_piece(vocab, token, &piece_buf, piece_buf.len, 0, false);
+    if (n > 0) {
+        const piece = piece_buf[0..@intCast(n)];
+        if (sink) |s| try s.write(piece);
+        try assistant_buf.appendSlice(allocator, piece);
+    } else if (n < 0) {
+        const actual_n: usize = @intCast(-n);
+        const large_buf = try allocator.alloc(u8, actual_n);
+        defer allocator.free(large_buf);
+        const n2 = llama_cpp.c.llama_token_to_piece(vocab, token, large_buf.ptr, @intCast(large_buf.len), 0, false);
+        if (n2 > 0) {
+            const piece = large_buf[0..@intCast(n2)];
+            if (sink) |s| try s.write(piece);
+            try assistant_buf.appendSlice(allocator, piece);
+        }
+    }
+}
+
 /// Evaluates the prompt and generates an assistant completion.
 ///
 /// This function is designed to be used by both the interactive CLI and server mode.
@@ -176,24 +205,7 @@ pub fn generate(
         completion_tokens += 1;
         if (ttft_ns == null) ttft_ns = gen_timer.read();
 
-        // Convert token to piece (stack buffer fast path, heap fallback)
-        var piece_buf: [256]u8 = undefined;
-        const n = llama_cpp.c.llama_token_to_piece(vocab, token, &piece_buf, piece_buf.len, 0, false);
-        if (n > 0) {
-            const piece = piece_buf[0..@intCast(n)];
-            if (opts.sink) |sink| try sink.write(piece);
-            try assistant_buf.appendSlice(allocator, piece);
-        } else if (n < 0) {
-            const actual_n: usize = @intCast(-n);
-            const large_buf = try allocator.alloc(u8, actual_n);
-            defer allocator.free(large_buf);
-            const n2 = llama_cpp.c.llama_token_to_piece(vocab, token, large_buf.ptr, @intCast(large_buf.len), 0, false);
-            if (n2 > 0) {
-                const piece = large_buf[0..@intCast(n2)];
-                if (opts.sink) |sink| try sink.write(piece);
-                try assistant_buf.appendSlice(allocator, piece);
-            }
-        }
+        try emitTokenPiece(allocator, vocab, opts.sink, &assistant_buf, token);
 
         batch.clear();
         try batch.add(token, @intCast(eval_pos), &[_]i32{0}, true);
@@ -278,8 +290,38 @@ fn generateSpeculative(
     var draft_pos: usize = prompt_tokens.len; // Draft eval pos
 
     var n_gen: usize = 0;
+    var finish: GenerationResult.FinishReason = .stop;
 
-    while (n_gen < opts.max_tokens) {
+    // Helper: commit one token (text + sink + counters + EOG check). Returns
+    // true if generation should stop after this token.
+    const Commit = struct {
+        fn run(
+            allocator2: std.mem.Allocator,
+            vocab2: ?*const llama_cpp.c.llama_vocab,
+            sink: ?TokenSink,
+            assistant_buf2: *std.ArrayList(u8),
+            generated_tokens2: *std.ArrayList(llama_cpp.Token),
+            ttft: *?u64,
+            timer: *std.time.Timer,
+            t: llama_cpp.Token,
+        ) !bool {
+            try generated_tokens2.append(allocator2, t);
+            if (ttft.* == null) ttft.* = timer.read();
+            try emitTokenPiece(allocator2, vocab2, sink, assistant_buf2, t);
+            return llama_cpp.c.llama_vocab_is_eog(vocab2, t);
+        }
+    };
+
+    spec_loop: while (n_gen < opts.max_tokens) {
+        if (shouldStop(opts)) {
+            finish = .aborted;
+            break;
+        }
+        if (eval_pos >= @as(usize, @intCast(ctx.nCtx()))) {
+            finish = .context_limit;
+            break;
+        }
+
         // A. Generate Draft Tokens
         var drafts: [16]llama_cpp.Token = undefined; // Max K=16
         const current_K = @min(K, drafts.len);
@@ -295,134 +337,100 @@ fn generateSpeculative(
             try draft_ctx.decode(draft_batch.handle);
         }
 
-        // B. Verify on Target
-        // We need to evaluate:
-        // 1. The token *after* the prompt (predicted by Target(LastPromptToken))
-        // 2. The tokens predicted by the drafts.
-        // But Target(LastPromptToken) is ALREADY done at step 1.
-        // So we can sample the first token immediately.
-
-        // Actually, we need to flush the drafts into Target to verify them.
-        // Target Batch: [Draft0, Draft1, ... Draft_K-1]
-        // This produces logits for checking [Draft1, Draft2, ... Draft_K]
-        // What checks Draft0? The *previous* logits of Target.
+        // B. Verify on Target — sample target's predicted first token using
+        // logits already in the context (from prompt or previous loop), then
+        // decode the K drafts to obtain logits for tokens 1..K.
+        const target_token_0 = sampler.sampleLast(ctx);
 
         batch.clear();
         for (0..current_K) |k_idx| {
             try batch.add(drafts[k_idx], @intCast(eval_pos + k_idx), &[_]i32{0}, true);
         }
-        // Save the logits of the *previous* step (checking Draft0) BEFORE decoding new batch?
-        // No, `sampleLast` uses the current state.
-        // So:
-        // Check Draft0 vs Target.sampleLast() (using logits from prompt/prev step).
-        // If good:
-        //    Decode Batch on Target.
-        //    Check Draft1 vs Target output at batch index 0.
-        //    ...
-
-        // Problem: If Draft0 is wrong, we shouldn't have decoded Draft1...DraftK on Target?
-        // Speculative decoding *optimistically* decodes them. That's the point.
-        // So we submit the batch.
-
-        const target_token_0 = sampler.sampleLast(ctx);
-
         try ctx.decode(batch.handle);
 
-        // C. Verification Loop
+        // C. Verification Loop — count accepted drafts and find mismatch.
         var n_accepted: usize = 0;
-        var mismatch_found = false;
+        var mismatch_token: ?llama_cpp.Token = null;
 
-        // Special check for first token (Draft0)
         if (target_token_0 == drafts[0]) {
-            if (ttft_ns == null) ttft_ns = gen_timer.read();
-            n_accepted += 1;
-            // Check subsequent tokens
+            n_accepted = 1;
             for (1..current_K) |k_idx| {
-                // To check Draft[k], we need logits resulted from input Draft[k-1].
-                // Input Draft[k-1] was at batch index k-1.
-                // So we sample at batch index k-1.
-                // Note: sampleAt(ctx, idx) takes an index into the *last batch*.
                 const target_token_k = sampler.sampleAt(ctx, @intCast(k_idx - 1));
-
                 if (target_token_k == drafts[k_idx]) {
                     n_accepted += 1;
                 } else {
-                    // Mismatch at k
-                    // The valid token is target_token_k.
-                    // But wait, if we mismatch, we stop.
-                    // The valid next token is target_token_k.
-                    // We append it to our definitive list.
-                    // And we discard drafts[k...].
-                    try generated_tokens.append(allocator, target_token_k);
-                    // Also need to emit text etc.
-                    mismatch_found = true;
+                    mismatch_token = target_token_k;
                     break;
                 }
             }
         } else {
-            // first token mismatch
-            // Valid token is target_token_0
-            try generated_tokens.append(allocator, target_token_0);
-            if (ttft_ns == null) ttft_ns = gen_timer.read();
-            mismatch_found = true;
+            mismatch_token = target_token_0;
         }
 
-        // D. Commit Accepted Drafts
+        // D. Commit accepted drafts FIRST (in generation order), then the
+        // mismatch token. Previously the mismatch was appended before the
+        // accepted prefix, which corrupted token order whenever any drafts
+        // were accepted. Stream each token through the sink and stop on EOG,
+        // user abort, or context exhaustion / max_tokens.
         for (0..n_accepted) |k_idx| {
-            try generated_tokens.append(allocator, drafts[k_idx]);
+            const t = drafts[k_idx];
+            const eog = try Commit.run(allocator, vocab, opts.sink, &assistant_buf, &generated_tokens, &ttft_ns, &gen_timer, t);
+            n_gen += 1;
+            eval_pos += 1;
+            if (eog) {
+                finish = .stop;
+                break :spec_loop;
+            }
+            if (n_gen >= opts.max_tokens) {
+                finish = .length;
+                break :spec_loop;
+            }
         }
 
-        // Handle Outputs (Text/Sink) for all newly added tokens
-        // We added n_accepted + (1 if mismatch).
-        // Iterate generated_tokens from old len...
-        // Wait, generated_tokens array has everything.
-        // We need to output the *new* ones.
-        // Actually, logic above appended to `generated_tokens`.
+        if (mismatch_token) |mt| {
+            const eog = try Commit.run(allocator, vocab, opts.sink, &assistant_buf, &generated_tokens, &ttft_ns, &gen_timer, mt);
+            n_gen += 1;
+            eval_pos += 1;
 
-        // ... (Text decoding logic same as non-speculative) ...
-        // Simplified: just update counters.
-
-        n_gen += n_accepted + (if (mismatch_found) @as(usize, 1) else 0);
-        eval_pos += n_accepted + (if (mismatch_found) @as(usize, 1) else 0);
-
-        // Fixup Draft Context if mismatch
-        if (mismatch_found) {
-            // Target context: We decoded K tokens.
-            // Valid prefix len = eval_pos.
-            // But we fed K tokens to Target. Target pos is now `old_eval_pos + K`.
-            // We need to rewind Target to `eval_pos`.
+            // Rewind both contexts to the committed prefix and re-sync draft.
             ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1);
-
-            // Also rewind Draft
             draft_ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1);
             draft_pos = eval_pos;
 
-            // Feed the ONE correct token to Draft so it's in sync for next step
-            // The correct token is the last one in `generated_tokens`.
-            const correct_token = generated_tokens.items[generated_tokens.items.len - 1];
+            if (eog) {
+                finish = .stop;
+                break :spec_loop;
+            }
+            if (n_gen >= opts.max_tokens) {
+                finish = .length;
+                break :spec_loop;
+            }
+
+            // Feed the corrected token into the draft so it can speculate next round.
             draft_batch.clear();
-            try draft_batch.add(correct_token, @intCast(draft_pos), &[_]i32{0}, true);
+            try draft_batch.add(mt, @intCast(draft_pos), &[_]i32{0}, true);
             try draft_ctx.decode(draft_batch.handle);
             draft_pos += 1;
         } else {
-            // All accepted.
-            // Target Context is at old_eval_pos + K.
-            // eval_pos is old_eval_pos + K.
-            // Draft Context is at corresponding pos.
-            // Everything synced.
+            // All K drafts accepted — both contexts are already synced. Optionally
+            // accept one extra token sampled from target's last batch slot.
             draft_pos = eval_pos;
 
-            // Optional: Generate one more from Target?
-            // "Accept K drafts + 1 from Target".
-            // The last token in the batch (index K-1) produces a prediction for K+1.
-            // We can accept that too!
             if (n_gen < opts.max_tokens) {
                 const extra_token = sampler.sampleAt(ctx, @intCast(current_K - 1));
-                try generated_tokens.append(allocator, extra_token);
+                const eog = try Commit.run(allocator, vocab, opts.sink, &assistant_buf, &generated_tokens, &ttft_ns, &gen_timer, extra_token);
                 n_gen += 1;
                 eval_pos += 1;
 
-                // Feed extra to Draft
+                if (eog) {
+                    finish = .stop;
+                    break :spec_loop;
+                }
+                if (n_gen >= opts.max_tokens) {
+                    finish = .length;
+                    break :spec_loop;
+                }
+
                 draft_batch.clear();
                 try draft_batch.add(extra_token, @intCast(draft_pos), &[_]i32{0}, true);
                 try draft_ctx.decode(draft_batch.handle);
@@ -430,20 +438,13 @@ fn generateSpeculative(
             }
         }
 
-        if (n_gen >= opts.max_tokens) break;
+        if (n_gen >= opts.max_tokens) {
+            finish = .length;
+            break :spec_loop;
+        }
     }
 
     const total_ns = gen_timer.read();
-    // Convert all tokens to text at once
-    for (generated_tokens.items) |t| {
-        // piece logic... reusing code from generate is hard without helper
-        // Just minimal impl:
-        var piece_buf: [256]u8 = undefined;
-        const n = llama_cpp.c.llama_token_to_piece(vocab, t, &piece_buf, piece_buf.len, 0, false);
-        if (n > 0) try assistant_buf.appendSlice(allocator, piece_buf[0..@intCast(n)]);
-        // handle large tokens...
-    }
-
     const text = try allocator.dupe(u8, assistant_buf.items);
     const tokens = try allocator.dupe(llama_cpp.Token, generated_tokens.items);
 
@@ -454,6 +455,6 @@ fn generateSpeculative(
         .completion_tokens = n_gen,
         .ttft_ns = ttft_ns,
         .total_ns = total_ns,
-        .finish_reason = if (n_gen >= opts.max_tokens) .length else .stop,
+        .finish_reason = finish,
     };
 }

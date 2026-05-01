@@ -135,6 +135,17 @@ pub fn build(b: *std.Build) void {
     c_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
 
+    // CPU Repack accelerator: repacks weight matrices into SIMD-friendly
+    // interleaved layouts at load time (q4_K_8x8, q5_K_8x8, q6_K_8x8, ...).
+    // Enables specialized GEMM/GEMV dispatch via tensor->extra. Roughly 2x
+    // tokens/sec improvement on local CPU inference. On by default; disable
+    // with -Dcpu-repack=false if a target lacks support.
+    const use_cpu_repack = b.option(bool, "cpu-repack", "Enable llama.cpp CPU repack accelerator (~2x perf)") orelse true;
+    if (use_cpu_repack) {
+        c_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
+        cpp_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
+    }
+
     if (actual_target.result.os.tag == .linux) {
         c_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("OOM");
