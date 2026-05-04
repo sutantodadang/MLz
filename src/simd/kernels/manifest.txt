@@ -1,0 +1,61 @@
+# SIMD Kernel Manifest (PLAN-ASSEMBLY-REWRITE Section 2)
+#
+# Documentation-only mirror.  The authoritative list of kernels is the
+# `simd_manifest` array in build.zig, which drives NASM/GAS compile steps
+# and codegen of `simd_kernels_manifest.h`.  This file is kept in sync
+# manually for human reference; it is NOT parsed by build.zig.
+#
+# Format (whitespace-separated; '#' starts a comment):
+#   <arch>  <relative_path>                       <symbol>                       <signature>
+#
+# Signatures (C-side prototypes emitted into the generated header):
+#   vec_dot       void(int n, float* r, const void* vx, const void* vy);
+#   rms_norm_f32  void(int n, float eps, const float* x, float* y);
+#   rope_neox_f32 void(long long n_pairs, const float* cache, const float* src, float* dst);
+#
+# Architectures: x86 (built on x86_64 hosts), arm64 (built on aarch64 hosts).
+# The build adds NASM steps for `x86` rows and GAS .S sources for `arm64` rows.
+
+# ---------------------------------------------------------------------------
+# x86_64 — vec_dot quantized kernels (handwritten NASM AVX2 + AVX-512)
+# ---------------------------------------------------------------------------
+x86   kernels/x86/vec/vec_dot_q4_0_q8_0_avx2.asm        simd_vec_dot_q4_0_q8_0_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q4_0_q8_0_avx512.asm      simd_vec_dot_q4_0_q8_0_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q8_0_q8_0_avx2.asm        simd_vec_dot_q8_0_q8_0_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q8_0_q8_0_avx512.asm      simd_vec_dot_q8_0_q8_0_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q2_k_q8_k_avx2.asm        simd_vec_dot_q2_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q2_k_q8_k_avx512.asm      simd_vec_dot_q2_k_q8_k_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q3_k_q8_k_avx2.asm        simd_vec_dot_q3_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q3_k_q8_k_avx512.asm      simd_vec_dot_q3_k_q8_k_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q4_k_q8_k_avx2.asm        simd_vec_dot_q4_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q4_k_q8_k_avx512.asm      simd_vec_dot_q4_k_q8_k_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q5_k_q8_k_avx2.asm        simd_vec_dot_q5_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q5_k_q8_k_avx512.asm      simd_vec_dot_q5_k_q8_k_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q6_k_q8_k_avx2.asm        simd_vec_dot_q6_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q6_k_q8_k_avx512.asm      simd_vec_dot_q6_k_q8_k_avx512      vec_dot
+x86   kernels/x86/vec/vec_dot_q8_k_q8_k_avx2.asm        simd_vec_dot_q8_k_q8_k_avx2        vec_dot
+x86   kernels/x86/vec/vec_dot_q8_k_q8_k_avx512.asm      simd_vec_dot_q8_k_q8_k_avx512      vec_dot
+
+# ---------------------------------------------------------------------------
+# x86_64 — unary ops (PLAN-ASSEMBLY-REWRITE Section 0D, gated, opt-in)
+# ---------------------------------------------------------------------------
+x86   kernels/x86/unary/rms_norm_f32_avx2.asm           simd_rms_norm_f32_avx2             rms_norm_f32
+x86   kernels/x86/unary/rms_norm_f32_avx512.asm         simd_rms_norm_f32_avx512           rms_norm_f32
+x86   kernels/x86/unary/rope_neox_f32_avx2.asm          simd_rope_neox_f32_avx2            rope_neox_f32
+x86   kernels/x86/unary/rope_neox_f32_avx512.asm        simd_rope_neox_f32_avx512          rope_neox_f32
+
+# ---------------------------------------------------------------------------
+# aarch64 — vec_dot NEON .S
+# ---------------------------------------------------------------------------
+arm64 kernels/aarch64/vec/vec_dot_q4_0_q8_0_neon.S      simd_vec_dot_q4_0_q8_0_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q8_0_q8_0_neon.S      simd_vec_dot_q8_0_q8_0_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q2_k_q8_k_neon.S      simd_vec_dot_q2_k_q8_k_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q3_k_q8_k_neon.S      simd_vec_dot_q3_k_q8_k_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q4_k_q8_k_neon.S      simd_vec_dot_q4_k_q8_k_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q5_k_q8_k_neon.S      simd_vec_dot_q5_k_q8_k_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q6_k_q8_k_neon.S      simd_vec_dot_q6_k_q8_k_neon        vec_dot
+arm64 kernels/aarch64/vec/vec_dot_q8_k_q8_k_neon.S      simd_vec_dot_q8_k_q8_k_neon        vec_dot
+
+# aarch64 — unary NEON .S (opt-in env-gated hooks)
+arm64 kernels/aarch64/unary/rms_norm_f32_neon.S         simd_rms_norm_f32_neon             rms_norm_f32
+arm64 kernels/aarch64/unary/rope_neox_f32_neon.S        simd_rope_neox_f32_neon            rope_neox_f32

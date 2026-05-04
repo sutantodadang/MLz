@@ -25,6 +25,7 @@ pub const Config = struct {
     // One-shot prompt mode
     prompt_mode: bool = false,
     user_prompt: ?[]const u8 = null,
+    n_predict: ?usize = null, // --n-predict : max tokens to generate in prompt mode
 
     // Speculative Decoding
     draft_model_path: ?[]const u8 = null,
@@ -34,6 +35,13 @@ pub const Config = struct {
     server_host: []const u8 = "127.0.0.1",
     server_port: u16 = 8080,
     server_api_key: ?[]const u8 = null,
+
+    // Custom SIMD backend runtime controls (consumed before model load to set
+    // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
+    // behaviour: SIMD on if compiled with -Dsimd-backend=true, off otherwise.
+    no_simd: bool = false, // --no-simd : sets MLZ_SIMD=0
+    simd_trace: bool = false, // --simd-trace : sets MLZ_SIMD_TRACE=1
+    simd_flash_attn: bool = false, // --simd-flash-attn : opt-in for hooked FA
 
     // prompt memory management
     _allocated_prompt: ?[]u8 = null,
@@ -129,6 +137,21 @@ pub const Config = struct {
                 cfg.server_port = try parseNextInt(u16, &i, args);
             } else if (std.mem.eql(u8, arg, "--api-key")) {
                 cfg.server_api_key = try getNextArg(&i, args);
+            } else if (std.mem.eql(u8, arg, "--no-simd")) {
+                cfg.no_simd = true;
+            } else if (std.mem.eql(u8, arg, "--n-predict")) {
+                const v = try parseNextInt(usize, &i, args);
+                // Clamp to a sane upper bound (1 MiB tokens) to prevent
+                // accidental near-infinite generation from typos like
+                // `--n-predict 18446744073709551615`.  Mirrors the
+                // openai.zig max_tokens guard.
+                const n_predict_max: usize = 1 << 20;
+                if (v == 0) return ParseError.InvalidInt;
+                cfg.n_predict = if (v > n_predict_max) n_predict_max else v;
+            } else if (std.mem.eql(u8, arg, "--simd-trace")) {
+                cfg.simd_trace = true;
+            } else if (std.mem.eql(u8, arg, "--simd-flash-attn")) {
+                cfg.simd_flash_attn = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 std.log.warn("Unknown argument: {s}", .{arg});
             } else {

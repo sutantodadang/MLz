@@ -135,6 +135,17 @@ pub fn build(b: *std.Build) void {
     c_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
     cpp_flags.append(b.allocator, "-DGGML_USE_CPU") catch @panic("OOM");
 
+    // CPU Repack accelerator: repacks weight matrices into SIMD-friendly
+    // interleaved layouts at load time (q4_K_8x8, q5_K_8x8, q6_K_8x8, ...).
+    // Enables specialized GEMM/GEMV dispatch via tensor->extra. Roughly 2x
+    // tokens/sec improvement on local CPU inference. On by default; disable
+    // with -Dcpu-repack=false if a target lacks support.
+    const use_cpu_repack = b.option(bool, "cpu-repack", "Enable llama.cpp CPU repack accelerator (~2x perf)") orelse true;
+    if (use_cpu_repack) {
+        c_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
+        cpp_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
+    }
+
     if (actual_target.result.os.tag == .linux) {
         c_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("OOM");
@@ -602,8 +613,32 @@ pub fn build(b: *std.Build) void {
             .flags = simd_cpp_flags.items,
         });
 
+        // Handwritten C++ intrinsic kernels (PLAN-ASSEMBLY-REWRITE step 8).
+        // Q5_K x Q8_K vec_dot is implemented as handwritten NASM:
+        //   src/simd/kernels/x86/vec/vec_dot_q5_k_q8_k_avx2.asm
+        //   src/simd/kernels/x86/vec/vec_dot_q5_k_q8_k_avx512.asm
+        // and as AArch64 NEON .S:
+        //   src/simd/kernels/aarch64/vec/vec_dot_q5_k_q8_k_neon.S
+
         // Add include path for SIMD headers
         ggml_lib.addIncludePath(b.path("src/simd"));
+
+        // ----------------------------------------------------------------
+        // Manifest codegen (PLAN-ASSEMBLY-REWRITE Section 2)
+        //
+        // Generates `simd_kernels_manifest.h` containing the canonical
+        // `extern "C"` declarations for every SIMD kernel in the project.
+        // The hook (`src/simd/ggml_simd_hook.cpp`) includes this header
+        // instead of hand-maintaining the prototype list.
+        //
+        // The manifest below is the SINGLE source of truth and is mirrored
+        // by `src/simd/kernels/manifest.txt` for documentation.  When you
+        // add a new kernel, append a row here AND to manifest.txt.
+        // ----------------------------------------------------------------
+        const manifest_h = generateSimdManifestHeader(b.allocator, no_avx512) catch @panic("OOM");
+        const manifest_wf = b.addWriteFiles();
+        const manifest_h_path = manifest_wf.add("simd_kernels_manifest.h", manifest_h);
+        ggml_lib.addIncludePath(manifest_h_path.dirname());
 
         // Architecture-specific assembly compilation
         if (actual_target.result.cpu.arch == .x86_64) {
@@ -978,6 +1013,90 @@ pub fn build(b: *std.Build) void {
             q4_k_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q4_k_q8_k_avx2.asm"));
             ggml_lib.addObjectFile(q4_k_obj);
 
+            // Q5_K x Q8_K vec_dot — handwritten NASM (AVX2 + AVX-512).
+            const q5_k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const q5_k_avx2_obj = q5_k_avx2_asm.addOutputFileArg("vec_dot_q5_k_q8_k_avx2.o");
+            q5_k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q5_k_q8_k_avx2.asm"));
+            ggml_lib.addObjectFile(q5_k_avx2_obj);
+
+            if (!no_avx512) {
+                const q5_k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const q5_k_avx512_obj = q5_k_avx512_asm.addOutputFileArg("vec_dot_q5_k_q8_k_avx512.o");
+                q5_k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_q5_k_q8_k_avx512.asm"));
+                ggml_lib.addObjectFile(q5_k_avx512_obj);
+            }
+
+            // ------------------------------------------------------------
+            // Unary ops (PLAN-ASSEMBLY-REWRITE Section 0D, opt-in via
+            // MLZ_SIMD_RMS_NORM=1 at runtime).  Decl in manifest.txt.
+            // ------------------------------------------------------------
+            const rms_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const rms_avx2_obj = rms_avx2_asm.addOutputFileArg("rms_norm_f32_avx2.o");
+            rms_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rms_norm_f32_avx2.asm"));
+            ggml_lib.addObjectFile(rms_avx2_obj);
+
+            if (!no_avx512) {
+                const rms_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const rms_avx512_obj = rms_avx512_asm.addOutputFileArg("rms_norm_f32_avx512.o");
+                rms_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rms_norm_f32_avx512.asm"));
+                ggml_lib.addObjectFile(rms_avx512_obj);
+            }
+
+            // ------------------------------------------------------------
+            // RoPE NEOX f32 (PLAN-ASSEMBLY-REWRITE Section 0E, opt-in via
+            // MLZ_SIMD_ROPE=1).  Replaces upstream's scalar `rotate_pairs`.
+            // ------------------------------------------------------------
+            const rope_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const rope_avx2_obj = rope_avx2_asm.addOutputFileArg("rope_neox_f32_avx2.o");
+            rope_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rope_neox_f32_avx2.asm"));
+            ggml_lib.addObjectFile(rope_avx2_obj);
+
+            if (!no_avx512) {
+                const rope_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const rope_avx512_obj = rope_avx512_asm.addOutputFileArg("rope_neox_f32_avx512.o");
+                rope_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rope_neox_f32_avx512.asm"));
+                ggml_lib.addObjectFile(rope_avx512_obj);
+            }
+
             const q8_k_asm = b.addSystemCommand(&[_][]const u8{
                 "nasm",
                 "-f",
@@ -1215,8 +1334,12 @@ pub fn build(b: *std.Build) void {
                 "src/simd/kernels/aarch64/vec/vec_dot_q2_k_q8_k_neon.S",
                 "src/simd/kernels/aarch64/vec/vec_dot_q3_k_q8_k_neon.S",
                 "src/simd/kernels/aarch64/vec/vec_dot_q4_k_q8_k_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_q5_k_q8_k_neon.S",
                 "src/simd/kernels/aarch64/vec/vec_dot_q6_k_q8_k_neon.S",
                 "src/simd/kernels/aarch64/vec/vec_dot_q8_k_q8_k_neon.S",
+                // Unary ops (opt-in env-gated hooks)
+                "src/simd/kernels/aarch64/unary/rms_norm_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/rope_neox_f32_neon.S",
                 // Matrix multiplication kernel
                 "src/simd/kernels/aarch64/matrix_mult_neon.S",
             };
@@ -1541,6 +1664,26 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run SIMD benchmarks");
     bench_step.dependOn(&bench_run.step);
 
+    // U1 — Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
+    // Generates random F32 vectors, quantizes via ggml's reference, calls every
+    // built kernel, and asserts the result matches a scalar dequantize-then-dot
+    // reference within REL_TOL=1e-3.  Exits non-zero on any failure.
+    const test_simd_exe = b.addExecutable(.{
+        .name = "test_simd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_simd.zig"),
+            .target = actual_target,
+            .optimize = optimize,
+        }),
+    });
+    test_simd_exe.linkLibrary(ggml_lib);
+    const test_simd_run = b.addRunArtifact(test_simd_exe);
+    if (b.args) |args| {
+        test_simd_run.addArgs(args);
+    }
+    const test_simd_step = b.step("test-simd", "Validate every built SIMD kernel against a scalar reference");
+    test_simd_step.dependOn(&test_simd_run.step);
+
     if (use_cuda) {
         if (getCudaPath(b)) |cuda_path| {
             const cuda_bin = switch (target.result.os.tag) {
@@ -1794,4 +1937,102 @@ fn compileCudaSources(
         return cuda_so;
     }
     return null;
+}
+
+// ----- end of build() and helpers -----
+
+// ----------------------------------------------------------------------------
+// generateSimdManifestHeader (PLAN-ASSEMBLY-REWRITE Section 2)
+//
+// Produces the contents of simd_kernels_manifest.h, a generated header
+// that supplies canonical extern "C" declarations for every SIMD kernel.
+// Including this header in src/simd/ggml_simd_hook.cpp removes the
+// previously-inline extern void simd_* boilerplate.
+//
+// Source of truth: the static array below (mirrored as documentation in
+// src/simd/kernels/manifest.txt).  When you add a new kernel, add a row
+// here too.
+// ----------------------------------------------------------------------------
+const SimdManifestEntry = struct {
+    symbol: []const u8,
+    sig: enum { vec_dot, rms_norm_f32, rope_neox_f32 },
+    needs_avx512: bool = false,
+};
+
+const simd_manifest = [_]SimdManifestEntry{
+    // vec_dot quantized kernels — x86 AVX2 + AVX-512
+    .{ .symbol = "simd_vec_dot_q4_0_q8_0_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q4_0_q8_0_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q8_0_q8_0_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q8_0_q8_0_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q2_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q2_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q3_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q3_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q4_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q4_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q5_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q5_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q6_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q6_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    .{ .symbol = "simd_vec_dot_q8_k_q8_k_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q8_k_q8_k_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    // unary ops — x86 AVX2 + AVX-512 (opt-in via MLZ_SIMD_RMS_NORM=1)
+    .{ .symbol = "simd_rms_norm_f32_avx2", .sig = .rms_norm_f32 },
+    .{ .symbol = "simd_rms_norm_f32_avx512", .sig = .rms_norm_f32, .needs_avx512 = true },
+    .{ .symbol = "simd_rope_neox_f32_avx2", .sig = .rope_neox_f32 },
+    .{ .symbol = "simd_rope_neox_f32_avx512", .sig = .rope_neox_f32, .needs_avx512 = true },
+    // NEON .S kernels are arch-gated via #if at the call site; declare
+    // them unconditionally so the hook compiles cleanly on aarch64 hosts.
+    .{ .symbol = "simd_vec_dot_q4_0_q8_0_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q8_0_q8_0_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q2_k_q8_k_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q3_k_q8_k_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q4_k_q8_k_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q5_k_q8_k_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q6_k_q8_k_neon", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_q8_k_q8_k_neon", .sig = .vec_dot },
+    // unary ops — aarch64 NEON (opt-in via MLZ_SIMD_RMS_NORM=1 / MLZ_SIMD_ROPE=1)
+    .{ .symbol = "simd_rms_norm_f32_neon", .sig = .rms_norm_f32 },
+    .{ .symbol = "simd_rope_neox_f32_neon", .sig = .rope_neox_f32 },
+};
+
+fn generateSimdManifestHeader(allocator: std.mem.Allocator, no_avx512: bool) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const header_prologue =
+        \\// AUTO-GENERATED by build.zig (generateSimdManifestHeader).
+        \\// Do not edit manually.  Source of truth is the `simd_manifest` array in build.zig.
+        \\// (src/simd/kernels/manifest.txt is a mirrored documentation file only.)
+        \\#pragma once
+        \\
+        \\#ifdef __cplusplus
+        \\extern "C" {
+        \\#endif
+        \\
+        \\
+    ;
+    try out.appendSlice(allocator, header_prologue);
+
+    for (simd_manifest) |e| {
+        if (e.needs_avx512 and no_avx512) continue;
+        const line = switch (e.sig) {
+            .vec_dot => try std.fmt.allocPrint(allocator, "void {s}(int n, float * r, const void * vx, const void * vy);\n", .{e.symbol}),
+            .rms_norm_f32 => try std.fmt.allocPrint(allocator, "void {s}(int n, float eps, const float * x, float * y);\n", .{e.symbol}),
+            .rope_neox_f32 => try std.fmt.allocPrint(allocator, "void {s}(long long n_pairs, const float * cache, const float * src, float * dst);\n", .{e.symbol}),
+        };
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+
+    const header_epilogue =
+        \\
+        \\#ifdef __cplusplus
+        \\} // extern "C"
+        \\#endif
+        \\
+    ;
+    try out.appendSlice(allocator, header_epilogue);
+    return out.toOwnedSlice(allocator);
 }

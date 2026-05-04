@@ -30,6 +30,7 @@
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1823,6 +1824,12 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
     ggml_compute_forward_norm(params, tensor);
   } break;
   case GGML_OP_RMS_NORM: {
+#ifdef GGML_USE_SIMD_BACKEND
+    extern int ggml_simd_try_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+    if (ggml_simd_try_rms_norm(params, tensor)) {
+      break;
+    }
+#endif
     ggml_compute_forward_rms_norm(params, tensor);
   } break;
   case GGML_OP_RMS_NORM_BACK: {
@@ -1880,6 +1887,12 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
     ggml_compute_forward_soft_max_ext_back(params, tensor);
   } break;
   case GGML_OP_ROPE: {
+#ifdef GGML_USE_SIMD_BACKEND
+    extern int ggml_simd_try_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+    if (ggml_simd_try_rope(params, tensor)) {
+      break;
+    }
+#endif
     ggml_compute_forward_rope(params, tensor);
   } break;
   case GGML_OP_ROPE_BACK: {
@@ -1955,6 +1968,40 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
     ggml_compute_forward_fill(params, tensor);
   } break;
   case GGML_OP_FLASH_ATTN_EXT: {
+#ifdef GGML_USE_SIMD_BACKEND
+    // Custom SIMD flash-attention hook.  Off by default — opt in with
+    // MLZ_SIMD_FLASH_ATTN=1 because the Q8_0 path historically crashes on
+    // long contexts (see PLAN-ASSEMBLY-REWRITE: tests E2 must gate this).
+    {
+      /* Atomic flag: -1 = uninitialised, 0 = disabled, 1 = enabled.
+       * ggml_compute_forward is called from multiple worker threads, so use
+       * a compare-exchange to initialise exactly once without a mutex.
+       * Acquire load on the fast path pairs with the release implied by the
+       * successful CAS so weak-memory targets (aarch64) see the env decision. */
+      static _Atomic int s_flash_enabled = -1;
+      int cached = atomic_load_explicit(&s_flash_enabled, memory_order_acquire);
+      if (cached < 0) {
+        const char *e = getenv("MLZ_SIMD_FLASH_ATTN");
+        int desired = (e && e[0] != '0') ? 1 : 0;
+        int expected = -1;
+        if (atomic_compare_exchange_strong_explicit(&s_flash_enabled, &expected,
+                                                    desired, memory_order_release,
+                                                    memory_order_acquire)) {
+          cached = desired;
+        } else {
+          /* Another thread won the race; `expected` now holds their value. */
+          cached = expected;
+        }
+      }
+      if (cached) {
+        extern int ggml_simd_try_flash_attn(const struct ggml_compute_params *params,
+                                            struct ggml_tensor *tensor);
+        if (ggml_simd_try_flash_attn(params, tensor)) {
+          break;
+        }
+      }
+    }
+#endif
     ggml_compute_forward_flash_attn_ext(params, tensor);
   } break;
   case GGML_OP_FLASH_ATTN_BACK: {
