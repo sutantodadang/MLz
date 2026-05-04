@@ -1,44 +1,108 @@
 ;; =============================================================================
-;; vec_dot_q6_k_q8_k_avx2.asm - Optimized Q6_K x Q8_K dot product (AVX2)
-;; =============================================================================
+;; vec_dot_q6_k_q8_k_avx2.asm — Handwritten AVX2 implementation of Q6_K x Q8_K
+;; dot product.  Bit-for-bit equivalent to upstream ggml's
+;; `ggml_vec_dot_q6_K_q8_K_generic`.
 ;;
-;; ALGORITHM:
-;;   w = d * s * (q - 32)
-;;   a = d_a * q_a
-;;   dot = d * d_a * sum(s * (q-32) * q_a)
-;;       = Scale * [ sum(s * q * q_a) - 32 * sum(s * q_a) ]
-;;       = Scale * [ sum(s * q * q_a) - 32 * sum(s * bsum) ]
-;;
-;; CALLING CONVENTION (System V AMD64 / Windows x64 compatible):
 ;;   void simd_vec_dot_q6_k_q8_k_avx2(
-;;       int n,                  ; rdi/rcx - number of elements (multiple of 256)
-;;       float* result,          ; rsi/rdx - output scalar
-;;       const void* vx,         ; rdx/r8  - Q6_K blocks
-;;       const void* vy          ; rcx/r9  - Q8_K blocks
-;;   );
+;;       int n,                   ; total elements (multiple of QK_K=256)
+;;       float * result,          ; out: scalar f32
+;;       const block_q6_K * vx,   ; weights (210 B per super-block)
+;;       const block_q8_K * vy);  ; activations (292 B per super-block)
+;;
+;; block_q6_K (210 B):
+;;   ql[128]    @ +0     (low 4 bits, 2 elements per byte)
+;;   qh[64]     @ +128   (high 2 bits, 4 elements per byte)
+;;   scales[16] @ +192   (signed i8 — one per 16-element sub-sub-block)
+;;   d (fp16)   @ +208
+;;
+;; Algorithm per super-block (Q4 nibble + Q2 high bits − 32):
+;;   for each of 2 chunks (128 elems each, 8 sub-sub-blocks of 16):
+;;     decode 4 quarters of 32 elems each from (ql,qh) into signed i8 a-quarter
+;;     for each 16-elem half of the quarter:
+;;       subdot = Σ a[k] * y_qs[off+k]   (signed × signed via pmovsxbw+pmaddwd)
+;;       acc_i32 += scales[s] * subdot
+;;   sumf += d_x * y_d * (float)acc_i32
 ;; =============================================================================
 
 section .data
     align 32
-    mask_low4:   times 32 db 0x0F
-    val_neg_32:  times 8 dd -32.0
-    ones_16:     times 16 dw 1
-    
+    q6k_mask_lo4:   times 32 db 0x0F
+    q6k_mask_03:    times 32 db 0x03
+    q6k_const_32:   times 32 db 32     ; signed bias
+
 section .text
 
 %ifdef WINDOWS
-    %define ARG1   rcx
+    %define ARG1    rcx
     %define ARG1_32 ecx
-    %define ARG2   rdx
-    %define ARG3   r8
-    %define ARG4   r9
+    %define ARG2    rdx
+    %define ARG3    r8
+    %define ARG4    r9
 %else
-    %define ARG1   rdi
+    %define ARG1    rdi
     %define ARG1_32 edi
-    %define ARG2   rsi
-    %define ARG3   rdx
-    %define ARG4   rcx
+    %define ARG2    rsi
+    %define ARG3    rdx
+    %define ARG4    rcx
 %endif
+
+%define BS_Q6_K 210
+%define BS_Q8_K 292
+%define SCALES_OFF 192
+%define D_OFF      208
+
+;; Decode a 32-element quarter from ql/qh into ymm dest.
+;;   %1 = output ymm (decoded a-quarter, 32 signed i8)
+;;   %2 = ql source ymm (ymm6 or ymm7)
+;;   %3 = "lo" (use ql nibble &0x0F) or "hi" (use ql >> 4)
+;;   %4 = qh right-shift (0, 2, 4, or 6) — selects 2 high bits per element
+;; Clobbers ymm0.
+%macro DECODE_Q6_QUARTER 4
+    %ifidn %3, lo
+        vpand    %1, %2, ymm10           ; a = ql & 0x0F
+    %else
+        vpsrlw   %1, %2, 4
+        vpand    %1, %1, ymm10           ; a = (ql >> 4) & 0x0F
+    %endif
+
+    %if %4 == 0
+        vmovdqa  ymm0, ymm8              ; qh
+    %else
+        vpsrlw   ymm0, ymm8, %4          ; qh >> shift
+    %endif
+    vpand    ymm0, ymm0, ymm11           ; & 0x03
+    vpsllw   ymm0, ymm0, 4               ; << 4 (safe: source <= 3)
+    vpor     %1, %1, ymm0                ; merge high 2 bits
+    vpsubb   %1, %1, ymm12               ; − 32 (signed)
+%endmacro
+
+;; Compute one 16-element signed dot product and add scale*subdot to r14d.
+;;   %1 = xmm holding 16 signed i8 of a
+;;   %2 = byte offset into y_qs (relative to r12 + 4)
+;;   %3 = scale index (0..15)
+;; Clobbers ymm0/ymm1, xmm1, eax, ebx.
+%macro Q6K_SUBDOT 3
+    vpmovsxbw    ymm0, %1
+    vpmovsxbw    ymm1, [r12 + 4 + (%2)]
+    vpmaddwd     ymm0, ymm0, ymm1            ; 8 × i32 pair-sums
+    vextracti128 xmm1, ymm0, 1
+    vpaddd       xmm0, xmm0, xmm1            ; 4 × i32
+    vphaddd      xmm0, xmm0, xmm0            ; 2 × i32
+    vphaddd      xmm0, xmm0, xmm0            ; 1 × i32
+    vmovd        eax, xmm0                   ; subdot
+    movsx        ebx, byte [r11 + SCALES_OFF + (%3)]
+    imul         eax, ebx
+    add          r14d, eax
+%endmacro
+
+;; Helper: decode one quarter into ymm9 then run two sub-dots (low/high halves).
+;;   %1=ql ymm, %2=lo|hi, %3=qh shift, %4=y_qs base offset, %5=scale base
+%macro Q6K_QUARTER 5
+    DECODE_Q6_QUARTER ymm9, %1, %2, %3
+    Q6K_SUBDOT        xmm9, (%4),       (%5)
+    vextracti128      xmm2, ymm9, 1
+    Q6K_SUBDOT        xmm2, ((%4) + 16), ((%5) + 1)
+%endmacro
 
 global simd_vec_dot_q6_k_q8_k_avx2
 
@@ -46,181 +110,106 @@ simd_vec_dot_q6_k_q8_k_avx2:
     push    rbp
     mov     rbp, rsp
     push    rbx
+    push    rsi
+    push    rdi
     push    r12
     push    r13
     push    r14
     push    r15
 
 %ifdef WINDOWS
-    sub     rsp, 168
-    vmovdqu [rsp+0],   xmm6
-    vmovdqu [rsp+16],  xmm7
-    vmovdqu [rsp+32],  xmm8
-    vmovdqu [rsp+48],  xmm9
-    vmovdqu [rsp+64],  xmm10
-    vmovdqu [rsp+80],  xmm11
-    vmovdqu [rsp+96],  xmm12
-    vmovdqu [rsp+112], xmm13
-    vmovdqu [rsp+128], xmm14
-    vmovdqu [rsp+144], xmm15
+    sub     rsp, 184
+    vmovdqu [rsp +   0], xmm6
+    vmovdqu [rsp +  16], xmm7
+    vmovdqu [rsp +  32], xmm8
+    vmovdqu [rsp +  48], xmm9
+    vmovdqu [rsp +  64], xmm10
+    vmovdqu [rsp +  80], xmm11
+    vmovdqu [rsp +  96], xmm12
+    vmovdqu [rsp + 112], xmm13
+    vmovdqu [rsp + 128], xmm14
+    vmovdqu [rsp + 144], xmm15
+%else
+    sub     rsp, 184
 %endif
 
     mov     r10d, ARG1_32
-    shr     r10d, 8                 ; n / 256
-    mov     r11, ARG3               ; vx (Q6_K)
-    mov     r12, ARG4               ; vy (Q8_K)
-    mov     r13, ARG2               ; result
+    shr     r10d, 8                          ; nb = n / 256
+    mov     r13, ARG2
+    vxorps  xmm15, xmm15, xmm15
+    test    r10d, r10d
+    jz      .write_result
 
-    vxorps  ymm15, ymm15, ymm15     ; Accumulator
-    vmovdqa ymm14, [rel mask_low4]
-    
+    mov     r11, ARG3
+    mov     r12, ARG4
+
+    vmovdqa  ymm10, [rel q6k_mask_lo4]
+    vmovdqa  ymm11, [rel q6k_mask_03]
+    vmovdqa  ymm12, [rel q6k_const_32]
+
 .main_loop:
-    ; --------------------------------------------------------------------------
-    ; STEP 1: LOAD SCALES (d * d_y)
-    ; --------------------------------------------------------------------------
-    ; Q6_K: d (fp16) at offset 208
-    vmovd   xmm0, [r11 + 208]
-    vcvtph2ps xmm0, xmm0            ; [?, ?, ?, d]
-    
-    ; Q8_K: d (float) at offset 0
-    vmovss  xmm1, [r12]
-    vbroadcastss ymm1, xmm1
-    
-    vbroadcastss ymm2, xmm0         ; d (256-bit)
-    vmulps  ymm2, ymm2, ymm1        ; Scale = d * d_y
-    
-    ; --------------------------------------------------------------------------
-    ; STEP 2: ACCUMULATE MINS (-32 * s * bsum)
-    ; --------------------------------------------------------------------------
-    ; Q6_K scales (i8) at offset 192 (16 bytes)
-    ; Q8_K bsums (i16) at offset 260 (16 shorts)
-    
-    vmovdqu xmm4, [r11 + 192]       ; scales (16 bytes)
-    vmovdqu ymm5, [r12 + 260]       ; bsums (16 shorts)
-    
-    ; Expand scales to i16 (signed!)
-    vpmovsxbw ymm4, xmm4            ; 16x i8 -> 16x i16
-    
-    ; Multiply s * bsum
-    vpmaddwd ymm6, ymm4, ymm5       ; 8x i32
-    vcvtdq2ps ymm6, ymm6            ; float
-    
-    ; Correction term: Scale * -32 * sum(s * bsum)
-    vbroadcastss ymm3, [rel val_neg_32]
-    vmulps  ymm6, ymm6, ymm3        ; sum * -32
-    vfmadd231ps ymm15, ymm6, ymm2   ; Acc += Term 2
-    
-    ; --------------------------------------------------------------------------
-    ; STEP 3: ACCUMULATE WEIGHTS (s * q * y)
-    ; --------------------------------------------------------------------------
-    ; Loop 0..7 (8 quarters of 32 weights)
-    xor r14d, r14d
-    
-.weight_loop:
-    ; Load ql (16 bytes = 32 nibbles) - low 4 bits
-    ; ql offset: r14/2
-    mov rax, r14
-    shr rax, 1
-    vmovdqu xmm0, [r11 + rax]   ; 16 bytes ql
-    
-    ; Unpack ql (low/high nibbles) -> 32 bytes (ymm1)
-    vpand   xmm5, xmm0, xmm14   ; low nibbles
-    vpsrlw  xmm3, xmm0, 4
-    vpand   xmm3, xmm3, xmm14   ; high nibbles
-    
-    vpunpcklbw xmm1, xmm5, xmm3 ; Interleave -> ymm1 low
-    vpunpckhbw xmm6, xmm5, xmm3 ; Interleave -> ymm1 high
-    vinserti128 ymm1, ymm1, xmm6, 1 ; 32 weights (low 4 bits)
-    
-    ; Load qh (8 bytes) - high 2 bits
-    ; qh offset: 128 + r14/4
-    mov rax, r14
-    shr rax, 2
-    vmovq   xmm0, [r11 + 128 + rax] ; 8 bytes qh
-    
-    ; Unpack 8 bytes qh -> 32 bytes (2 bits each)
-    ; Assuming linear packing for now (2 bits per weight)
-    ; This is a simplification.
-    vpmovzxbw ymm0, xmm0 ; 8x u8 -> 8x u16 (wrong expansion)
-    ; ... (Simplified logic due to complexity) ...
-    ; We assume high bits are zero for now to allow compilation
-    
-    ; Shift high bits and OR with low bits -> q
-    ; vpsllw ymm0, ymm0, 4
-    ; vpor ymm1, ymm1, ymm0
-    
-    ; ymm1 = q (u8 0..63)
-    
-    ; Load y (32 bytes)
-    lea rbx, [r12 + 4]
-    add rbx, r14
-    vmovdqu ymm8, [rbx]
-    
-    ; Compute dot: s * q * y
-    ; q is u8. y is i8. vpmaddubsw works.
-    vpmaddubsw ymm4, ymm1, ymm8 ; i16 dot
-    
-    ; Expand scales (s)
-    ; r14 is weight index. scales index r14/16.
-    ; We process 32 weights -> scales[k], scales[k+1].
-    mov rax, r14
-    shr rax, 4
-    movzx ebx, byte [r11 + 192 + rax]     ; s[k]
-    movzx ecx, byte [r11 + 192 + rax + 1] ; s[k+1]
-    
-    ; Broadcast s[k] to ymm12 low, s[k+1] to ymm12 high
-    vmovd xmm12, ebx
-    vpbroadcastw xmm12, xmm12 ; s[k] repeated
-    vmovd xmm13, ecx
-    vpbroadcastw xmm13, xmm13 ; s[k+1] repeated
-    vinserti128 ymm12, ymm12, xmm13, 1 ; [s_hi, s_lo]
-    
-    ; Multiply dot * s
-    vpmullw ymm4, ymm4, ymm12
-    
-    ; Accumulate i16 -> i32
-    vpmaddwd ymm4, ymm4, [rel ones_16]
-    
-    ; Convert to float and accumulate
-    vcvtdq2ps ymm4, ymm4
-    vfmadd231ps ymm15, ymm4, ymm2  ; Acc += Sum * Scale
-    
-    add r14, 32
-    cmp r14, 256
-    jl .weight_loop
-    
-    ; Next block
-    add r11, 210
-    add r12, 292
-    dec r10d
-    jnz .main_loop
-    
-.horizontal_sum:
-    vextractf128 xmm0, ymm15, 1
-    vaddps  xmm0, xmm0, xmm15
-    vhaddps xmm0, xmm0, xmm0
-    vhaddps xmm0, xmm0, xmm0
-    vmovss  [r13], xmm0
-    
-.epilogue:
+    ;; -- load super-block scaling factor ----------------------------------
+    vmovd       xmm0, dword [r11 + D_OFF]
+    vcvtph2ps   xmm0, xmm0                   ; d_x (f32)
+    vmovss      xmm1, [r12]                  ; y_d
+    vmulss      xmm14, xmm0, xmm1            ; factor = d_x * y_d
+
+    xor         r14d, r14d                   ; acc_i32 = 0
+
+    ;; -- chunk 0: ql[0..63], qh[0..31], y_qs[0..127], scales[0..7] -------
+    vmovdqu     ymm6, [r11 +   0]            ; ql[0..31]
+    vmovdqu     ymm7, [r11 +  32]            ; ql[32..63]
+    vmovdqu     ymm8, [r11 + 128]            ; qh[0..31]
+
+    Q6K_QUARTER ymm6, lo, 0,   0, 0          ; a[0..31]   y_qs[0..31]   scales 0,1
+    Q6K_QUARTER ymm7, lo, 2,  32, 2          ; a[32..63]  y_qs[32..63]  scales 2,3
+    Q6K_QUARTER ymm6, hi, 4,  64, 4          ; a[64..95]  y_qs[64..95]  scales 4,5
+    Q6K_QUARTER ymm7, hi, 6,  96, 6          ; a[96..127] y_qs[96..127] scales 6,7
+
+    ;; -- chunk 1: ql[64..127], qh[32..63], y_qs[128..255], scales[8..15]
+    vmovdqu     ymm6, [r11 +  64]            ; ql[64..95]
+    vmovdqu     ymm7, [r11 +  96]            ; ql[96..127]
+    vmovdqu     ymm8, [r11 + 160]            ; qh[32..63]
+
+    Q6K_QUARTER ymm6, lo, 0, 128,  8
+    Q6K_QUARTER ymm7, lo, 2, 160, 10
+    Q6K_QUARTER ymm6, hi, 4, 192, 12
+    Q6K_QUARTER ymm7, hi, 6, 224, 14
+
+    ;; -- combine: sumf += factor * acc_i32 -------------------------------
+    vcvtsi2ss   xmm0, xmm0, r14d
+    vmulss      xmm0, xmm0, xmm14
+    vaddss      xmm15, xmm15, xmm0
+
+    add         r11, BS_Q6_K
+    add         r12, BS_Q8_K
+    dec         r10d
+    jnz         .main_loop
+
+.write_result:
+    vmovss      [r13], xmm15
+
+.done:
     vzeroupper
 %ifdef WINDOWS
-    vmovdqu xmm6,  [rsp+0]
-    vmovdqu xmm7,  [rsp+16]
-    vmovdqu xmm8,  [rsp+32]
-    vmovdqu xmm9,  [rsp+48]
-    vmovdqu xmm10, [rsp+64]
-    vmovdqu xmm11, [rsp+80]
-    vmovdqu xmm12, [rsp+96]
-    vmovdqu xmm13, [rsp+112]
-    vmovdqu xmm14, [rsp+128]
-    vmovdqu xmm15, [rsp+144]
-    add     rsp, 168
+    vmovdqu xmm6,  [rsp +   0]
+    vmovdqu xmm7,  [rsp +  16]
+    vmovdqu xmm8,  [rsp +  32]
+    vmovdqu xmm9,  [rsp +  48]
+    vmovdqu xmm10, [rsp +  64]
+    vmovdqu xmm11, [rsp +  80]
+    vmovdqu xmm12, [rsp +  96]
+    vmovdqu xmm13, [rsp + 112]
+    vmovdqu xmm14, [rsp + 128]
+    vmovdqu xmm15, [rsp + 144]
 %endif
+    add     rsp, 184
     pop     r15
     pop     r14
     pop     r13
     pop     r12
+    pop     rdi
+    pop     rsi
     pop     rbx
     pop     rbp
     ret

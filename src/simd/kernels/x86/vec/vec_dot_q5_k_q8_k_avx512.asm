@@ -1,17 +1,23 @@
 ;; =============================================================================
-;; vec_dot_q4_k_q8_k_avx512.asm — Handwritten AVX-512 implementation of
-;; Q4_K x Q8_K dot product.  Bit-for-bit equivalent to upstream ggml's
-;; `ggml_vec_dot_q4_K_q8_K_generic`.
+;; vec_dot_q5_k_q8_k_avx512.asm — Handwritten AVX-512 implementation of
+;; Q5_K x Q8_K dot product.  Bit-for-bit equivalent to upstream ggml's
+;; `ggml_vec_dot_q5_K_q8_K_generic`.
 ;;
-;; Conservative AVX-512 port: per-sub-block algorithm matches the AVX2 sibling
-;; (vec_dot_q4_k_q8_k_avx2.asm); constants live in zmm regs.  Q4_K is identical
-;; to Q5_K minus the qh / +16 logic.
+;; STRATEGY
+;; --------
+;; Conservative AVX-512 port: the per-sub-block algorithm matches the AVX2
+;; sibling (vec_dot_q5_k_q8_k_avx2.asm), but constants live in zmm regs and
+;; broadcasts use EVEX encodings.  This guarantees correctness; a future
+;; revision can fuse two sub-blocks into one zmm pass for throughput.
+;;
+;; Width: AVX-512 F + BW + DQ.  No VNNI required.
 ;; =============================================================================
 
 section .data
     align 64
-    q4k_ones_i16_z:    times 32 dw 1
-    q4k_mask_lo4_z:    times 64 db 0x0F
+    ones_i16_z:    times 32 dw 1            ; 64 B (16 i16 per 256b lane)
+    mask_lo4_z:    times 64 db 0x0F         ; 64 B
+    const_16_z:    times 64 db 16           ; 64 B
 
 section .text
 
@@ -29,11 +35,15 @@ section .text
     %define ARG4    rcx
 %endif
 
-%define BS_Q4_K 144
+%define BS_Q5_K 176
 %define BS_Q8_K 292
 %define SCALES_OFF 160
 
-%macro Q4K_SUB_DOT 2
+;; -----------------------------------------------------------------------------
+;; SUB_DOT macro — same as AVX2 sibling.  ymm12/13/14 are the lower 256 bits of
+;; the corresponding zmm constants loaded once in the prologue.
+;; -----------------------------------------------------------------------------
+%macro SUB_DOT 2
     %ifidn %1, lo
         vpand        ymm0, ymm6, ymm13
     %else
@@ -41,7 +51,16 @@ section .text
         vpand        ymm0, ymm0, ymm13
     %endif
 
+    mov              eax, (1 << %2)
+    vmovd            xmm1, eax
+    vpbroadcastb     ymm1, xmm1
+    vpand            ymm2, ymm7, ymm1
+    vpcmpeqb         ymm2, ymm2, ymm1
+    vpand            ymm2, ymm2, ymm14
+    vpaddb           ymm0, ymm0, ymm2
+
     vmovdqu          ymm1, [r12 + 4 + (%2)*32]
+
     vpmaddubsw       ymm0, ymm0, ymm1
     vpmaddwd         ymm0, ymm0, ymm12
 
@@ -56,9 +75,9 @@ section .text
     add              r14d, eax
 %endmacro
 
-global simd_vec_dot_q4_k_q8_k_avx512
+global simd_vec_dot_q5_k_q8_k_avx512
 
-simd_vec_dot_q4_k_q8_k_avx512:
+simd_vec_dot_q5_k_q8_k_avx512:
     push    rbp
     mov     rbp, rsp
     push    rbx
@@ -95,8 +114,10 @@ simd_vec_dot_q4_k_q8_k_avx512:
     mov     r11, ARG3
     mov     r12, ARG4
 
-    vmovdqa64 zmm12, [rel q4k_ones_i16_z]
-    vmovdqa64 zmm13, [rel q4k_mask_lo4_z]
+    ;; EVEX 512-bit loads of the constants (lower halves used as ymm12/13/14).
+    vmovdqa64 zmm12, [rel ones_i16_z]
+    vmovdqa64 zmm13, [rel mask_lo4_z]
+    vmovdqa64 zmm14, [rel const_16_z]
 
 .main_loop:
     vmovd      xmm0, dword [r11]
@@ -150,23 +171,25 @@ simd_vec_dot_q4_k_q8_k_avx512:
     vphaddd       xmm0, xmm0, xmm0
     vmovd         r15d, xmm0
 
+    vmovdqu       ymm7, [r11 + 16]
+
     xor           r14d, r14d
 
-    vmovdqu       ymm6, [r11 + 16 + 0*32]
-    Q4K_SUB_DOT   lo, 0
-    Q4K_SUB_DOT   hi, 1
+    vmovdqu       ymm6, [r11 + 48 + 0*32]
+    SUB_DOT       lo, 0
+    SUB_DOT       hi, 1
 
-    vmovdqu       ymm6, [r11 + 16 + 1*32]
-    Q4K_SUB_DOT   lo, 2
-    Q4K_SUB_DOT   hi, 3
+    vmovdqu       ymm6, [r11 + 48 + 1*32]
+    SUB_DOT       lo, 2
+    SUB_DOT       hi, 3
 
-    vmovdqu       ymm6, [r11 + 16 + 2*32]
-    Q4K_SUB_DOT   lo, 4
-    Q4K_SUB_DOT   hi, 5
+    vmovdqu       ymm6, [r11 + 48 + 2*32]
+    SUB_DOT       lo, 4
+    SUB_DOT       hi, 5
 
-    vmovdqu       ymm6, [r11 + 16 + 3*32]
-    Q4K_SUB_DOT   lo, 6
-    Q4K_SUB_DOT   hi, 7
+    vmovdqu       ymm6, [r11 + 48 + 3*32]
+    SUB_DOT       lo, 6
+    SUB_DOT       hi, 7
 
     vcvtsi2ss     xmm0, xmm0, r14d
     vmulss        xmm0, xmm0, xmm4
@@ -175,7 +198,7 @@ simd_vec_dot_q4_k_q8_k_avx512:
     vsubss        xmm0, xmm0, xmm1
     vaddss        xmm15, xmm15, xmm0
 
-    add           r11, BS_Q4_K
+    add           r11, BS_Q5_K
     add           r12, BS_Q8_K
     dec           r10d
     jnz           .main_loop

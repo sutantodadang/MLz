@@ -46,6 +46,16 @@ pub fn main() !void {
                     \\  --port <int>           Server port (default: 8080)
                     \\  --api-key <string>     Require Authorization: Bearer <api-key>
                     \\
+                    \\Custom SIMD backend (built with -Dsimd-backend=true):
+                    \\  --no-simd              Disable custom SIMD hooks (use ggml default)
+                    \\  --simd-trace           Print every dispatched SIMD op to stderr
+                    \\  --simd-flash-attn      Opt-in: route flash attention through custom hook
+                    \\
+                    \\Env vars (equivalent to flags above):
+                    \\  MLZ_SIMD=0             same as --no-simd
+                    \\  MLZ_SIMD_TRACE=1       same as --simd-trace
+                    \\  MLZ_SIMD_FLASH_ATTN=1  same as --simd-flash-attn
+                    \\
                 , .{args[0]});
                 return;
             },
@@ -54,6 +64,12 @@ pub fn main() !void {
     };
 
     const model_path = cfg.model_path;
+
+    // Apply custom-SIMD runtime flags before any ggml work begins.  These set
+    // env vars read once (and cached) by ggml_simd_hook.cpp.
+    if (cfg.no_simd) setEnvVar("MLZ_SIMD", "0");
+    if (cfg.simd_trace) setEnvVar("MLZ_SIMD_TRACE", "1");
+    if (cfg.simd_flash_attn) setEnvVar("MLZ_SIMD_FLASH_ATTN", "1");
 
     if (cfg.server_mode) {
         try server.run(allocator, model_path, .{
@@ -250,6 +266,29 @@ pub fn main() !void {
 fn printToken(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     _ = ctx;
     try std.fs.File.stdout().deprecatedWriter().writeAll(bytes);
+}
+
+/// Set an environment variable in the current process.  Used to forward CLI
+/// flags into the C++ SIMD hook layer (which reads MLZ_SIMD* env vars).
+/// On Windows uses _putenv_s; on POSIX uses setenv.  Failures are silent —
+/// these flags are advisory.
+fn setEnvVar(name: []const u8, value: []const u8) void {
+    var stack_name: [128]u8 = undefined;
+    var stack_value: [32]u8 = undefined;
+    if (name.len >= stack_name.len or value.len >= stack_value.len) return;
+    @memcpy(stack_name[0..name.len], name);
+    stack_name[name.len] = 0;
+    @memcpy(stack_value[0..value.len], value);
+    stack_value[value.len] = 0;
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
+    };
+    if (@import("builtin").os.tag == .windows) {
+        _ = c._putenv_s(@ptrCast(&stack_name), @ptrCast(&stack_value));
+    } else {
+        _ = c.setenv(@ptrCast(&stack_name), @ptrCast(&stack_value), 1);
+    }
 }
 
 fn maybeSaveChat(

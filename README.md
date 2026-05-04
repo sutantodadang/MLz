@@ -82,6 +82,17 @@ zig build -Dsimd-backend=true -Doptimize=ReleaseFast
 ```
 > **Supported formats:** F32 (native) and F16 (via F16C conversion). Quantized models (Q4_K_M, etc.) use GGML's built-in kernels.
 
+The backend is rollback-safe at runtime. CLI flags:
+
+| Flag                | Equivalent env var       | Effect |
+|---------------------|--------------------------|--------|
+| `--no-simd`         | `MLZ_SIMD=0`             | Disable hooks, use ggml default path |
+| `--simd-trace`      | `MLZ_SIMD_TRACE=1`       | Print every dispatched op to stderr |
+| `--simd-flash-attn` | `MLZ_SIMD_FLASH_ATTN=1`  | Opt in to the flash-attention hook |
+
+See [docs/simd.md](docs/simd.md) for the full dispatch contract, kernel
+inventory, and how to add new kernels.
+
 ## Project Structure
 
 ```
