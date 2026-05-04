@@ -140,7 +140,14 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
                 cfg.no_simd = true;
             } else if (std.mem.eql(u8, arg, "--n-predict")) {
-                cfg.n_predict = try parseNextInt(usize, &i, args);
+                const v = try parseNextInt(usize, &i, args);
+                // Clamp to a sane upper bound (1 MiB tokens) to prevent
+                // accidental near-infinite generation from typos like
+                // `--n-predict 18446744073709551615`.  Mirrors the
+                // openai.zig max_tokens guard.
+                const n_predict_max: usize = 1 << 20;
+                if (v == 0) return ParseError.InvalidInt;
+                cfg.n_predict = if (v > n_predict_max) n_predict_max else v;
             } else if (std.mem.eql(u8, arg, "--simd-trace")) {
                 cfg.simd_trace = true;
             } else if (std.mem.eql(u8, arg, "--simd-flash-attn")) {

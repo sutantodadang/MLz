@@ -30,6 +30,7 @@
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1974,16 +1975,25 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
     {
       /* Atomic flag: -1 = uninitialised, 0 = disabled, 1 = enabled.
        * ggml_compute_forward is called from multiple worker threads, so use
-       * a compare-exchange to initialise exactly once without a mutex. */
+       * a compare-exchange to initialise exactly once without a mutex.
+       * Acquire load on the fast path pairs with the release implied by the
+       * successful CAS so weak-memory targets (aarch64) see the env decision. */
       static _Atomic int s_flash_enabled = -1;
-      if (s_flash_enabled < 0) {
+      int cached = atomic_load_explicit(&s_flash_enabled, memory_order_acquire);
+      if (cached < 0) {
         const char *e = getenv("MLZ_SIMD_FLASH_ATTN");
         int desired = (e && e[0] != '0') ? 1 : 0;
         int expected = -1;
-        /* If another thread won the race, desired is already set correctly. */
-        atomic_compare_exchange_strong(&s_flash_enabled, &expected, desired);
+        if (atomic_compare_exchange_strong_explicit(&s_flash_enabled, &expected,
+                                                    desired, memory_order_release,
+                                                    memory_order_acquire)) {
+          cached = desired;
+        } else {
+          /* Another thread won the race; `expected` now holds their value. */
+          cached = expected;
+        }
       }
-      if (s_flash_enabled) {
+      if (cached) {
         extern int ggml_simd_try_flash_attn(const struct ggml_compute_params *params,
                                             struct ggml_tensor *tensor);
         if (ggml_simd_try_flash_attn(params, tensor)) {
