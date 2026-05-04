@@ -140,8 +140,7 @@ pub fn parseChatCompletionRequest(
         if (m.content.len == 0) return ParseError.EmptyContent;
         const role_ok = std.ascii.eqlIgnoreCase(m.role, "system") or
             std.ascii.eqlIgnoreCase(m.role, "user") or
-            std.ascii.eqlIgnoreCase(m.role, "assistant") or
-            std.ascii.eqlIgnoreCase(m.role, "tool");
+            std.ascii.eqlIgnoreCase(m.role, "assistant");
         if (!role_ok) return ParseError.InvalidRole;
     }
 

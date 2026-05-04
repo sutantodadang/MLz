@@ -32,6 +32,7 @@ function Run-MLz([string]$tag, [string[]]$extra) {
         "--temp", "0",
         "--seed", "$Seed",
         "--ctx", "2048",
+        "--n-predict", "$MaxTokens",
         "--stream", "false"
     ) + $extra
     Write-Host "[$tag] $exe $($argList -join ' ')"
@@ -39,9 +40,10 @@ function Run-MLz([string]$tag, [string[]]$extra) {
     $stderrFile = [IO.Path]::GetTempFileName()
     $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
     $stdout = Get-Content $stdoutFile -Raw
+    $stderr = Get-Content $stderrFile -Raw
     Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
     if ($proc.ExitCode -ne 0) {
-        Write-Error "[$tag] MLz exited with $($proc.ExitCode)"
+        Write-Error "[$tag] MLz exited with $($proc.ExitCode)`nstderr: $stderr"
     }
     return ($stdout).Trim()
 }

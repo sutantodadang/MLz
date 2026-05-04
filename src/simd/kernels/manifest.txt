@@ -1,10 +1,9 @@
 # SIMD Kernel Manifest (PLAN-ASSEMBLY-REWRITE Section 2)
 #
-# Single source of truth consumed by build.zig at configure time:
-#   - Drives NASM compile steps for every kernel listed.
-#   - Generates `simd_kernels_manifest.h` in the build cache, which is included
-#     by `src/simd/ggml_simd_hook.cpp` instead of hand-maintained
-#     `extern void simd_*` declarations.
+# Documentation-only mirror.  The authoritative list of kernels is the
+# `simd_manifest` array in build.zig, which drives NASM/GAS compile steps
+# and codegen of `simd_kernels_manifest.h`.  This file is kept in sync
+# manually for human reference; it is NOT parsed by build.zig.
 #
 # Format (whitespace-separated; '#' starts a comment):
 #   <arch>  <relative_path>                       <symbol>                       <signature>

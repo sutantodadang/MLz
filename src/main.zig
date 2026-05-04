@@ -143,6 +143,7 @@ pub fn main() !void {
 
             const result = try engine.chat(allocator, msgs.items, .{
                 .sink = sink,
+                .max_tokens = cfg.n_predict,
             });
             // Result owns text and tokens, usually managed by arena or manually.
             // inference.GenerationResult deinit? It has text and tokens slices.

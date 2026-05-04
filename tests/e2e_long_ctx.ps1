@@ -37,6 +37,7 @@ function Run-Variant([string]$tag, [string[]]$extra) {
         "--temp", "0.8",
         "--seed", "$Seed",
         "--ctx", "$Ctx",
+        "--n-predict", "$MaxTokens",
         "--stream", "false"
     ) + $extra
     Write-Host "[$tag] generating up to $MaxTokens tokens at ctx=$Ctx ..."
@@ -45,9 +46,10 @@ function Run-Variant([string]$tag, [string[]]$extra) {
     $stderrFile = [IO.Path]::GetTempFileName()
     $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
     $sw.Stop()
+    $stderr = Get-Content $stderrFile -Raw
     Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
     if ($proc.ExitCode -ne 0) {
-        Write-Error "[$tag] FAIL: exit=$($proc.ExitCode) after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s"
+        Write-Error "[$tag] FAIL: exit=$($proc.ExitCode) after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s`nstderr: $stderr"
     }
     Write-Host "[$tag] PASS ($($sw.Elapsed.TotalSeconds.ToString('0.0'))s)"
 }

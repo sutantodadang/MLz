@@ -1972,10 +1972,16 @@ static void ggml_compute_forward(struct ggml_compute_params *params,
     // MLZ_SIMD_FLASH_ATTN=1 because the Q8_0 path historically crashes on
     // long contexts (see PLAN-ASSEMBLY-REWRITE: tests E2 must gate this).
     {
-      static int s_flash_enabled = -1;
+      /* Atomic flag: -1 = uninitialised, 0 = disabled, 1 = enabled.
+       * ggml_compute_forward is called from multiple worker threads, so use
+       * a compare-exchange to initialise exactly once without a mutex. */
+      static _Atomic int s_flash_enabled = -1;
       if (s_flash_enabled < 0) {
         const char *e = getenv("MLZ_SIMD_FLASH_ATTN");
-        s_flash_enabled = (e && e[0] != '0') ? 1 : 0;
+        int desired = (e && e[0] != '0') ? 1 : 0;
+        int expected = -1;
+        /* If another thread won the race, desired is already set correctly. */
+        atomic_compare_exchange_strong(&s_flash_enabled, &expected, desired);
       }
       if (s_flash_enabled) {
         extern int ggml_simd_try_flash_attn(const struct ggml_compute_params *params,

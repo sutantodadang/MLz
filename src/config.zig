@@ -25,6 +25,7 @@ pub const Config = struct {
     // One-shot prompt mode
     prompt_mode: bool = false,
     user_prompt: ?[]const u8 = null,
+    n_predict: ?usize = null, // --n-predict : max tokens to generate in prompt mode
 
     // Speculative Decoding
     draft_model_path: ?[]const u8 = null,
@@ -138,6 +139,8 @@ pub const Config = struct {
                 cfg.server_api_key = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
                 cfg.no_simd = true;
+            } else if (std.mem.eql(u8, arg, "--n-predict")) {
+                cfg.n_predict = try parseNextInt(usize, &i, args);
             } else if (std.mem.eql(u8, arg, "--simd-trace")) {
                 cfg.simd_trace = true;
             } else if (std.mem.eql(u8, arg, "--simd-flash-attn")) {
