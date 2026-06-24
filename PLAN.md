@@ -156,13 +156,17 @@ these caches. The per-slot approach uses only `seq_rm`, which works.)
       Llama (transformer), gemma (hybrid), and Qwen3, plus a 12-way concurrent
       stress run (queue overflow, 0 errors). Graceful full-clear fallback when a
       backend can't partially remove KV.
-- [ ] **Deferred:** cross-slot `seq_cp` radix tree with LRU eviction +
-      ref-counted spans. Ranged `seq_cp` aborts on this llama build
-      (`GGML_ASSERT`); a viable path is one dedicated sequence per cached prefix
-      reused via FULL-sequence `seq_cp` (p0=0,p1=-1) — needs verifying that full
-      copies are allowed where sub-range copies are not, plus a seq-pool budget.
-      Lower priority: per-slot reuse already captures the multi-turn / shared-
-      prefix win.
+- [ ] **Not built (viable, confirmed):** cross-slot `seq_cp` radix tree.
+      Experiment (`--seqcp-test`, since removed) proved on BOTH Llama-3.2-1B and
+      gemma-Q6 that **full-sequence `seq_cp(src,dst,0,-1)` succeeds** (no abort,
+      KV carried — the copied sequence continued coherently), while **sub-range
+      `seq_cp(...,0,k)` aborts** (`GGML_ASSERT is_full`). So a radix tree is
+      buildable: one dedicated sequence per cached prefix segment, reused by
+      full-copy into a slot; LRU eviction + ref-counting over a seq-pool bounded
+      by `n_seq_max`. Lets a *cold* slot reuse a prefix another slot prefilled —
+      the benefit per-slot reuse can't give. Sizeable feature; per-slot reuse
+      already captures the multi-turn / shared-prefix win, so this is lower
+      priority.
 
 Validated (`--max-concurrent 4 --prefix-cache`, greedy):
 - correctness: distinct prompts, 4-way concurrent, and multi-turn recall all
