@@ -37,6 +37,7 @@ int simd_check_avx2(void) { return 0; }
 int simd_check_avx512(void) { return 0; }
 int simd_check_f16c(void) { return 0; }
 int simd_check_avx512_fp16(void) { return 0; }
+int simd_check_avx512_vnni(void) { return 0; }
 
 #else  // x86_64
 
@@ -171,6 +172,28 @@ int simd_check_avx512_fp16(void) {
   bool has_avx512_fp16 = (info[3] & (1 << 23)) != 0; // AVX-512 FP16 in EDX
 
   return (g_avx512_fp16_supported = has_avx512_fp16 ? 1 : 0);
+}
+
+// Cached AVX-512 VNNI detection (needs AVX512VL for the 256-bit vpdpbusd path)
+static int g_avx512_vnni_checked = 0;
+static int g_avx512_vnni_supported = 0;
+
+int simd_check_avx512_vnni(void) {
+  if (g_avx512_vnni_checked) {
+    return g_avx512_vnni_supported;
+  }
+  g_avx512_vnni_checked = 1;
+
+  if (!simd_check_avx512()) {
+    return (g_avx512_vnni_supported = 0);
+  }
+
+  int info[4] = {0};
+  cpuid(info, 7, 0);
+  bool has_vnni = (info[2] & (1 << 11)) != 0; // AVX512_VNNI in ECX
+  bool has_vl = (info[1] & (1 << 31)) != 0;   // AVX512VL  in EBX
+
+  return (g_avx512_vnni_supported = (has_vnni && has_vl) ? 1 : 0);
 }
 
 #endif  // __aarch64__ / x86_64

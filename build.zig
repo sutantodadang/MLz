@@ -1257,6 +1257,32 @@ pub fn build(b: *std.Build) void {
                 ggml_lib.addObjectFile(vdf_avx512_obj);
             }
 
+            // gemm_s8s8s32 — INT8 GEMM microkernel (Phase 3 kernel expansion)
+            const gemm_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const gemm_avx2_obj = gemm_avx2_asm.addOutputFileArg("gemm_s8s8s32_avx2.o");
+            gemm_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx2.asm"));
+            ggml_lib.addObjectFile(gemm_avx2_obj);
+
+            if (!no_avx512) {
+                const gemm_vnni_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const gemm_vnni_obj = gemm_vnni_asm.addOutputFileArg("gemm_s8s8s32_avx512vnni.o");
+                gemm_vnni_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx512vnni.asm"));
+                ggml_lib.addObjectFile(gemm_vnni_obj);
+            }
+
             const q8_k_asm = b.addSystemCommand(&[_][]const u8{
                 "nasm",
                 "-f",

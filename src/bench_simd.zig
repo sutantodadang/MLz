@@ -50,6 +50,9 @@ extern "c" fn simd_rope_standard_f32_avx2(n_pairs: i64, cache: ?*const f32, src:
 extern "c" fn simd_rope_standard_f32_avx512(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
 extern "c" fn simd_vec_dot_f32_f32_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+extern "c" fn simd_check_avx512_vnni() bool;
+extern "c" fn simd_gemm_s8s8s32_avx2(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
+extern "c" fn simd_gemm_s8s8s32_avx512vnni(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 
 // NEON kernels (aarch64)
 extern "c" fn simd_quantize_q8_0_f32_neon(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
@@ -236,6 +239,26 @@ pub fn main() !void {
     // vec_dot_f32_f32
     run_vec_dot("vec_dot_f32_f32 (AVX2)", simd_vec_dot_f32_f32_avx2, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
     run_vec_dot("vec_dot_f32_f32 (AVX-512)", simd_vec_dot_f32_f32_avx512, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+
+    // gemm_s8s8s32 — INT8 GEMM microkernel (M x K . N x K^T -> M x N)
+    {
+        const GM: usize = 64;
+        const GN: usize = 64;
+        const GK: usize = 512;
+        const gemm_iters: usize = 400;
+        const ga = try allocator.alloc(i8, GM * GK);
+        defer allocator.free(ga);
+        const gb = try allocator.alloc(i8, GN * GK);
+        defer allocator.free(gb);
+        const gc = try allocator.alloc(i32, GM * GN);
+        defer allocator.free(gc);
+        for (ga, 0..) |*v, i| v.* = @intCast(@as(i32, @intCast(i % 255)) - 127);
+        for (gb, 0..) |*v, i| v.* = @intCast(@as(i32, @intCast((i * 7) % 255)) - 127);
+        run_gemm("gemm_s8s8s32 (AVX2)", simd_gemm_s8s8s32_avx2, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);
+        if (simd_check_avx512_vnni()) {
+            run_gemm("gemm_s8s8s32 (VNNI)", simd_gemm_s8s8s32_avx512vnni, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);
+        }
+    }
     } // end enable_new_kernels
 
     // Prevent optimizer from eliminating unused result
@@ -254,6 +277,20 @@ fn run_vec_dot(name: []const u8, kernel: anytype, N: usize, vx: ?*const anyopaqu
     const flops = @as(f64, @floatFromInt(2 * N - 1)) * @as(f64, @floatFromInt(iter));
     const gflops = flops / sec / 1e9;
     report(name, sec, gflops);
+}
+
+fn run_gemm(name: []const u8, kernel: anytype, M: usize, N: usize, K: usize, A: [*]const i8, B: [*]const i8, C: [*]i32, iter: usize) void {
+    kernel(@intCast(M), @intCast(N), @intCast(K), A, B, C); // warm
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(@intCast(M), @intCast(N), @intCast(K), A, B, C);
+    }
+    const ns = timer.read();
+    const sec = @as(f64, @floatFromInt(ns)) / 1e9;
+    // GEMM: 2*M*N*K ops (one mul + one add per inner term)
+    const ops = @as(f64, @floatFromInt(2 * M * N * K)) * @as(f64, @floatFromInt(iter));
+    const gops = ops / sec / 1e9;
+    report(name, sec, gops);
 }
 
 fn run_rms_norm(name: []const u8, kernel: anytype, n: usize, eps: f32, x: ?*const f32, y: ?*f32, iter: usize) void {

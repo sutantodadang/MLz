@@ -48,6 +48,12 @@ int simd_check_f16c(void);
 int simd_check_avx512_fp16(void);
 
 /**
+ * @brief Check if CPU supports AVX-512 VNNI (vpdpbusd, needs AVX512VL for ymm)
+ * @return Non-zero if AVX-512 VNNI + VL are supported, zero otherwise
+ */
+int simd_check_avx512_vnni(void);
+
+/**
  * @brief Check if CPU supports ARM NEON instructions
  * @return Non-zero if NEON is supported (always true on AArch64), zero otherwise
  */

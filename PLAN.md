@@ -209,8 +209,19 @@ the actual compute and SIMD matters).
     `ymm0..3`, leaving constants intact. Now passes all sizes.
   - Build gotcha found: zig caches nasm output by argv only, so editing a `.asm`
     does NOT re-assemble in some cases — clear `.zig-cache` to force it.
-- [ ] **Remaining:** INT8 GEMM microkernels, AVX512-VNNI / AMX dispatch, fused
-      RoPE+attention.
+- [x] **INT8 GEMM microkernel** (`gemm_s8s8s32`, AVX2 + AVX512-VNNI fast path).
+      `C[M,N] = A[M,K]·B[N,K]ᵀ`, s8·s8→s32. Uses ggml's `vpsignb` sign trick
+      (x86 has no s8·s8 mul): AVX2 path `vpmaddubsw`+`vpmaddwd`, VNNI path one
+      `vpdpbusd`. Runtime gate `simd_check_avx512_vnni()` (CPUID leaf-7
+      VNNI bit 11 + VL bit 31). Golden-vector correctness vs scalar triple loop,
+      incl. K%32 scalar tail (test-simd pass=152, fail=0). Benched ~136 GOPS
+      (AVX2) / ~139 GOPS (VNNI) at 64×64×512.
+      - ponytail ceiling: naive triple loop, no register/cache blocking → a
+        per-(m,n) horizontal reduce dominates, so VNNI ≈ AVX2 here. Tile into an
+        MR×NR microkernel (accumulate output tiles in regs, reduce once) to
+        expose VNNI throughput when GEMM actually gates inference.
+- [ ] **Remaining:** AMX dispatch (needs Sapphire Rapids — untestable on this
+      Zen4 box, deferred); MR×NR GEMM tiling; fused RoPE+attention.
 
 ---
 

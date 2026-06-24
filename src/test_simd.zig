@@ -59,6 +59,11 @@ extern "c" fn simd_rope_standard_f32_avx512(n_pairs: c_longlong, cache: [*]const
 extern "c" fn simd_vec_dot_f32_f32_avx2(n: c_int, r: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, r: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 
+// New kernel symbols â€” INT8 GEMM microkernel
+extern "c" fn simd_check_avx512_vnni() bool;
+extern "c" fn simd_gemm_s8s8s32_avx2(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
+extern "c" fn simd_gemm_s8s8s32_avx512vnni(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
+
 // -----------------------------------------------------------------------------
 // ggml reference quantize/dequantize (canonical, scalar)
 // -----------------------------------------------------------------------------
@@ -462,8 +467,84 @@ pub fn main() !void {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // New kernels: INT8 GEMM microkernel (s8*s8 -> s32). AVX2 + AVX512-VNNI.
+    // Reference: scalar triple-loop. Exact integer match expected.
+    // Sizes include K % 32 != 0 to exercise the scalar tail.
+    // -------------------------------------------------------------------------
+    if (enable_new_kernels and builtin.cpu.arch == .x86_64) {
+        const have_vnni = simd_check_avx512_vnni();
+        std.debug.print("CPU caps: AVX512-VNNI={any}\n", .{have_vnni});
+        const gemm_cases = [_][3]usize{ .{ 1, 1, 32 }, .{ 2, 3, 64 }, .{ 4, 5, 256 }, .{ 3, 7, 96 }, .{ 5, 4, 160 }, .{ 1, 1, 40 }, .{ 2, 2, 35 } };
+        if (have_avx2) {
+            try runGemmTest(allocator, "gemm_s8s8s32 avx2", simd_gemm_s8s8s32_avx2, &gemm_cases, &rng, &pass, &fail);
+        }
+        if (have_vnni) {
+            try runGemmTest(allocator, "gemm_s8s8s32 avx512vnni", simd_gemm_s8s8s32_avx512vnni, &gemm_cases, &rng, &pass, &fail);
+        }
+    }
+
     std.debug.print("\n=== SUMMARY: pass={d} fail={d} kernel-skipped={d} ===\n", .{ pass, fail, skip });
     if (fail > 0) std.process.exit(1);
+}
+
+// -----------------------------------------------------------------------------
+// INT8 GEMM validator: C[M,N] = A[M,K] . B[N,K]^T, s8*s8 -> s32, exact.
+// -----------------------------------------------------------------------------
+const GemmFn = *const fn (M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) callconv(.c) void;
+
+fn runGemmTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: GemmFn,
+    cases: []const [3]usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (cases) |c| {
+        const M = c[0];
+        const N = c[1];
+        const K = c[2];
+        const A = try allocator.alloc(i8, M * K);
+        defer allocator.free(A);
+        const B = try allocator.alloc(i8, N * K);
+        defer allocator.free(B);
+        const C = try allocator.alloc(i32, M * N);
+        defer allocator.free(C);
+        const Cref = try allocator.alloc(i32, M * N);
+        defer allocator.free(Cref);
+        for (A) |*v| v.* = @intCast(r.intRangeAtMost(i32, -127, 127));
+        for (B) |*v| v.* = @intCast(r.intRangeAtMost(i32, -127, 127));
+        @memset(C, -559038737); // 0xDEADBEEF sentinel
+
+        for (0..M) |m| {
+            for (0..N) |n| {
+                var acc: i32 = 0;
+                for (0..K) |k| acc += @as(i32, A[m * K + k]) * @as(i32, B[n * K + k]);
+                Cref[m * N + n] = acc;
+            }
+        }
+        fp(@intCast(M), @intCast(N), @intCast(K), A.ptr, B.ptr, C.ptr);
+
+        var ok = true;
+        for (0..M * N) |i| {
+            if (C[i] != Cref[i]) {
+                ok = false;
+                std.debug.print(" MxNxK={d}x{d}x{d}:FAIL[{d}] got={d} ref={d}", .{ M, N, K, i, C[i], Cref[i] });
+                break;
+            }
+        }
+        if (ok) {
+            std.debug.print(" {d}x{d}x{d}:ok", .{ M, N, K });
+            pass.* += 1;
+        } else {
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
 }
 
 // -----------------------------------------------------------------------------
