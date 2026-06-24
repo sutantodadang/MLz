@@ -128,51 +128,44 @@ read reallocated → any request whose body spanned multiple `recv()`s 404'd.
 ## Phase 2 — Prefix sharing / RadixAttention-lite `done`
 
 SGLang's edge: reuse KV across requests with a common prefix (system prompts,
-few-shot, multi-turn). Delivered as **per-slot prefix reuse + prefix-affinity
-admission** (opt-in, `prefix_cache`).
+few-shot, multi-turn). Delivered as a **cross-slot prefix cache**
+(`src/prefix_cache.zig`) — a request on ANY slot reuses a prefix that a request
+on a DIFFERENT slot prefilled.
 
-The road here was a long debug. Symptom: any prefix reuse corrupted output on
-BOTH a plain transformer (Llama-3.2-1B, added to the model set for this) and a
-hybrid model (gemma). Root cause was **not** the model architecture — it was a
-KV-lifecycle double-ownership bug: `finishSlot` wiped a slot's KV
-(`seq_rm(-1,-1)`) on completion, while `slot.cached` still claimed those tokens
-were live, so the next request reused a prefix that had been deleted → attention
-over empty cells → garbage. Fix: `finishSlot` keeps the KV when `prefix_cache`
-is on; `admit()` owns trimming/clearing it. (Cross-slot ranged `seq_cp` — true
-RadixAttention KV *copy* — remains unavailable: it aborts with `GGML_ASSERT` on
-these caches. The per-slot approach uses only `seq_rm`, which works.)
+Two findings made it work. (1) A KV-lifecycle bug — `finishSlot` wiped a slot's
+KV while the cache still claimed those tokens were live — was the sole cause of
+the "model corrupts" symptoms (not architecture). (2) The defining cross-slot
+primitive: a `--seqcp-test` experiment proved that **full-sequence
+`seq_cp(src,dst,0,-1)` succeeds** on both Llama and gemma, while **sub-range
+`seq_cp` aborts** (`GGML_ASSERT is_full`). So sharing is built on full copies +
+end-aligned `seq_rm` truncation only.
 
-- [x] **Per-slot prefix reuse**: `slot.cached` tracks the slot's exact committed
-      KV (prompt + fed tokens). On admit, reuse the longest common prefix, trim
-      the divergent tail with `seq_rm` (graceful full-clear fallback when a
-      backend can't partially remove), prefill only the suffix.
-- [x] **Prefix-affinity admission** (`pickSlot`): route each request to the idle
-      slot whose retained prefix matches best, so a prefix family lands on a warm
-      slot.
-- [x] **Hit-rate metric** (`n_requests` / `reused_tokens` / `prefilled_tokens`)
-      logged on shutdown; wire into `/metrics` in Phase 5.
+- [x] **Cross-slot cache pool** (`PrefixCache`): a pool of dedicated cache
+      sequences (ids past the serving slots, `n_cache = max_concurrent`), each
+      holding one cached prompt prefix. `acquire` picks the longest-matching
+      entry, truncates it to the matched length (end-aligned `seq_rm`), and
+      full-copies it into the slot; `store` full-copies a slot's prefilled prompt
+      KV into a free/LRU entry. `seq_cp` shares cells, so it's cheap. LRU
+      eviction; graceful skip when a backend can't truncate.
+- [x] Scheduler integration: `admit` calls `acquire` (clean clear on miss),
+      snapshot calls `store`, `finishSlot` frees the slot (cache is independent).
+      `n_seq_max = max_concurrent + n_cache`.
+- [x] **Hit-rate metric** (`hits` / `reused_tokens` / `prefilled_tokens`) logged
+      on shutdown; wire into `/metrics` in Phase 5.
 - [x] `prefix_cache` **on by default** (`serve.prefix_cache` / `MLZ_PREFIX_CACHE`
-      / `--prefix-cache`; disable with `--no-prefix-cache`). Validated correct on
-      Llama (transformer), gemma (hybrid), and Qwen3, plus a 12-way concurrent
-      stress run (queue overflow, 0 errors). Graceful full-clear fallback when a
-      backend can't partially remove KV.
-- [ ] **Not built (viable, confirmed):** cross-slot `seq_cp` radix tree.
-      Experiment (`--seqcp-test`, since removed) proved on BOTH Llama-3.2-1B and
-      gemma-Q6 that **full-sequence `seq_cp(src,dst,0,-1)` succeeds** (no abort,
-      KV carried — the copied sequence continued coherently), while **sub-range
-      `seq_cp(...,0,k)` aborts** (`GGML_ASSERT is_full`). So a radix tree is
-      buildable: one dedicated sequence per cached prefix segment, reused by
-      full-copy into a slot; LRU eviction + ref-counting over a seq-pool bounded
-      by `n_seq_max`. Lets a *cold* slot reuse a prefix another slot prefilled —
-      the benefit per-slot reuse can't give. Sizeable feature; per-slot reuse
-      already captures the multi-turn / shared-prefix win, so this is lower
-      priority.
+      / `--prefix-cache`; disable with `--no-prefix-cache`).
+- [ ] **Deferred:** split cached prefixes at branch points into a true radix
+      *tree* (multi-node assembly via several full-copies) for finer-grained
+      sharing; per-prefix ref-counting. The flat LRU pool already captures the
+      dominant shared-system / multi-turn cases.
 
-Validated (`--max-concurrent 4 --prefix-cache`, greedy):
-- correctness: distinct prompts, 4-way concurrent, and multi-turn recall all
-  correct on Llama-3.2-1B **and** gemma-Q6.
-- **prefix latency: 6.8x** (Llama, 2272→334 ms p50) / **12.7x** (gemma,
-  12151→957 ms p50) on a shared long prefix.
+Validated (`--max-concurrent 4 --prefix-cache`, greedy) on Llama-3.2-1B
+(transformer) **and** gemma-Q6 (hybrid):
+- correctness: distinct, 4-way concurrent, multi-turn recall, and a 12-way
+  concurrent stress (queue overflow) — all correct, 0 errors.
+- **cross-slot reuse**: a cold request caches a long shared prefix (Llama 904 ms
+  / gemma 4963 ms); the next *different* request that shares it reuses cross-slot
+  (Llama 113 ms ≈ 8x / gemma 451 ms ≈ 11x).
 - continuous-batching throughput unchanged: 4.19x on Llama-3.2-1B.
 
 ---

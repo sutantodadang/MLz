@@ -102,6 +102,13 @@ pub const Context = struct {
         return c.llama_memory_seq_rm(c.llama_get_memory(self.handle), seq_id, p0, p1);
     }
 
+    /// Copy KV cells for positions [p0, p1) from sequence `src` to `dst`
+    /// (p1 == -1 = to end). Only FULL-sequence copies (the whole src content) are
+    /// supported on this build; sub-range copies abort. seq_cp shares cells.
+    pub fn kvCacheSeqCp(self: Context, src: i32, dst: i32, p0: i32, p1: i32) void {
+        c.llama_memory_seq_cp(c.llama_get_memory(self.handle), src, dst, p0, p1);
+    }
+
     pub fn nCtx(self: Context) u32 {
         return c.llama_n_ctx(self.handle);
     }

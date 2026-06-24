@@ -20,6 +20,7 @@
 const std = @import("std");
 const llama = @import("llama_cpp.zig");
 const inference = @import("inference.zig");
+const prefix = @import("prefix_cache.zig");
 
 /// One unit of work. Allocated by the submitter (handler thread) and kept alive
 /// until `wait()` returns — the submitter blocks for the whole generation, so a
@@ -72,11 +73,6 @@ const Slot = struct {
     n_decoded: usize = 0,
     /// Last sampled token, fed at the next decode step.
     last_token: llama.Token = 0,
-    /// Prompt tokens whose KV currently occupies this slot at positions
-    /// [0, len) — the prefix of the previous request served here. Lets a new
-    /// request that shares a prefix (e.g. same system prompt) skip re-prefilling
-    /// it. Owner-thread-only.
-    cached: std.ArrayList(llama.Token) = .empty,
 };
 
 pub const Scheduler = struct {
@@ -99,51 +95,58 @@ pub const Scheduler = struct {
     max_queue: usize,
 
     // --- Phase 2 prefix sharing ---
-    // Prefix reuse (keep a slot's KV prefix, seq_rm the divergent tail, prefill
-    // only the suffix) is correct on standard transformer KV caches but corrupts
-    // recurrent/hybrid models (e.g. Gated Delta Net): their recurrent state is
-    // not position-indexed, so a partial seq_rm cannot rewind it, and the model
-    // emits garbage. llama does NOT reliably flag those models (is_hybrid/
-    // is_recurrent return false here), so reuse is OPT-IN (default false) —
-    // correct everywhere by default, enabled only for plain-KV-cache models.
-    // When on, sharing is by prefix-affinity admission: route each request to
-    // the idle slot whose retained prefix matches best.
+    // Cross-slot prefix cache (RadixAttention-lite): a pool of dedicated cache
+    // sequences holds prompt prefixes; a request on any slot reuses the longest
+    // cached prefix via full-sequence seq_cp. Opt-in via prefix_cache. null pool
+    // => no reuse (each request decodes from a clean KV).
     prefix_cache: bool,
+    prefix_pool: ?prefix.PrefixCache,
     n_requests: u64 = 0,
     reused_tokens: u64 = 0,
     prefilled_tokens: u64 = 0,
 
+    /// `n_slots` serving slots (seq ids 0..n_slots). `n_cache` extra cache
+    /// sequences (ids n_slots..n_slots+n_cache) back the cross-slot prefix cache;
+    /// pass 0 to disable. The llama context must have n_seq_max >= n_slots+n_cache.
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: llama.Context,
         vocab: ?*const llama.c.llama_vocab,
-        n_seq_max: usize,
+        n_slots: usize,
         n_batch: usize,
         prefix_cache: bool,
+        n_cache: usize,
     ) !*Scheduler {
         const self = try allocator.create(Scheduler);
         errdefer allocator.destroy(self);
 
-        const slots = try allocator.alloc(Slot, n_seq_max);
+        const slots = try allocator.alloc(Slot, n_slots);
         errdefer allocator.free(slots);
         for (slots, 0..) |*s, i| s.* = .{ .seq_id = @intCast(i) };
 
-        const sample_idx = try allocator.alloc(i32, n_seq_max);
+        const sample_idx = try allocator.alloc(i32, n_slots);
         errdefer allocator.free(sample_idx);
+
+        var pool: ?prefix.PrefixCache = null;
+        if (prefix_cache and n_cache > 0) {
+            pool = try prefix.PrefixCache.init(allocator, ctx, n_cache, @intCast(n_slots));
+        }
+        errdefer if (pool) |*p| p.deinit();
 
         self.* = .{
             .allocator = allocator,
             .ctx = ctx,
             .vocab = vocab,
-            .batch = llama.Batch.init(@intCast(n_batch), 0, @intCast(n_seq_max)),
+            .batch = llama.Batch.init(@intCast(n_batch), 0, @intCast(n_slots + n_cache)),
             .n_batch = n_batch,
             .n_ctx = @intCast(ctx.nCtx()),
             .slots = slots,
             .sample_idx = sample_idx,
             .queue = .empty,
             .running = std.atomic.Value(bool).init(true),
-            .max_queue = n_seq_max * 4,
+            .max_queue = n_slots * 4,
             .prefix_cache = prefix_cache,
+            .prefix_pool = pool,
         };
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
         return self;
@@ -159,15 +162,16 @@ pub const Scheduler = struct {
         if (self.n_requests > 0) {
             const total = self.reused_tokens + self.prefilled_tokens;
             const pct: u64 = if (total > 0) self.reused_tokens * 100 / total else 0;
+            const hits: u64 = if (self.prefix_pool) |p| p.hits else 0;
             std.log.info(
-                "scheduler: {d} requests, prefix reused {d}/{d} prompt tokens ({d}%)",
-                .{ self.n_requests, self.reused_tokens, total, pct },
+                "scheduler: {d} requests, {d} prefix-cache hits, reused {d}/{d} prompt tokens ({d}%)",
+                .{ self.n_requests, hits, self.reused_tokens, total, pct },
             );
         }
 
+        if (self.prefix_pool) |*p| p.deinit();
         self.batch.deinit();
         self.queue.deinit(self.allocator);
-        for (self.slots) |*slot| slot.cached.deinit(self.allocator);
         self.allocator.free(self.sample_idx);
         self.allocator.free(self.slots);
         self.allocator.destroy(self);
@@ -187,7 +191,7 @@ pub const Scheduler = struct {
             // --- admit queued requests into idle slots, count active ---
             self.mutex.lock();
             while (self.queue.items.len > 0) {
-                const slot_idx = self.pickSlot(self.queue.items[0].prompt_tokens) orelse break;
+                const slot_idx = self.pickSlot() orelse break;
                 const req = self.queue.orderedRemove(0);
                 self.admit(&self.slots[slot_idx], req);
             }
@@ -222,47 +226,26 @@ pub const Scheduler = struct {
         }
     }
 
-    /// Prefix-affinity admission: with prefix_cache on, pick the idle slot whose
-    /// retained prefix shares the most tokens with this prompt (so a prefix
-    /// family routes to a warm slot). Off: any idle slot. Null when none idle.
-    fn pickSlot(self: *Scheduler, prompt: []const llama.Token) ?usize {
-        var best: ?usize = null;
-        var best_match: usize = 0;
+    /// First idle slot, or null when all are busy. (Prefix reuse is cross-slot
+    /// via the shared cache pool, so slot choice doesn't affect reuse.)
+    fn pickSlot(self: *Scheduler) ?usize {
         for (self.slots, 0..) |*slot, i| {
-            if (slot.state != .idle) continue;
-            if (!self.prefix_cache) return i;
-            const m = lcp(prompt, slot.cached.items);
-            if (best == null or m > best_match) {
-                best = i;
-                best_match = m;
-            }
+            if (slot.state == .idle) return i;
         }
-        return best;
+        return null;
     }
 
-    /// Assign a request to a slot. With prefix_cache on, reuse the longest cached
-    /// prefix (seq_rm the divergent tail, capped at prompt.len-1 so one token is
-    /// decoded for logits). Off, clear the slot's KV for a clean decode (correct
-    /// on every architecture).
+    /// Assign a request to a slot. With the prefix cache, reuse the longest
+    /// cached prefix (full-copied into the slot); otherwise clear the slot's KV.
+    /// Either way the slot then prefills tokens [start, prompt.len).
     fn admit(self: *Scheduler, slot: *Slot, req: *Request) void {
         self.n_requests += 1;
         var start: usize = 0;
-        if (self.prefix_cache) {
-            // Reuse the longest prefix this slot already holds. slot.cached is
-            // exactly the slot's committed KV (prompt + fed tokens — see pass 1),
-            // and finishSlot keeps that KV alive, so [0, start) is valid to reuse.
-            // Trim the divergent tail with seq_rm (false return -> backend can't
-            // partially remove -> full clear). Cap at len-1 so one token decodes
-            // for logits.
-            const m = lcp(req.prompt_tokens, slot.cached.items);
-            start = if (m >= req.prompt_tokens.len) req.prompt_tokens.len - 1 else m;
-            if (start < slot.cached.items.len) {
-                if (start == 0 or !self.ctx.kvCacheSeqRm(slot.seq_id, @intCast(start), -1)) {
-                    _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
-                    start = 0;
-                }
-            }
-        } else {
+        if (self.prefix_pool) |*pool| {
+            start = pool.acquire(slot.seq_id, req.prompt_tokens);
+        }
+        if (start == 0) {
+            // No reuse: clear the slot's sequence for a clean decode.
             _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
         }
         self.reused_tokens += start;
@@ -286,7 +269,6 @@ pub const Scheduler = struct {
             if (slot.state != .decode) continue;
             if (budget == 0) break;
             try self.batch.add(slot.last_token, @intCast(slot.n_past), &[_]i32{slot.seq_id}, true);
-            if (self.prefix_cache) slot.cached.append(self.allocator, slot.last_token) catch {};
             self.sample_idx[i] = self.batch.handle.n_tokens - 1;
             budget -= 1;
         }
@@ -324,15 +306,11 @@ pub const Scheduler = struct {
                 // The token fed this step is now committed to KV.
                 slot.n_past += 1;
             } else {
-                // Prefill just finished; n_past == prompt length. Snapshot the
-                // prompt as the slot's committed-KV prefix; generated tokens are
-                // appended in pass 1 as they are fed.
+                // Prefill just finished; the slot's KV is exactly the prompt
+                // ([0, prompt.len), no generated token committed yet). Cache it
+                // for cross-slot reuse before generation appends to the slot.
                 slot.state = .decode;
-                if (self.prefix_cache) {
-                    slot.cached.clearRetainingCapacity();
-                    slot.cached.appendSlice(self.allocator, req.prompt_tokens) catch
-                        slot.cached.clearRetainingCapacity();
-                }
+                if (self.prefix_pool) |*pool| pool.store(slot.seq_id, req.prompt_tokens);
             }
 
             if (llama.c.llama_vocab_is_eog(self.vocab, tok)) {
@@ -360,11 +338,10 @@ pub const Scheduler = struct {
 
     fn finishSlot(self: *Scheduler, slot: *Slot, reason: inference.GenerationResult.FinishReason) void {
         slot.req.?.complete(reason, slot.n_decoded);
-        // Keep this slot's KV when prefix_cache is on so the next request can
-        // reuse its prefix — admit() owns trimming/clearing it. Without reuse,
-        // free it now. (Wiping it here while `cached` still claimed those tokens
-        // were live was the reuse-corruption bug.)
-        if (!self.prefix_cache) _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+        // Free the slot's KV. The reusable prefix lives in the cache pool (a
+        // separate set of sequences populated at the prefill->decode transition),
+        // so nothing is lost by clearing the slot here.
+        _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
         slot.req = null;
         slot.state = .idle;
     }
@@ -389,19 +366,3 @@ pub const Scheduler = struct {
         }
     }
 };
-
-/// Length of the longest common prefix of two token slices.
-fn lcp(a: []const llama.Token, b: []const llama.Token) usize {
-    const n = @min(a.len, b.len);
-    var i: usize = 0;
-    while (i < n and a[i] == b[i]) : (i += 1) {}
-    return i;
-}
-
-test "lcp" {
-    const T = llama.Token;
-    try std.testing.expectEqual(@as(usize, 3), lcp(&[_]T{ 1, 2, 3, 4 }, &[_]T{ 1, 2, 3, 9 }));
-    try std.testing.expectEqual(@as(usize, 0), lcp(&[_]T{ 5, 2 }, &[_]T{ 1, 2 }));
-    try std.testing.expectEqual(@as(usize, 2), lcp(&[_]T{ 1, 2 }, &[_]T{ 1, 2, 3 }));
-    try std.testing.expectEqual(@as(usize, 0), lcp(&[_]T{}, &[_]T{1}));
-}

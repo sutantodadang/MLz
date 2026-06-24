@@ -45,12 +45,12 @@ pub const EngineConfig = struct {
     /// 1 keeps the single-stream path (prefix cache + speculative decoding).
     max_concurrent: u32 = 1,
 
-    /// Enable prefix reuse in the batched scheduler: each slot keeps its KV and
-    /// a new request reuses the longest common prefix (prefix-affinity routing +
-    /// seq_rm tail trim), prefilling only the suffix. Default on (validated
-    /// correct + 6-13x lower prefill latency on transformer/hybrid/Qwen3 models);
-    /// disable with --no-prefix-cache. Falls back to a full clear when a backend
-    /// can't partially remove KV.
+    /// Enable the cross-slot prefix cache in the batched scheduler: a pool of
+    /// cache sequences holds prompt prefixes; a request on any slot reuses the
+    /// longest cached prefix (full-copied in) and prefills only the suffix.
+    /// Default on (validated correct + ~8-11x lower prefill latency on shared
+    /// prefixes / multi-turn on transformer and hybrid models); disable with
+    /// --no-prefix-cache.
     prefix_cache: bool = true,
 };
 
@@ -117,7 +117,10 @@ pub const Engine = struct {
         } else cfg.n_ctx;
         cparams.n_batch = 1024;
         cparams.n_ubatch = 512;
-        cparams.n_seq_max = @intCast(@max(@as(u32, 1), cfg.max_concurrent));
+        // Cross-slot prefix cache reserves `n_cache` extra sequences past the
+        // serving slots to hold cached prefixes.
+        const n_cache: u32 = if (cfg.max_concurrent > 1 and cfg.prefix_cache) cfg.max_concurrent else 0;
+        cparams.n_seq_max = @intCast(@max(@as(u32, 1), cfg.max_concurrent) + n_cache);
         cparams.offload_kqv = true;
 
         const cpu_count: i32 = @intCast(std.Thread.getCpuCount() catch 4);
@@ -177,7 +180,7 @@ pub const Engine = struct {
         // Continuous-batching scheduler (opt-in via max_concurrent > 1).
         var scheduler: ?*sched.Scheduler = null;
         if (cfg.max_concurrent > 1) {
-            scheduler = try sched.Scheduler.init(allocator, ctx, vocab, cfg.max_concurrent, 1024, cfg.prefix_cache);
+            scheduler = try sched.Scheduler.init(allocator, ctx, vocab, cfg.max_concurrent, 1024, cfg.prefix_cache, n_cache);
         }
         errdefer if (scheduler) |s| s.deinit();
 
