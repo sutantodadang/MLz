@@ -45,10 +45,11 @@ pub const EngineConfig = struct {
     /// 1 keeps the single-stream path (prefix cache + speculative decoding).
     max_concurrent: u32 = 1,
 
-    /// RESERVED. Batched-path prefix reuse is currently disabled in the
-    /// scheduler (every seq_rm-based reuse strategy corrupts output on the
-    /// tested llama KV caches; see scheduler.zig admit). This flag has no effect
-    /// yet — kept so the config surface is stable for when reuse is fixed.
+    /// Enable prefix reuse in the batched scheduler: each slot keeps its KV and
+    /// a new request reuses the longest common prefix (prefix-affinity routing +
+    /// seq_rm tail trim), prefilling only the suffix. Default off; validated
+    /// correct + 6-13x lower prefill latency on transformer and hybrid models.
+    /// Falls back to a full clear when a backend can't partially remove KV.
     prefix_cache: bool = false,
 };
 

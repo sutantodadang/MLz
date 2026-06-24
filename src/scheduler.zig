@@ -246,19 +246,25 @@ pub const Scheduler = struct {
     /// on every architecture).
     fn admit(self: *Scheduler, slot: *Slot, req: *Request) void {
         self.n_requests += 1;
-        // Clear the slot's sequence so each request decodes from a clean KV.
-        //
-        // Batched-path prefix REUSE is intentionally disabled. Every seq_rm-based
-        // reuse strategy tried (keep prefix + trim divergent tail + re-prefill
-        // suffix) corrupts output on this llama build's KV caches — distinct
-        // prompts that share only a template prefix come back garbled, and even a
-        // multi-turn continuation returns the wrong answer. Curiously the
-        // single-stream path (engine.chat, seq 0) reuses correctly, so the cause
-        // is specific to the concurrent scheduler and not yet isolated. Until it
-        // is, the scheduler always re-prefills — correct on every architecture.
-        // The `prefix_cache` flag is retained for when reuse is fixed.
-        _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
-        const start: usize = 0;
+        var start: usize = 0;
+        if (self.prefix_cache) {
+            // Reuse the longest prefix this slot already holds. slot.cached is
+            // exactly the slot's committed KV (prompt + fed tokens — see pass 1),
+            // and finishSlot keeps that KV alive, so [0, start) is valid to reuse.
+            // Trim the divergent tail with seq_rm (false return -> backend can't
+            // partially remove -> full clear). Cap at len-1 so one token decodes
+            // for logits.
+            const m = lcp(req.prompt_tokens, slot.cached.items);
+            start = if (m >= req.prompt_tokens.len) req.prompt_tokens.len - 1 else m;
+            if (start < slot.cached.items.len) {
+                if (start == 0 or !self.ctx.kvCacheSeqRm(slot.seq_id, @intCast(start), -1)) {
+                    _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+                    start = 0;
+                }
+            }
+        } else {
+            _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+        }
         self.reused_tokens += start;
         self.prefilled_tokens += req.prompt_tokens.len - start;
 
@@ -280,6 +286,7 @@ pub const Scheduler = struct {
             if (slot.state != .decode) continue;
             if (budget == 0) break;
             try self.batch.add(slot.last_token, @intCast(slot.n_past), &[_]i32{slot.seq_id}, true);
+            if (self.prefix_cache) slot.cached.append(self.allocator, slot.last_token) catch {};
             self.sample_idx[i] = self.batch.handle.n_tokens - 1;
             budget -= 1;
         }
@@ -317,8 +324,15 @@ pub const Scheduler = struct {
                 // The token fed this step is now committed to KV.
                 slot.n_past += 1;
             } else {
-                // Prefill just finished; n_past == prompt length.
+                // Prefill just finished; n_past == prompt length. Snapshot the
+                // prompt as the slot's committed-KV prefix; generated tokens are
+                // appended in pass 1 as they are fed.
                 slot.state = .decode;
+                if (self.prefix_cache) {
+                    slot.cached.clearRetainingCapacity();
+                    slot.cached.appendSlice(self.allocator, req.prompt_tokens) catch
+                        slot.cached.clearRetainingCapacity();
+                }
             }
 
             if (llama.c.llama_vocab_is_eog(self.vocab, tok)) {
@@ -346,7 +360,11 @@ pub const Scheduler = struct {
 
     fn finishSlot(self: *Scheduler, slot: *Slot, reason: inference.GenerationResult.FinishReason) void {
         slot.req.?.complete(reason, slot.n_decoded);
-        _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+        // Keep this slot's KV when prefix_cache is on so the next request can
+        // reuse its prefix — admit() owns trimming/clearing it. Without reuse,
+        // free it now. (Wiping it here while `cached` still claimed those tokens
+        // were live was the reuse-corruption bug.)
+        if (!self.prefix_cache) _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
         slot.req = null;
         slot.state = .idle;
     }
