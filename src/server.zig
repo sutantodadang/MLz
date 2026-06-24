@@ -271,6 +271,11 @@ fn handleConnection(
         return;
     }
 
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/completions")) {
+        try handleCompletions(allocator, stream, engine, req.body);
+        return;
+    }
+
     try writeJsonError(allocator, stream, 404, "Not Found", "not_found", "route not found");
 }
 
@@ -371,6 +376,56 @@ fn handleChatCompletions(
     // Final finish_reason chunk.
     try sse.sendFinish(resp.finishReasonString());
     try sse.done();
+}
+
+/// Legacy `/v1/completions` (text completion). The prompt is wrapped as a single
+/// user message and run through the same engine path (so the chat template still
+/// applies); the response is reshaped to the completion schema. Non-streaming.
+fn handleCompletions(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    engine: *Engine,
+    body: []const u8,
+) !void {
+    var parsed = openai.parseCompletionRequest(allocator, body) catch |err| {
+        const fe = openai.describeParseError(@errorCast(err));
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", fe.param, fe.message);
+        return;
+    };
+    defer parsed.deinit();
+
+    const creq = parsed.value;
+    var msgs = [_]openai.ChatMessage{.{ .role = "user", .content = creq.prompt }};
+    const chat_req = openai.ChatCompletionRequest{
+        .model = creq.model,
+        .messages = msgs[0..],
+        .temperature = creq.temperature,
+        .top_p = creq.top_p,
+        .max_tokens = creq.max_tokens,
+        .seed = creq.seed,
+    };
+
+    var resp = engine.complete(allocator, chat_req, null, null) catch |err| {
+        try writeEngineError(allocator, stream, err);
+        return;
+    };
+    defer resp.deinit(allocator);
+
+    const text = if (resp.value.choices.len > 0) resp.value.choices[0].message.content else "";
+    const choices = [_]openai.CompletionChoice{.{ .text = text, .index = 0, .finish_reason = resp.finishReasonString() }};
+    const out = openai.CompletionResponse{
+        .id = resp.value.id,
+        .object = "text_completion",
+        .created = resp.value.created,
+        .model = resp.value.model,
+        .choices = choices[0..],
+        .usage = resp.value.usage,
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try openai.writeJson(buf.writer(allocator), out);
+    try writeResponse(stream, .{ .status = 200, .reason = "OK", .content_type = "application/json", .body = buf.items });
 }
 
 /// Map engine errors (from `engine.complete`) to (status, type, message)

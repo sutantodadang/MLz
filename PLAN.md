@@ -278,14 +278,25 @@ the actual compute and SIMD matters).
 
 ## Phase 4 — Ease-of-use / LM Studio parity `~2-3 wk`
 
-- [ ] **Model management**: `mlz models list|pull|rm`. `pull` from HuggingFace
-      (resolve GGUF, resumable download). Local registry under `~/.mlz/models`.
-- [ ] **Auto model load**: server resolves `model` field of request against
-      registry; lazy-load + LRU-unload to fit memory (multi-model serving).
-- [ ] **TUI dashboard** (optional, not GUI): live slots, tok/s, KV usage, queue
-      depth. Reuse `terminal.zig`.
-- [ ] More OpenAI endpoints: `/v1/completions`, `/v1/embeddings` (embedding
-      models), `/v1/models` already present.
+- [x] **Model management** (`src/models.zig`): `mlz models list|pull|rm|dir`.
+      Registry at `%LOCALAPPDATA%\mlz\models` (Win) / `$XDG_DATA_HOME|~/.local/
+      share/mlz/models` (else). `pull` accepts a full URL or HuggingFace
+      shorthand `owner/repo/file.gguf` (→ `…/resolve/main/…`), downloads via
+      `std.http.Client` to a `.part` file, **resumable** (HTTP Range; restarts if
+      the server ignores Range), atomic rename on completion. `list` shows sizes,
+      `dir` prints the path. Unit-tested (resolveSource, list/resolve/remove);
+      live pull+rm smoke-tested.
+- [x] **Bare-name model resolution**: if `<model_path>` / `model =` isn't an
+      existing file, it's resolved against the registry — so `mlz qwen2.5-0.5b`
+      and `model = "qwen2.5-0.5b"` work for pulled models (`main.zig`).
+- [x] **`/v1/completions`** (legacy text completion): prompt wrapped as a user
+      message through the same engine path, response reshaped to the completion
+      schema. `/v1/chat/completions`, `/v1/models`, `/health` already present.
+      Parse unit-tested.
+- [ ] **Deferred:** auto multi-model LRU load/unload (single loaded model for
+      now; registry resolution is the groundwork); TUI dashboard; `/v1/embeddings`
+      (needs embedding-model API wiring); SSE streaming for `/v1/completions`
+      (non-streaming for now).
 
 ---
 

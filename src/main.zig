@@ -6,6 +6,7 @@ const terminal = @import("terminal.zig");
 const server = @import("server.zig");
 const config = @import("config.zig");
 const inference = @import("inference.zig");
+const models = @import("models.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -14,6 +15,10 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+
+    // `mlz models ...` registry management — handled before config parse
+    // (needs no model path).
+    if (try models.runCli(allocator, args)) return;
 
     // Handle --init before full parse (does not require a model path).
     for (args[1..]) |arg| {
@@ -77,6 +82,15 @@ pub fn main() !void {
                     \\  --config <file>        Load settings from a TOML file (default: ./mlz.toml)
                     \\  --print-config         Print resolved configuration and exit
                     \\
+                    \\Model registry (<model_path> may be a bare name from the registry):
+                    \\  mlz models list                     list downloaded models
+                    \\  mlz models pull <url|owner/repo/file.gguf> [name]
+                    \\  mlz models rm <name>                delete a model
+                    \\  mlz models dir                      print the registry path
+                    \\
+                    \\Server endpoints: /v1/chat/completions, /v1/completions, /v1/models, /health
+                    \\
+
                 , .{args[0]});
                 return;
             },
@@ -91,7 +105,20 @@ pub fn main() !void {
         return;
     }
 
-    const model_path = cfg.model_path;
+    // Resolve the model path. If it is not an existing file, try the registry
+    // so `mlz <name>` / `model = "<name>"` works for pulled models.
+    var resolved_model: ?[]u8 = null;
+    defer if (resolved_model) |p| allocator.free(p);
+    const model_path = blk: {
+        if (std.fs.cwd().access(cfg.model_path, .{})) |_| break :blk cfg.model_path else |_| {}
+        const dir = models.registryDir(allocator) catch break :blk cfg.model_path;
+        defer allocator.free(dir);
+        if (models.resolvePath(allocator, dir, cfg.model_path) catch null) |p| {
+            resolved_model = p;
+            break :blk p;
+        }
+        break :blk cfg.model_path;
+    };
 
     // Apply custom-SIMD runtime flags before any ggml work begins.  These set
     // env vars read once (and cached) by ggml_simd_hook.cpp.

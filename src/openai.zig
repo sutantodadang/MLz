@@ -64,6 +64,33 @@ pub const ChatCompletionChunk = struct {
     choices: []const ChatCompletionChunkChoice,
 };
 
+/// Legacy `/v1/completions` (text completion). `prompt` accepted as a string
+/// only (array prompts not supported).
+pub const CompletionRequest = struct {
+    model: ?[]const u8 = null,
+    prompt: []const u8,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    max_tokens: ?u32 = null,
+    stream: ?bool = null,
+    seed: ?u32 = null,
+};
+
+pub const CompletionChoice = struct {
+    text: []const u8,
+    index: usize,
+    finish_reason: []const u8,
+};
+
+pub const CompletionResponse = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const CompletionChoice,
+    usage: Usage,
+};
+
 pub const ErrorResponse = struct {
     @"error": struct {
         message: []const u8,
@@ -144,6 +171,33 @@ pub fn parseChatCompletionRequest(
         if (!role_ok) return ParseError.InvalidRole;
     }
 
+    return parsed;
+}
+
+/// Parse a `/v1/completions` request body. `prompt` is required and must be a
+/// non-empty string; ranges validated like the chat endpoint.
+pub fn parseCompletionRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) !std.json.Parsed(CompletionRequest) {
+    var parsed = std.json.parseFromSlice(
+        CompletionRequest,
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return ParseError.InvalidJson;
+    errdefer parsed.deinit();
+
+    if (parsed.value.prompt.len == 0) return ParseError.EmptyContent;
+    if (parsed.value.temperature) |t| {
+        if (!std.math.isFinite(t) or t < 0.0 or t > 2.0) return ParseError.InvalidTemperature;
+    }
+    if (parsed.value.top_p) |p| {
+        if (!std.math.isFinite(p) or p <= 0.0 or p > 1.0) return ParseError.InvalidTopP;
+    }
+    if (parsed.value.max_tokens) |m| {
+        if (m == 0 or m > 1024 * 1024) return ParseError.InvalidMaxTokens;
+    }
     return parsed;
 }
 
@@ -243,6 +297,15 @@ test "parse: accepts well-formed request" {
     defer parsed.deinit();
     try t.expectEqual(@as(usize, 1), parsed.value.messages.len);
     try t.expectEqualStrings("user", parsed.value.messages[0].role);
+}
+
+test "parse completions: accepts prompt, rejects empty" {
+    const t = std.testing;
+    var parsed = try parseCompletionRequest(t.allocator, "{\"prompt\":\"hello\",\"max_tokens\":16}");
+    defer parsed.deinit();
+    try t.expectEqualStrings("hello", parsed.value.prompt);
+    try t.expectError(ParseError.EmptyContent, parseCompletionRequest(t.allocator, "{\"prompt\":\"\"}"));
+    try t.expectError(ParseError.InvalidJson, parseCompletionRequest(t.allocator, "{\"model\":\"x\"}"));
 }
 
 test "describeParseError: every variant has a non-empty message and param" {
