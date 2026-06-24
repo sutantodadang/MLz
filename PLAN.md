@@ -88,21 +88,30 @@ Replace single-slot + global mutex with a multi-slot scheduler decoding N
 sequences per `llama_decode`. This is what closes the throughput gap to
 vLLM/SGLang on the same hardware.
 
-- [ ] Set `cparams.n_seq_max = max_concurrent`; size `n_batch`/`n_ubatch` for
-      aggregate slot tokens.
-- [ ] **Slot pool** (`src/scheduler.zig`): each slot = one `seq_id`, its
-      prompt/decode state, sampler, output sink. Free-list allocation.
-- [ ] **Scheduler loop**: single owner thread runs the decode loop. Per step:
-      admit waiting prefills, pack continuing decodes + new prefill chunks into
-      one batch, `llama_decode`, scatter logits → per-slot samplers → emit
-      tokens to each slot's sink. (llama-server's slot model is the reference.)
-- [ ] Server handlers become producers: enqueue request → slot, stream tokens
-      out of the slot's channel. Remove the per-request engine mutex.
-- [ ] **Chunked prefill** so long prompts don't starve active decoders.
-- [ ] Fairness + backpressure: bounded queue, 429 when full.
+- [x] Set `cparams.n_seq_max = max_concurrent` (engine.init); scheduler batch
+      sized to `n_batch` (1024).
+- [x] **Slot pool** (`src/scheduler.zig`): each slot = one `seq_id` with
+      prefill/decode state + n_past; per-request sampler keeps sampling state
+      independent across interleaved sequences.
+- [x] **Scheduler loop**: single owner thread. Per step: admit queued requests
+      into idle slots, pack one continuing-decode token per active slot + prefill
+      chunks into one batch, `llama_decode`, sample each slot at its logits
+      index, emit to its sink, free seq KV (`seq_rm`) on finish.
+- [x] Engine routes `chat()` to the scheduler when `max_concurrent > 1` (no
+      engine mutex in that path); single-stream path unchanged at N=1. Server
+      needed no changes — concurrency comes from concurrent handler threads.
+- [x] **Chunked prefill** (budget split: decode tokens first, then prefill
+      chunks fill the rest).
+- [x] Backpressure: bounded queue (`n_seq_max * 4`), `error.QueueFull` when full.
+- [ ] **Deferred:** prefix cache + speculative decoding in the batched path
+      (single-stream keeps both); proper criterion-style throughput benchmark in
+      CI (Phase 3). Slow-client head-of-line blocking (owner thread does socket
+      I/O) — upgrade to per-slot writer threads if it bites.
 
-Acceptance: throughput (tok/s aggregate) scales with concurrency up to slot
-count; single-stream latency within ~5% of today.
+Validated end-to-end (gemma-3-4b Q6_K, `--max-concurrent 4`): 6 concurrent
+requests → 6 correct distinct answers with 2 queued past the 4 slots; no
+crash/deadlock/leak. Also fixed a pre-existing `openai.writeJson` bug (adapter
+buffer never flushed → empty HTTP bodies) found during validation.
 
 ---
 

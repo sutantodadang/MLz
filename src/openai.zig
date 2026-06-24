@@ -165,6 +165,10 @@ pub fn writeJson(writer: anytype, value: anytype) !void {
         var adapter = w.adaptToNewApi(&buf);
         var jw = std.json.Stringify{ .writer = &adapter.new_interface, .options = .{ .whitespace = .minified } };
         try jw.write(value);
+        // Flush buffered bytes from the adapter into the underlying writer.
+        // Without this, JSON smaller than the adapter buffer (8 KiB) never
+        // reaches the destination and the response body comes out empty.
+        try adapter.new_interface.flush();
         if (adapter.err) |err| return err;
         return;
     }

@@ -4,6 +4,7 @@ const chat_lib = @import("chat.zig");
 const signal = @import("signal.zig");
 const inference = @import("inference.zig");
 const openai = @import("openai.zig");
+const sched = @import("scheduler.zig");
 
 /// Configuration for the inference engine.
 pub const EngineConfig = struct {
@@ -39,6 +40,10 @@ pub const EngineConfig = struct {
 
     /// Path to a draft model for speculative decoding.
     draft_model_path: ?[]const u8 = null,
+
+    /// Max concurrent sequences. >1 enables the continuous-batching scheduler;
+    /// 1 keeps the single-stream path (prefix cache + speculative decoding).
+    max_concurrent: u32 = 1,
 };
 
 pub const ChatOptions = struct {
@@ -82,6 +87,9 @@ pub const Engine = struct {
     mutex: std.Thread.Mutex = .{},
     cached_tokens: std.ArrayList(llama.Token),
 
+    /// Continuous-batching scheduler, present only when max_concurrent > 1.
+    scheduler: ?*sched.Scheduler = null,
+
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8, cfg: EngineConfig) !Engine {
         const path_z = try llama.dupeZ(allocator, model_path);
         defer allocator.free(path_z);
@@ -101,7 +109,7 @@ pub const Engine = struct {
         } else cfg.n_ctx;
         cparams.n_batch = 1024;
         cparams.n_ubatch = 512;
-        cparams.n_seq_max = 1;
+        cparams.n_seq_max = @intCast(@max(@as(u32, 1), cfg.max_concurrent));
         cparams.offload_kqv = true;
 
         const cpu_count: i32 = @intCast(std.Thread.getCpuCount() catch 4);
@@ -158,6 +166,13 @@ pub const Engine = struct {
         errdefer if (draft_batch) |b| b.deinit();
         errdefer if (draft_sampler) |s| s.deinit();
 
+        // Continuous-batching scheduler (opt-in via max_concurrent > 1).
+        var scheduler: ?*sched.Scheduler = null;
+        if (cfg.max_concurrent > 1) {
+            scheduler = try sched.Scheduler.init(allocator, ctx, vocab, cfg.max_concurrent, 1024);
+        }
+        errdefer if (scheduler) |s| s.deinit();
+
         return .{
             .model_path = model_path,
             .model = model,
@@ -176,10 +191,13 @@ pub const Engine = struct {
             .id_counter = std.atomic.Value(u64).init(1),
             .cached_tokens = .{},
             .mutex = .{},
+            .scheduler = scheduler,
         };
     }
 
     pub fn deinit(self: *Engine, allocator: std.mem.Allocator) void {
+        // Stop the scheduler thread first — it owns the llama context while running.
+        if (self.scheduler) |s| s.deinit();
         self.cached_tokens.deinit(allocator);
         self.batch.deinit();
         if (self.draft_sampler) |s| s.deinit();
@@ -265,6 +283,59 @@ pub const Engine = struct {
             return error.ContextTooSmall;
         }
 
+        // Sampler config with request overrides. Built before the engine mutex
+        // because both paths need it and sampler creation is independent state.
+        const s_cfg = llama.SamplerConfig{
+            .temp = opts.temp orelse self.cfg.temp,
+            .top_k = opts.top_k orelse self.cfg.top_k,
+            .top_p = opts.top_p orelse self.cfg.top_p,
+            .min_p = opts.min_p orelse self.cfg.min_p,
+            .seed = opts.seed orelse self.cfg.seed,
+        };
+
+        var sampler: llama.Sampler = undefined;
+        if (self.grammar_z) |g| {
+            const default_root: [:0]const u8 = "root";
+            const root = self.grammar_root_z orelse default_root;
+            sampler = try llama.Sampler.initWithConfigAndGrammar(s_cfg, self.vocab, g, root);
+        } else {
+            sampler = try llama.Sampler.initWithConfig(s_cfg);
+        }
+        sampler.reset();
+
+        const max_tokens: usize = opts.max_tokens orelse 4096;
+
+        // Continuous-batching path: hand off to the scheduler thread. No engine
+        // mutex (each request is an independent KV sequence); no prefix cache or
+        // speculative decoding in this path yet.
+        if (self.scheduler) |sch| {
+            defer sampler.deinit();
+            var req = sched.Request{
+                .prompt_tokens = prompt.tokens,
+                .sampler = sampler,
+                .max_tokens = max_tokens,
+                .sink = opts.sink,
+                .allocator = allocator,
+            };
+            try sch.submit(&req);
+            req.wait();
+            defer req.text.deinit(allocator);
+
+            const text = try allocator.dupe(u8, req.text.items);
+            const tokens = try allocator.alloc(llama.Token, 0);
+            return .{
+                .text = text,
+                .tokens = tokens,
+                .prompt_tokens = prompt.tokens.len,
+                .completion_tokens = req.completion_tokens,
+                .ttft_ns = null,
+                .total_ns = 0,
+                .finish_reason = req.finish,
+            };
+        }
+
+        // Single-stream path.
+        defer sampler.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -287,28 +358,6 @@ pub const Engine = struct {
                 self.cached_tokens.shrinkRetainingCapacity(n_past);
             }
         }
-
-        // Sampler config with request overrides.
-        const s_cfg = llama.SamplerConfig{
-            .temp = opts.temp orelse self.cfg.temp,
-            .top_k = opts.top_k orelse self.cfg.top_k,
-            .top_p = opts.top_p orelse self.cfg.top_p,
-            .min_p = opts.min_p orelse self.cfg.min_p,
-            .seed = opts.seed orelse self.cfg.seed,
-        };
-
-        var sampler: llama.Sampler = undefined;
-        if (self.grammar_z) |g| {
-            const default_root: [:0]const u8 = "root";
-            const root = self.grammar_root_z orelse default_root;
-            sampler = try llama.Sampler.initWithConfigAndGrammar(s_cfg, self.vocab, g, root);
-        } else {
-            sampler = try llama.Sampler.initWithConfig(s_cfg);
-        }
-        defer sampler.deinit();
-        sampler.reset();
-
-        const max_tokens: usize = opts.max_tokens orelse 4096;
 
         const gen = try inference.generate(allocator, self.ctx, self.vocab, &self.batch, sampler, prompt.tokens, .{
             .max_tokens = max_tokens,

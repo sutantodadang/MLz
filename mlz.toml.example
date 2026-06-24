@@ -11,6 +11,7 @@ threads = "auto"        # "auto" = physical core count; or an integer
 enabled = false
 host = "127.0.0.1"
 port = 8080
+max_concurrent = 1      # >1 enables continuous batching (concurrent requests share decode steps)
 # api_key = "secret"
 
 [sampling]
