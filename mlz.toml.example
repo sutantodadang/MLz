@@ -1,0 +1,31 @@
+# MLz configuration. Copy to mlz.toml (auto-loaded from cwd) or pass --config <path>.
+# Precedence: built-in defaults < this file < MLZ_* env vars < CLI flags.
+
+[model]
+path = "models/model.gguf"
+n_ctx = 4096
+n_gpu_layers = "auto"   # "auto" = use default offload (999); or an integer
+threads = "auto"        # "auto" = physical core count; or an integer
+
+[serve]
+enabled = false
+host = "127.0.0.1"
+port = 8080
+# api_key = "secret"
+
+[sampling]
+temp = 0.8
+top_k = 40
+top_p = 0.95
+min_p = 0.05
+seed = 42
+
+[chat]
+stream = true
+# system = "You are a helpful assistant."
+# template = "gemma"
+# grammar = "grammar.gbnf"
+grammar_root = "root"
+
+[speculative]
+# draft_model = "models/draft.gguf"

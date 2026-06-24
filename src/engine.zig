@@ -95,7 +95,10 @@ pub const Engine = struct {
         errdefer model.deinit();
 
         var cparams = llama.c.llama_context_default_params();
-        cparams.n_ctx = cfg.n_ctx;
+        cparams.n_ctx = if (cfg.n_ctx == 0) blk: {
+            const train = model.nCtxTrain();
+            break :blk if (train > 0) @as(u32, @intCast(train)) else 4096;
+        } else cfg.n_ctx;
         cparams.n_batch = 1024;
         cparams.n_ubatch = 512;
         cparams.n_seq_max = 1;

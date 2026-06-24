@@ -1,0 +1,180 @@
+# MLz Roadmap — vLLM/SGLang throughput, LM Studio ease, config-first tuning
+
+## Positioning
+
+MLz = thin, fast Zig serving layer over llama.cpp (GGML compute + GPU backends)
+with custom CPU SIMD kernels. **Do not reinvent GGML.** Differentiate on three
+axes only:
+
+1. **Performance** — continuous batching + prefix-sharing serving loop (the
+   thing llama.cpp gives you primitives for but MLz does not yet use).
+2. **Ease of use** — config-file-first, sane auto-tuned defaults, model
+   management.
+3. **Tunability** — one declarative config (`mlz.toml`) controlling every knob,
+   layered with env + CLI override.
+
+Honest scope note: vLLM/SGLang win throughput via PagedAttention/RadixAttention
+on their *own* CUDA kernels. MLz rides llama.cpp's KV cache + batch API, which
+already supports multi-sequence decode and slot scheduling (llama-server proves
+it). The win is wiring that up — not writing CUDA.
+
+---
+
+## Current state (baseline)
+
+| Area | Status |
+|---|---|
+| Compute | llama.cpp + custom SIMD (AVX2/512, NEON) for vec_dot/silu/rope/layernorm/quantize/FA |
+| Batching | **None** — `n_seq_max=1`, `engine.mutex` serializes server requests |
+| Prefix cache | Single sequential `cached_tokens` longest-common-prefix reuse |
+| Spec decode | Implemented (draft model), single-sequence |
+| Server | OpenAI `/v1/chat/completions` (SSE + WebSocket), `/v1/models` |
+| Config | CLI flags only (`src/config.zig`) |
+| Observability | Per-turn stdout stats; no `/metrics`, no structured logs |
+
+---
+
+## Phase 0 — Config-first foundation (ease + tunability) `~1 wk`
+
+The "easy to tune by config" ask. Ship before perf work so every later knob has
+a home.
+
+- [x] `mlz.toml` loader. Layer precedence: **defaults < file < env (`MLZ_*`) <
+      CLI flags**. Hand-rolled flat TOML subset parser (no dep). File/env strings
+      owned by a `Config` arena; CLI strings borrow argv. `--config <path>` +
+      auto-discover `./mlz.toml`.
+- [x] `mlz --print-config` dumps the fully-resolved effective config.
+- [x] `mlz --init` writes a commented starter `mlz.toml` (refuses to overwrite).
+      Source: `mlz.toml.example` / `config.starter_toml`.
+- [x] Auto-tune: `threads = "auto"` → CPU count (engine default when null);
+      `n_ctx = "auto"` → model's `n_ctx_train` (resolved in `engine.init` via
+      sentinel 0). `n_gpu_layers = "auto"` → 999 = offload all layers (llama
+      clamps to model layer count).
+- [ ] **Deferred:** VRAM-aware *partial* GPU offload (probe free VRAM, fit a
+      subset of layers). Needs a cross-platform backend VRAM query llama.cpp
+      doesn't expose cleanly. "auto" = offload-all is the correct default until
+      then; revisit when serving models larger than VRAM.
+
+Config surface (additive to today's flags):
+```toml
+[model]
+path = "models/qwen2.5-7b-q4.gguf"
+n_ctx = 8192
+n_gpu_layers = "auto"   # auto = probe VRAM
+threads = "auto"
+
+[serve]
+host = "127.0.0.1"
+port = 8080
+max_concurrent = 8      # NEW: slot count (phase 1)
+prefix_cache = true     # NEW: phase 2
+
+[sampling]
+temp = 0.8
+top_k = 40
+top_p = 0.95
+min_p = 0.05
+
+[speculative]
+draft_model = ""        # optional
+draft_tokens = 5
+```
+
+---
+
+## Phase 1 — Continuous batching (THE perf win) `~3-4 wk`
+
+Replace single-slot + global mutex with a multi-slot scheduler decoding N
+sequences per `llama_decode`. This is what closes the throughput gap to
+vLLM/SGLang on the same hardware.
+
+- [ ] Set `cparams.n_seq_max = max_concurrent`; size `n_batch`/`n_ubatch` for
+      aggregate slot tokens.
+- [ ] **Slot pool** (`src/scheduler.zig`): each slot = one `seq_id`, its
+      prompt/decode state, sampler, output sink. Free-list allocation.
+- [ ] **Scheduler loop**: single owner thread runs the decode loop. Per step:
+      admit waiting prefills, pack continuing decodes + new prefill chunks into
+      one batch, `llama_decode`, scatter logits → per-slot samplers → emit
+      tokens to each slot's sink. (llama-server's slot model is the reference.)
+- [ ] Server handlers become producers: enqueue request → slot, stream tokens
+      out of the slot's channel. Remove the per-request engine mutex.
+- [ ] **Chunked prefill** so long prompts don't starve active decoders.
+- [ ] Fairness + backpressure: bounded queue, 429 when full.
+
+Acceptance: throughput (tok/s aggregate) scales with concurrency up to slot
+count; single-stream latency within ~5% of today.
+
+---
+
+## Phase 2 — Prefix sharing / RadixAttention-lite `~2 wk`
+
+SGLang's edge: share KV across requests with a common prefix (system prompts,
+few-shot, multi-turn). llama.cpp gives `llama_kv_cache_seq_cp` / `seq_rm`.
+
+- [ ] **Radix tree** of token-prefix → cached KV span (`src/prefix_cache.zig`).
+      On admit: match longest cached prefix, `seq_cp` its KV into the new slot,
+      prefill only the suffix.
+- [ ] LRU eviction by KV-block budget; ref-count spans in use by live slots.
+- [ ] Metric: prefix-cache hit rate, tokens saved.
+
+Acceptance: repeated system-prompt workloads show measured prefill reduction;
+hit-rate visible in `/metrics`.
+
+---
+
+## Phase 3 — CPU SIMD kernel expansion (perf, existing strength) `ongoing`
+
+Keep the custom-kernel differentiator for the CPU-only path (where llama.cpp is
+the actual compute and SIMD matters).
+
+- [ ] Bench harness in CI: `bench_simd` gates regressions per kernel/arch.
+- [ ] Fill gaps: batched `vec_dot` for q4_K/q6_K, fused RoPE+attention, INT8 GEMM
+      microkernels for the prefill GEMM hot path.
+- [ ] Runtime dispatch already keyed on CPU features — extend to AVX512-VNNI /
+      AMX where present.
+- [ ] Correctness: golden-vector tests vs GGML reference per kernel (extend
+      `test_simd.zig`).
+
+---
+
+## Phase 4 — Ease-of-use / LM Studio parity `~2-3 wk`
+
+- [ ] **Model management**: `mlz models list|pull|rm`. `pull` from HuggingFace
+      (resolve GGUF, resumable download). Local registry under `~/.mlz/models`.
+- [ ] **Auto model load**: server resolves `model` field of request against
+      registry; lazy-load + LRU-unload to fit memory (multi-model serving).
+- [ ] **TUI dashboard** (optional, not GUI): live slots, tok/s, KV usage, queue
+      depth. Reuse `terminal.zig`.
+- [ ] More OpenAI endpoints: `/v1/completions`, `/v1/embeddings` (embedding
+      models), `/v1/models` already present.
+
+---
+
+## Phase 5 — Observability & ops `~1 wk`
+
+- [ ] `/metrics` Prometheus: tok/s, TTFT, queue depth, slot utilization, KV
+      usage, prefix hit rate, accept rate (spec decode).
+- [ ] Structured JSON logs (level via config).
+- [ ] `/health` + `/health/ready` (model loaded & slots warm).
+
+---
+
+## Sequencing rationale
+
+```
+Phase 0 (config) ─┬─> Phase 1 (batching) ──> Phase 2 (prefix share)
+                  └─> Phase 3 (SIMD, parallel track)
+Phase 1 done ─────────> Phase 4 (UX) + Phase 5 (metrics)
+```
+
+Phase 1 is the single highest-leverage item — without continuous batching MLz
+cannot approach vLLM/SGLang throughput regardless of kernel speed. Phase 0 is
+cheap and unblocks tuning every later phase. Phases 3/4/5 are parallelizable.
+
+## Explicit non-goals (YAGNI)
+
+- No custom CUDA/Metal kernels — llama.cpp backends already cover GPU.
+- No PagedAttention block allocator — llama.cpp KV cache + `seq_cp` is enough at
+  this scale; revisit only if KV fragmentation measurably caps concurrency.
+- No web GUI — TUI + OpenAI API is the surface. LM Studio's GUI is not the moat.
+- No training / fine-tuning — inference only.

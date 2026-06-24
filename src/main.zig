@@ -15,6 +15,22 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    // Handle --init before full parse (does not require a model path).
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--init")) {
+            const cwd = std.fs.cwd();
+            if (cwd.access("mlz.toml", .{})) |_| {
+                std.debug.print("mlz.toml already exists; refusing to overwrite.\n", .{});
+                return;
+            } else |_| {}
+            const f = try cwd.createFile("mlz.toml", .{});
+            defer f.close();
+            try f.writeAll(config.starter_toml);
+            std.debug.print("Wrote mlz.toml. Edit it, then run: mlz --config mlz.toml\n", .{});
+            return;
+        }
+    }
+
     // Parse configuration
     const cfg = config.Config.parse(allocator, args) catch |err| {
         switch (err) {
@@ -57,12 +73,23 @@ pub fn main() !void {
                     \\  MLZ_SIMD_TRACE=1       same as --simd-trace
                     \\  MLZ_SIMD_FLASH_ATTN=1  same as --simd-flash-attn
                     \\
+                    \\Config file:
+                    \\  --config <file>        Load settings from a TOML file (default: ./mlz.toml)
+                    \\  --print-config         Print resolved configuration and exit
+                    \\
                 , .{args[0]});
                 return;
             },
             else => return err,
         }
     };
+    defer cfg.deinit(allocator);
+
+    if (cfg.print_config) {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        try cfg.dump(stdout);
+        return;
+    }
 
     const model_path = cfg.model_path;
 

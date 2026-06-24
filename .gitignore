@@ -1,5 +1,9 @@
 .zig-cache/
 zig-out/
 *.o
+*.exe
+*.pdb
 models
 .sisyphus/
+deps/
+mlz.toml
