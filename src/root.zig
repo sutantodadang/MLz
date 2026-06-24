@@ -11,6 +11,7 @@ pub const server = @import("server.zig");
 pub const openai = @import("openai.zig");
 pub const chat = @import("chat.zig");
 pub const models = @import("models.zig");
+pub const model_manager = @import("model_manager.zig");
 
 test {
     // Run tests in all imported modules

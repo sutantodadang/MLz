@@ -75,6 +75,11 @@ pub const Model = struct {
     pub fn nCtxTrain(self: Model) i32 {
         return c.llama_model_n_ctx_train(self.handle);
     }
+
+    /// Embedding dimension (n_embd) of the model.
+    pub fn nEmbd(self: Model) i32 {
+        return c.llama_model_n_embd(self.handle);
+    }
 };
 
 pub const Context = struct {
@@ -112,7 +117,27 @@ pub const Context = struct {
     pub fn nCtx(self: Context) u32 {
         return c.llama_n_ctx(self.handle);
     }
+
+    /// Pooled embedding vector for a sequence (requires the context to be created
+    /// with `embeddings = true` and a pooling type). Length = model n_embd.
+    pub fn embeddingsSeq(self: Context, seq_id: i32) ?[*]const f32 {
+        return c.llama_get_embeddings_seq(self.handle, seq_id);
+    }
 };
+
+/// Default context params with embeddings enabled (mean pooling). For the
+/// `/v1/embeddings` path: a second context over an already-loaded model.
+pub fn embeddingContextParams(n_ctx: u32, n_threads: i32) c.llama_context_params {
+    var p = c.llama_context_default_params();
+    p.n_ctx = n_ctx;
+    p.n_batch = n_ctx;
+    p.n_ubatch = n_ctx;
+    p.embeddings = true;
+    p.pooling_type = c.LLAMA_POOLING_TYPE_MEAN;
+    p.n_threads = n_threads;
+    p.n_threads_batch = n_threads;
+    return p;
+}
 
 /// Configuration for sampler chain. All fields have sane defaults.
 pub const SamplerConfig = struct {

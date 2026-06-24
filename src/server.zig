@@ -405,6 +405,22 @@ fn handleCompletions(
         .seed = creq.seed,
     };
 
+    if (creq.stream orelse false) {
+        try writeSseHeaders(stream);
+        const id = try engine.nextIdAlloc(allocator);
+        defer allocator.free(id);
+        var sink = CompletionSseSink.init(stream, allocator, id, engine.modelId());
+        var resp = engine.complete(allocator, chat_req, sink.tokenSink(), null) catch |err| {
+            try sink.sendError(engineErrorMessage(err), engineErrorType(err));
+            try sink.done();
+            return;
+        };
+        defer resp.deinit(allocator);
+        try sink.sendFinish(resp.finishReasonString());
+        try sink.done();
+        return;
+    }
+
     var resp = engine.complete(allocator, chat_req, null, null) catch |err| {
         try writeEngineError(allocator, stream, err);
         return;
@@ -587,6 +603,67 @@ const SseSink = struct {
             }},
         };
         try self.sendChunk(chunk);
+    }
+};
+
+/// SSE sink for `/v1/completions` streaming. Emits `text_completion` chunks
+/// (choices[].text) rather than chat deltas.
+const CompletionSseSink = struct {
+    stream: std.net.Stream,
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    created: i64,
+    model: []const u8,
+
+    pub fn init(stream: std.net.Stream, allocator: std.mem.Allocator, id: []const u8, model: []const u8) CompletionSseSink {
+        return .{ .stream = stream, .allocator = allocator, .id = id, .created = std.time.timestamp(), .model = model };
+    }
+
+    pub fn tokenSink(self: *CompletionSseSink) inference.TokenSink {
+        return .{ .ctx = self, .writeFn = writeToken, .flushFn = flushNoop };
+    }
+
+    fn chunk(self: *CompletionSseSink, text: []const u8, finish: ?[]const u8) !void {
+        const c = openai.CompletionChunk{
+            .id = self.id,
+            .object = "text_completion",
+            .created = self.created,
+            .model = self.model,
+            .choices = &[_]openai.CompletionChunkChoice{.{ .text = text, .index = 0, .finish_reason = finish }},
+        };
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "data: ");
+        try openai.writeJson(buf.writer(self.allocator), c);
+        try buf.appendSlice(self.allocator, "\n\n");
+        try self.stream.writeAll(buf.items);
+    }
+
+    pub fn sendFinish(self: *CompletionSseSink, finish_reason: []const u8) !void {
+        try self.chunk("", finish_reason);
+    }
+
+    pub fn done(self: *CompletionSseSink) !void {
+        try self.stream.writeAll("data: [DONE]\n\n");
+    }
+
+    pub fn sendError(self: *CompletionSseSink, message: []const u8, err_type: []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const payload = openai.ErrorResponse{ .@"error" = .{ .message = message, .type = err_type } };
+        try buf.appendSlice(self.allocator, "data: ");
+        try openai.writeJson(buf.writer(self.allocator), payload);
+        try buf.appendSlice(self.allocator, "\n\n");
+        try self.stream.writeAll(buf.items);
+    }
+
+    fn writeToken(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *CompletionSseSink = @ptrCast(@alignCast(ctx));
+        try self.chunk(bytes, null);
+    }
+
+    fn flushNoop(ctx: *anyopaque) anyerror!void {
+        _ = ctx;
     }
 };
 

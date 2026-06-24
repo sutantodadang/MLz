@@ -91,6 +91,20 @@ pub const CompletionResponse = struct {
     usage: Usage,
 };
 
+pub const CompletionChunkChoice = struct {
+    text: []const u8,
+    index: usize,
+    finish_reason: ?[]const u8 = null,
+};
+
+pub const CompletionChunk = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const CompletionChunkChoice,
+};
+
 pub const ErrorResponse = struct {
     @"error": struct {
         message: []const u8,
