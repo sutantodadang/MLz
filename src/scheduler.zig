@@ -246,21 +246,19 @@ pub const Scheduler = struct {
     /// on every architecture).
     fn admit(self: *Scheduler, slot: *Slot, req: *Request) void {
         self.n_requests += 1;
-        var start: usize = 0;
-        if (self.prefix_cache) {
-            const shared = lcp(req.prompt_tokens, slot.cached.items);
-            start = if (shared >= req.prompt_tokens.len) req.prompt_tokens.len - 1 else shared;
-            if (start < slot.cached.items.len) {
-                // seq_rm returns false when the backend can't partially remove —
-                // fall back to a full clear.
-                if (start == 0 or !self.ctx.kvCacheSeqRm(slot.seq_id, @intCast(start), -1)) {
-                    _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
-                    start = 0;
-                }
-            }
-        } else {
-            _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
-        }
+        // Clear the slot's sequence so each request decodes from a clean KV.
+        //
+        // Batched-path prefix REUSE is intentionally disabled. Every seq_rm-based
+        // reuse strategy tried (keep prefix + trim divergent tail + re-prefill
+        // suffix) corrupts output on this llama build's KV caches — distinct
+        // prompts that share only a template prefix come back garbled, and even a
+        // multi-turn continuation returns the wrong answer. Curiously the
+        // single-stream path (engine.chat, seq 0) reuses correctly, so the cause
+        // is specific to the concurrent scheduler and not yet isolated. Until it
+        // is, the scheduler always re-prefills — correct on every architecture.
+        // The `prefix_cache` flag is retained for when reuse is fixed.
+        _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+        const start: usize = 0;
         self.reused_tokens += start;
         self.prefilled_tokens += req.prompt_tokens.len - start;
 
@@ -269,15 +267,6 @@ pub const Scheduler = struct {
         slot.prefill_pos = start;
         slot.n_past = start;
         slot.n_decoded = 0;
-    }
-
-    /// Record the just-prefilled prompt as this slot's reusable prefix (only when
-    /// prefix_cache is on).
-    fn snapshotPrefix(self: *Scheduler, slot: *Slot, prompt: []const llama.Token) void {
-        if (!self.prefix_cache) return;
-        slot.cached.clearRetainingCapacity();
-        slot.cached.appendSlice(self.allocator, prompt) catch
-            slot.cached.clearRetainingCapacity();
     }
 
     fn step(self: *Scheduler) !void {
@@ -328,12 +317,8 @@ pub const Scheduler = struct {
                 // The token fed this step is now committed to KV.
                 slot.n_past += 1;
             } else {
-                // Prefill just finished; n_past == prompt length and the slot's
-                // KV[0, prompt.len) is exactly the prompt. Record it so the next
-                // request on this slot can reuse the shared prefix. (Generated
-                // tokens get appended after; the next admit's seq_rm trims them.)
+                // Prefill just finished; n_past == prompt length.
                 slot.state = .decode;
-                self.snapshotPrefix(slot, req.prompt_tokens);
             }
 
             if (llama.c.llama_vocab_is_eog(self.vocab, tok)) {

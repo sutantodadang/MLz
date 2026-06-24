@@ -45,8 +45,10 @@ pub const EngineConfig = struct {
     /// 1 keeps the single-stream path (prefix cache + speculative decoding).
     max_concurrent: u32 = 1,
 
-    /// Enable prefix reuse across requests. Default false: safe on all model
-    /// architectures. Only enable for standard transformer models.
+    /// RESERVED. Batched-path prefix reuse is currently disabled in the
+    /// scheduler (every seq_rm-based reuse strategy corrupts output on the
+    /// tested llama KV caches; see scheduler.zig admit). This flag has no effect
+    /// yet — kept so the config surface is stable for when reuse is fixed.
     prefix_cache: bool = false,
 };
 
