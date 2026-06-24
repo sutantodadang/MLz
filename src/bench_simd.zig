@@ -204,8 +204,8 @@ pub fn main() !void {
     run_rope("rope_neox_f32 (AVX2)", simd_rope_neox_f32_avx2, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
     run_rope("rope_neox_f32 (AVX-512)", simd_rope_neox_f32_avx512, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
 
-    // ------- new kernel benchmarks (WIP, gated off — see PLAN Phase 3) -------
-    const enable_new_kernels = false;
+    // ------- new kernel benchmarks -------
+    const enable_new_kernels = true;
     if (enable_new_kernels) {
         if (!json_mode) {
             std.debug.print("\n--- New Kernels ---\n", .{});

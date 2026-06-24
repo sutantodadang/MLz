@@ -169,12 +169,12 @@ simd_silu_f32_avx2:
     ; 2^n via scalar integer ops with clamp
     vcvtss2si r15d, xmm2            ; n as integer
     add     r15d, 127               ; biased exponent
-    xor     eax, eax
-    cmp     r15d, eax
-    cmovl   r15d, eax               ; clamp lo: max(0, n+127)
-    cmp     r15d, 254
-    mov     eax, 254
-    cmovg   r15d, eax               ; clamp hi: min(254, ...)
+    xor     r10d, r10d              ; (r10d scratch: eax aliases rax = src ptr)
+    cmp     r15d, r10d
+    cmovl   r15d, r10d              ; clamp lo: max(0, n+127)
+    mov     r10d, 254
+    cmp     r15d, r10d
+    cmovg   r15d, r10d              ; clamp hi: min(254, ...)
     shl     r15d, 23                ; construct float bit pattern
     vmovd   xmm5, r15d              ; xmm5 = 2^n
 

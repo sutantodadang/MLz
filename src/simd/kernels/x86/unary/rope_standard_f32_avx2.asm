@@ -114,9 +114,12 @@ simd_rope_standard_f32_avx2:
 
         ; --- Interleave results and store ---
         ; ymm6 = [de0,de1,de2,de3 | dup], ymm7 = [do0,do1,do2,do3 | dup]
-        ; vunpcklps: interleave low 2 floats of each 128-bit lane
-        vunpcklps ymm8, ymm6, ymm7
-        ; result = [de0,do0,de1,do1 | de2,do2,de3,do3]
+        ; (vpermpd duplicated the low lane into the high lane, so all 4 results
+        ; live in lane 0.) Interleave: low pair via unpcklps, high pair via
+        ; unpckhps, then assemble the two 128-bit halves.
+        vunpcklps   ymm8, ymm6, ymm7        ; lane0 = [de0,do0,de1,do1]
+        vunpckhps   ymm9, ymm6, ymm7        ; lane0 = [de2,do2,de3,do3]
+        vinsertf128 ymm8, ymm8, xmm9, 1     ; [de0,do0,de1,do1 | de2,do2,de3,do3]
         lea     rcx, [r9 + rax*8]
         vmovups [rcx], ymm8
 

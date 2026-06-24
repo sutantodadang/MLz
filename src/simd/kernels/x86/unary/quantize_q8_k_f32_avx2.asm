@@ -115,8 +115,9 @@ simd_quantize_q8_k_f32_avx2:
     je      .zero_block
 
     ; --- find which lane (0..7) holds the global amax ---
-    vbroadcastss ymm13, xmm8
-    vcmpps  ymm15, ymm15, ymm13, 0        ; EQ: which lanes match global amax?
+    ; (use ymm9, NOT ymm13 — ymm13 holds the int32 127 clamp used in pass 2)
+    vbroadcastss ymm9, xmm8
+    vcmpps  ymm15, ymm15, ymm9, 0         ; EQ: which lanes match global amax?
     vmovmskps eax, ymm15
     tzcnt   eax, eax                         ; first matching lane (0-7)
 

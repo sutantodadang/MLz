@@ -149,12 +149,12 @@ simd_silu_f32_avx512:
 
     vcvtss2si r15d, xmm2
     add     r15d, 127
-    xor     eax, eax
-    cmp     r15d, eax
-    cmovl   r15d, eax               ; clamp lo
-    cmp     r15d, 254
-    mov     eax, 254
-    cmovg   r15d, eax               ; clamp hi
+    xor     r10d, r10d              ; (r10d scratch: eax aliases rax = src ptr)
+    cmp     r15d, r10d
+    cmovl   r15d, r10d              ; clamp lo
+    mov     r10d, 254
+    cmp     r15d, r10d
+    cmovg   r15d, r10d              ; clamp hi
     shl     r15d, 23
     vmovd   xmm5, r15d
 

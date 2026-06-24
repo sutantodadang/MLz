@@ -147,10 +147,10 @@ simd_quantize_q8_0_f32_avx512:
     vucomiss xmm4, xmm7
     jz      .zero_id
 
-    ; Fast approximate reciprocal: vrcp14ps gives ~1/amax (14-bit)
-    vbroadcastss zmm5, xmm4         ; zmm5 = {amax, ...} × 16
-    vrcp14ps zmm5, zmm5             ; zmm5 ≈ 1/amax (all lanes)
-    vmulps   zmm5, zmm5, zmm15      ; zmm5 = 127/amax = id (all lanes)
+    ; id = 127/amax. Use EXACT scalar division (vrcp14ps is only 14-bit and
+    ; produces off-by-one quantization vs the reference), then broadcast.
+    vdivss   xmm5, xmm11, xmm4      ; xmm5 = 127.0 / amax (exact)
+    vbroadcastss zmm5, xmm5         ; zmm5 = {id, ...} × 16
     jmp      .apply_scale
 
 .zero_id:
