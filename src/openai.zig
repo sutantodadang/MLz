@@ -105,6 +105,22 @@ pub const CompletionChunk = struct {
     choices: []const CompletionChunkChoice,
 };
 
+pub const EmbeddingData = struct {
+    object: []const u8 = "embedding",
+    embedding: []const f32,
+    index: usize,
+};
+
+pub const EmbeddingResponse = struct {
+    object: []const u8 = "list",
+    data: []const EmbeddingData,
+    model: []const u8,
+    usage: struct {
+        prompt_tokens: usize,
+        total_tokens: usize,
+    },
+};
+
 pub const ErrorResponse = struct {
     @"error": struct {
         message: []const u8,

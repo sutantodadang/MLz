@@ -293,10 +293,21 @@ the actual compute and SIMD matters).
       message through the same engine path, response reshaped to the completion
       schema. `/v1/chat/completions`, `/v1/models`, `/health` already present.
       Parse unit-tested.
-- [ ] **Deferred:** auto multi-model LRU load/unload (single loaded model for
-      now; registry resolution is the groundwork); TUI dashboard; `/v1/embeddings`
-      (needs embedding-model API wiring); SSE streaming for `/v1/completions`
-      (non-streaming for now).
+- [x] **Auto multi-model LRU load/unload** (`model_manager.zig` +
+      `EngineManager`): the startup model is always resident; a request naming a
+      different model (registry name or file path) loads it on demand into a
+      refcount-pinned LRU pool (`server.max_loaded_models`, default 1 extra),
+      evicting the least-recently-used *unpinned* engine at capacity. Pinning
+      keeps an engine alive for the whole request even under concurrent eviction.
+      Generic LRU core has 4 unit tests; live-verified: alt model by path loaded
+      + generated, default still served afterward, unknown model → 404.
+- [x] **`/v1/embeddings`** (`embeddings.zig`): model loaded in embedding mode
+      (mean pooling), tokenize → decode → pooled vector, L2-normalised. Accepts a
+      string or array of strings; lazy `EmbeddingService` caches one embedder and
+      reloads on model change. Live-verified (returns normalised vectors).
+- [x] **SSE streaming for `/v1/completions`** (`CompletionSseSink`): `text_
+      completion` chunks + `[DONE]`. Live-verified (token chunks → finish → DONE).
+- [ ] **Deferred:** TUI dashboard.
 
 ---
 

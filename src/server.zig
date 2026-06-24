@@ -6,6 +6,9 @@ const signal = @import("signal.zig");
 const inference = @import("inference.zig");
 const openai = @import("openai.zig");
 const engine_mod = @import("engine.zig");
+const models = @import("models.zig");
+const model_manager = @import("model_manager.zig");
+const embeddings = @import("embeddings.zig");
 pub const Engine = engine_mod.Engine;
 pub const EngineConfig = engine_mod.EngineConfig;
 
@@ -38,6 +41,86 @@ pub const ServerConfig = struct {
     /// Defends against slowloris-style attacks where a client opens a TCP
     /// connection but never sends a full request. Set to 0 to disable.
     recv_timeout_ms: u32 = 30_000,
+
+    /// Max number of *extra* (non-default) models the server keeps resident for
+    /// auto multi-model serving. The startup model is always resident; requests
+    /// naming another registry model load it (LRU-evicting at this cap).
+    max_loaded_models: usize = 1,
+};
+
+/// Wraps the always-resident startup engine plus an LRU pool of extra engines
+/// loaded on demand by request `model` name. Engines are pinned while in use.
+pub const EngineManager = struct {
+    allocator: std.mem.Allocator,
+    engine_cfg: EngineConfig,
+    default_engine: *Engine,
+    default_id: []const u8,
+    lru: model_manager.LruManager(*Engine),
+
+    pub const Acquired = struct {
+        engine: *Engine,
+        handle: ?model_manager.LruManager(*Engine).Handle,
+        pub fn release(self: Acquired) void {
+            if (self.handle) |h| h.release();
+        }
+    };
+
+    /// `self` must live at a stable address (the LRU stores `&self` as ctx).
+    pub fn bind(self: *EngineManager, capacity: usize) !void {
+        self.lru = try model_manager.LruManager(*Engine).init(
+            self.allocator,
+            capacity,
+            self,
+            loadEngine,
+            unloadEngine,
+        );
+    }
+
+    pub fn deinit(self: *EngineManager) void {
+        self.lru.deinit();
+    }
+
+    fn loadEngine(ctx: *anyopaque, name: []const u8) anyerror!*Engine {
+        const self: *EngineManager = @ptrCast(@alignCast(ctx));
+        // Resolve name -> path: a real file path wins, else the registry.
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| self.allocator.free(o);
+        var path: []const u8 = name;
+        if (std.fs.cwd().access(name, .{})) |_| {} else |_| {
+            const dir = models.registryDir(self.allocator) catch return error.ModelNotFound;
+            defer self.allocator.free(dir);
+            owned = (models.resolvePath(self.allocator, dir, name) catch null) orelse return error.ModelNotFound;
+            path = owned.?;
+        }
+        const ep = try self.allocator.create(Engine);
+        errdefer self.allocator.destroy(ep);
+        ep.* = try Engine.init(self.allocator, path, self.engine_cfg);
+        return ep;
+    }
+
+    fn unloadEngine(ctx: *anyopaque, value: **Engine) void {
+        const self: *EngineManager = @ptrCast(@alignCast(ctx));
+        value.*.deinit(self.allocator);
+        self.allocator.destroy(value.*);
+    }
+
+    pub fn acquire(self: *EngineManager, model: ?[]const u8) !Acquired {
+        const name = model orelse return .{ .engine = self.default_engine, .handle = null };
+        if (name.len == 0 or std.mem.eql(u8, name, self.default_id)) {
+            return .{ .engine = self.default_engine, .handle = null };
+        }
+        const h = try self.lru.acquire(name);
+        return .{ .engine = h.value().*, .handle = h };
+    }
+};
+
+/// Per-server shared state threaded to each connection handler.
+const ServerCtx = struct {
+    allocator: std.mem.Allocator,
+    cfg: ServerConfig,
+    manager: *EngineManager,
+    embed: *embeddings.EmbeddingService,
+    default_model_path: []const u8,
 };
 
 const Header = struct {
@@ -91,6 +174,27 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
     var engine = try Engine.init(allocator, model_path, engine_cfg);
     defer engine.deinit(allocator);
 
+    var manager = EngineManager{
+        .allocator = allocator,
+        .engine_cfg = engine_cfg,
+        .default_engine = &engine,
+        .default_id = engine.modelId(),
+        .lru = undefined,
+    };
+    try manager.bind(@max(@as(usize, 1), cfg.max_loaded_models));
+    defer manager.deinit();
+
+    var embed_service = embeddings.EmbeddingService.init(allocator, engine_cfg.n_ctx, engine_cfg.threads);
+    defer embed_service.deinit();
+
+    var sctx = ServerCtx{
+        .allocator = allocator,
+        .cfg = cfg,
+        .manager = &manager,
+        .embed = &embed_service,
+        .default_model_path = model_path,
+    };
+
     const addr = try resolveListenAddress(allocator, cfg.host, cfg.port);
     defer allocator.free(addr.host);
 
@@ -131,10 +235,8 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
         if (cfg.recv_timeout_ms != 0) applyRecvTimeout(conn.stream.handle, cfg.recv_timeout_ms);
 
         const Handler = struct {
-            allocator: std.mem.Allocator,
             stream: std.net.Stream,
-            engine: *Engine,
-            cfg: ServerConfig,
+            sctx: *ServerCtx,
             conn_count: *std.atomic.Value(u32),
 
             fn run(self: @This()) void {
@@ -142,7 +244,7 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
                     self.stream.close();
                     _ = self.conn_count.fetchSub(1, .release);
                 }
-                handleConnection(self.allocator, self.stream, self.engine, self.cfg) catch |err| {
+                handleConnection(self.stream, self.sctx) catch |err| {
                     std.log.err("connection error: {any}", .{err});
                 };
             }
@@ -151,10 +253,8 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
         _ = conn_count.fetchAdd(1, .acq_rel);
 
         const handler = Handler{
-            .allocator = allocator,
             .stream = conn.stream,
-            .engine = &engine,
-            .cfg = cfg,
+            .sctx = &sctx,
             .conn_count = &conn_count,
         };
 
@@ -215,11 +315,11 @@ fn resolveListenAddress(allocator: std.mem.Allocator, host: []const u8, port: u1
 }
 
 fn handleConnection(
-    allocator: std.mem.Allocator,
     stream: std.net.Stream,
-    engine: *Engine,
-    cfg: ServerConfig,
+    sctx: *ServerCtx,
 ) !void {
+    const allocator = sctx.allocator;
+    const cfg = sctx.cfg;
     var req_buf: std.ArrayList(u8) = .empty;
     defer req_buf.deinit(allocator);
 
@@ -251,7 +351,8 @@ fn handleConnection(
     }
 
     if (isWebSocketUpgrade(req.headers) and std.mem.eql(u8, req.path, "/v1/chat/completions/ws")) {
-        try handleWebSocket(allocator, stream, req.headers, engine);
+        // WebSocket stays on the default engine (no per-request model switch).
+        try handleWebSocket(allocator, stream, req.headers, sctx.manager.default_engine);
         return;
     }
 
@@ -262,21 +363,41 @@ fn handleConnection(
     }
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/models")) {
-        try handleModels(allocator, stream, engine);
+        try handleModels(allocator, stream, sctx);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/chat/completions")) {
-        try handleChatCompletions(allocator, stream, engine, req.body);
+        try handleChatCompletions(allocator, stream, sctx, req.body);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/completions")) {
-        try handleCompletions(allocator, stream, engine, req.body);
+        try handleCompletions(allocator, stream, sctx, req.body);
+        return;
+    }
+
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/embeddings")) {
+        try handleEmbeddings(allocator, stream, sctx, req.body);
         return;
     }
 
     try writeJsonError(allocator, stream, 404, "Not Found", "not_found", "route not found");
+}
+
+/// Acquire the engine for a request `model`, writing a 400/404 and returning
+/// null if the named model can't be loaded.
+fn acquireEngineOrError(allocator: std.mem.Allocator, stream: std.net.Stream, sctx: *ServerCtx, model: ?[]const u8) !?EngineManager.Acquired {
+    return sctx.manager.acquire(model) catch |err| {
+        const msg = switch (err) {
+            error.ModelNotFound => "requested model not found in the registry",
+            error.AllModelsPinned => "all model slots busy; try again",
+            else => "failed to load the requested model",
+        };
+        const status: u16 = if (err == error.ModelNotFound) 404 else 503;
+        try writeJsonErrorParam(allocator, stream, status, if (status == 404) "Not Found" else "Service Unavailable", "invalid_request_error", "model", msg);
+        return null;
+    };
 }
 
 fn authorized(headers: []const Header, api_key: []const u8) bool {
@@ -287,11 +408,10 @@ fn authorized(headers: []const Header, api_key: []const u8) bool {
     return std.mem.eql(u8, token, api_key);
 }
 
-fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, engine: *Engine) !void {
+fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, sctx: *ServerCtx) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    const model_id = engine.modelId();
     const ModelEntry = struct {
         id: []const u8,
         object: []const u8,
@@ -302,23 +422,35 @@ fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, engine: *E
         data: []const ModelEntry,
     };
 
-    var data = [_]ModelEntry{.{ .id = model_id, .object = "model", .owned_by = "mlz" }};
-    const payload: ModelsResponse = .{ .object = "list", .data = data[0..] };
+    var data: std.ArrayList(ModelEntry) = .empty;
+    defer data.deinit(allocator);
+    const default_id = sctx.manager.default_id;
+    try data.append(allocator, .{ .id = default_id, .object = "model", .owned_by = "mlz" });
 
+    // Plus every model in the registry (so clients can discover loadable ones).
+    if (models.registryDir(allocator)) |dir| {
+        defer allocator.free(dir);
+        if (models.list(allocator, dir)) |entries| {
+            defer {
+                for (entries) |e| allocator.free(e.name);
+                allocator.free(entries);
+            }
+            for (entries) |e| {
+                if (std.mem.eql(u8, e.name, default_id)) continue;
+                try data.append(allocator, .{ .id = e.name, .object = "model", .owned_by = "mlz" });
+            }
+        } else |_| {}
+    } else |_| {}
+
+    const payload: ModelsResponse = .{ .object = "list", .data = data.items };
     try openai.writeJson(buf.writer(allocator), payload);
-
-    try writeResponse(stream, .{
-        .status = 200,
-        .reason = "OK",
-        .content_type = "application/json",
-        .body = buf.items,
-    });
+    try writeResponse(stream, .{ .status = 200, .reason = "OK", .content_type = "application/json", .body = buf.items });
 }
 
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
-    engine: *Engine,
+    sctx: *ServerCtx,
     body: []const u8,
 ) !void {
     var parsed = openai.parseChatCompletionRequest(allocator, body) catch |err| {
@@ -331,6 +463,9 @@ fn handleChatCompletions(
     defer parsed.deinit();
 
     const req = parsed.value;
+    const acq = (try acquireEngineOrError(allocator, stream, sctx, req.model)) orelse return;
+    defer acq.release();
+    const engine = acq.engine;
     const stream_resp: bool = req.stream orelse false;
 
     if (!stream_resp) {
@@ -384,7 +519,7 @@ fn handleChatCompletions(
 fn handleCompletions(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
-    engine: *Engine,
+    sctx: *ServerCtx,
     body: []const u8,
 ) !void {
     var parsed = openai.parseCompletionRequest(allocator, body) catch |err| {
@@ -395,6 +530,9 @@ fn handleCompletions(
     defer parsed.deinit();
 
     const creq = parsed.value;
+    const acq = (try acquireEngineOrError(allocator, stream, sctx, creq.model)) orelse return;
+    defer acq.release();
+    const engine = acq.engine;
     var msgs = [_]openai.ChatMessage{.{ .role = "user", .content = creq.prompt }};
     const chat_req = openai.ChatCompletionRequest{
         .model = creq.model,
@@ -438,6 +576,100 @@ fn handleCompletions(
         .usage = resp.value.usage,
     };
 
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try openai.writeJson(buf.writer(allocator), out);
+    try writeResponse(stream, .{ .status = 200, .reason = "OK", .content_type = "application/json", .body = buf.items });
+}
+
+/// `/v1/embeddings`: embeds one string or an array of strings using the
+/// requested model (or the startup model) loaded in embedding mode.
+fn handleEmbeddings(allocator: std.mem.Allocator, stream: std.net.Stream, sctx: *ServerCtx, body: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", "body", "invalid JSON");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", "body", "expected a JSON object");
+        return;
+    }
+    const obj = parsed.value.object;
+
+    // Resolve the model path: named registry model, else the startup model.
+    var model_path_owned: ?[]u8 = null;
+    defer if (model_path_owned) |p| allocator.free(p);
+    var model_path: []const u8 = sctx.default_model_path;
+    var model_label: []const u8 = sctx.manager.default_id;
+    if (obj.get("model")) |mv| {
+        if (mv == .string and mv.string.len > 0) {
+            model_label = mv.string;
+            if (std.fs.cwd().access(mv.string, .{})) |_| {
+                model_path = mv.string;
+            } else |_| {
+                const dir = models.registryDir(allocator) catch null;
+                defer if (dir) |d| allocator.free(d);
+                if (dir) |d| {
+                    if (models.resolvePath(allocator, d, mv.string) catch null) |p| {
+                        model_path_owned = p;
+                        model_path = p;
+                    } else {
+                        try writeJsonErrorParam(allocator, stream, 404, "Not Found", "invalid_request_error", "model", "requested model not found");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect inputs (string or array of strings).
+    var inputs: std.ArrayList([]const u8) = .empty;
+    defer inputs.deinit(allocator);
+    const input_v = obj.get("input") orelse {
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", "input", "input is required");
+        return;
+    };
+    switch (input_v) {
+        .string => |s| try inputs.append(allocator, s),
+        .array => |arr| {
+            for (arr.items) |it| {
+                if (it == .string) try inputs.append(allocator, it.string);
+            }
+        },
+        else => {},
+    }
+    if (inputs.items.len == 0) {
+        try writeJsonErrorParam(allocator, stream, 400, "Bad Request", "invalid_request_error", "input", "input must be a non-empty string or array of strings");
+        return;
+    }
+
+    // Embed each input. Vectors are owned and freed after serialisation.
+    var data: std.ArrayList(openai.EmbeddingData) = .empty;
+    defer {
+        for (data.items) |d| allocator.free(d.embedding);
+        data.deinit(allocator);
+    }
+    var total_chars: usize = 0;
+    for (inputs.items, 0..) |text, i| {
+        const vec = sctx.embed.embed(allocator, model_path, text) catch |err| {
+            const msg = switch (err) {
+                error.NotAnEmbeddingModel => "the selected model does not produce embeddings",
+                error.EmptyInput => "an input string was empty",
+                else => "failed to compute embeddings",
+            };
+            const status: u16 = if (err == error.NotAnEmbeddingModel or err == error.EmptyInput) 400 else 500;
+            try writeJsonError(allocator, stream, status, if (status == 400) "Bad Request" else "Internal Server Error", "invalid_request_error", msg);
+            return;
+        };
+        total_chars += text.len;
+        try data.append(allocator, .{ .embedding = vec, .index = i });
+    }
+
+    const out = openai.EmbeddingResponse{
+        .data = data.items,
+        .model = model_label,
+        .usage = .{ .prompt_tokens = total_chars / 4, .total_tokens = total_chars / 4 },
+    };
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try openai.writeJson(buf.writer(allocator), out);
