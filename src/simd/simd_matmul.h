@@ -54,6 +54,13 @@ int simd_check_avx512_fp16(void);
 int simd_check_avx512_vnni(void);
 
 /**
+ * @brief INT8 GEMM: C[M,N] = A[M,K] . B[N,K]^T, signed int8 -> int32.
+ *        Routes to the tiled VNNI microkernel for aligned shapes, else naive.
+ */
+void simd_gemm_s8s8s32(int M, int N, int K, const signed char *A,
+                       const signed char *B, int *C);
+
+/**
  * @brief Check if CPU supports ARM NEON instructions
  * @return Non-zero if NEON is supported (always true on AArch64), zero otherwise
  */

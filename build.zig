@@ -1281,6 +1281,18 @@ pub fn build(b: *std.Build) void {
                 const gemm_vnni_obj = gemm_vnni_asm.addOutputFileArg("gemm_s8s8s32_avx512vnni.o");
                 gemm_vnni_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx512vnni.asm"));
                 ggml_lib.addObjectFile(gemm_vnni_obj);
+
+                const gemm_vnni_t_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const gemm_vnni_t_obj = gemm_vnni_t_asm.addOutputFileArg("gemm_s8s8s32_avx512vnni_tiled.o");
+                gemm_vnni_t_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx512vnni_tiled.asm"));
+                ggml_lib.addObjectFile(gemm_vnni_t_obj);
             }
 
             const q8_k_asm = b.addSystemCommand(&[_][]const u8{

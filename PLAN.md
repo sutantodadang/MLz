@@ -216,12 +216,20 @@ the actual compute and SIMD matters).
       VNNI bit 11 + VL bit 31). Golden-vector correctness vs scalar triple loop,
       incl. K%32 scalar tail (test-simd pass=152, fail=0). Benched ~136 GOPS
       (AVX2) / ~139 GOPS (VNNI) at 64×64×512.
-      - ponytail ceiling: naive triple loop, no register/cache blocking → a
-        per-(m,n) horizontal reduce dominates, so VNNI ≈ AVX2 here. Tile into an
-        MR×NR microkernel (accumulate output tiles in regs, reduce once) to
-        expose VNNI throughput when GEMM actually gates inference.
-- [ ] **Remaining:** AMX dispatch (needs Sapphire Rapids — untestable on this
-      Zen4 box, deferred); MR×NR GEMM tiling; fused RoPE+attention.
+- [x] **MR×NR GEMM tiling** (`gemm_s8s8s32_avx512vnni_t`, 4×2 register-blocked).
+      Each A/B load is reused across the tile instead of re-read per (m,n),
+      fixing the bandwidth bound. Uses the unsigned-offset trick (A XOR 0x80 →
+      u8; correct with `128·ΣB[n]`, the column sum accumulated by `vpdpbusd`
+      against a u8=1 vector) so `vpdpbusd` needs no per-row sign fold — VNNI-only
+      because the AVX2 `vpmaddubsw` path would overflow int16 with u8∈[0,255].
+      C dispatcher `simd_gemm_s8s8s32()` routes aligned shapes (M%4,N%2,K%32) to
+      the tile, else the naive AVX2 kernel. Validated (test-simd pass=164 fail=0,
+      incl. dispatcher on arbitrary shapes). **~359 GOPS vs ~123 naive VNNI =
+      2.9×** at 64×64×512.
+      - further levers: larger MR/NR (more reuse, more reg pressure); an AVX2
+        sign-trick tiled variant; K-panel packing.
+- [ ] **Remaining:** fused RoPE+attention; AMX dispatch (needs Sapphire Rapids —
+      untestable on this Zen4 box, deferred).
 
 ---
 
