@@ -103,24 +103,20 @@ vLLM/SGLang on the same hardware.
 - [x] **Chunked prefill** (budget split: decode tokens first, then prefill
       chunks fill the rest).
 - [x] Backpressure: bounded queue (`n_seq_max * 4`), `error.QueueFull` when full.
-- [x] **Per-slot prefix cache**: each slot retains its last prompt's KV;
-      a new request reuses the longest common prefix and `seq_rm`-trims the
-      divergent tail (graceful full-clear fallback when the backend can't
-      partially remove, e.g. recurrent/SSM caches — never crashes).
+- [x] Prefix reuse (per-slot) — moved to **opt-in** in Phase 2 (see below). It
+      was unsafe by default: correct on plain transformer KV caches but corrupts
+      recurrent/hybrid models.
 - [x] **Reliable benchmark** (`bench/bench_serve.py`, stdlib threads):
       sequential vs concurrent tok/s + the prefix-cache A/B.
 - [ ] **Deferred:** speculative decoding in the batched path (single-stream
-      keeps it); shared cross-slot prefix tree (RadixAttention, Phase 2 — ranged
-      `seq_cp` is rejected by recurrent KV caches in this llama build); CI gating
-      of the benchmark (Phase 3). Slow-client head-of-line blocking (owner thread
-      does socket I/O) — upgrade to per-slot writer threads if it bites.
+      keeps it); CI gating of the benchmark (Phase 3). Slow-client head-of-line
+      blocking (owner thread does socket I/O) — upgrade to per-slot writer threads
+      if it bites.
 
 Validated end-to-end (gemma-3-4b Q6_K, `--max-concurrent 4`):
 - correctness: 6 concurrent → 6 correct distinct answers, 2 queued past 4 slots;
   no crash/deadlock/leak.
 - **throughput: 3.16x** (9.9 → 31.3 tok/s, 4 slots) via `bench_serve.py`.
-- **prefix cache: 10.8x** warm-cache p50 latency drop (9584 → 887 ms) with a
-  long shared prefix.
 
 Two pre-existing server bugs fixed while validating: (1) `openai.writeJson` never
 flushed the `adaptToNewApi` adapter → every HTTP body/SSE chunk came out empty;
@@ -129,19 +125,44 @@ read reallocated → any request whose body spanned multiple `recv()`s 404'd.
 
 ---
 
-## Phase 2 — Prefix sharing / RadixAttention-lite `~2 wk`
+## Phase 2 — Prefix sharing / RadixAttention-lite `done (constrained)`
 
 SGLang's edge: share KV across requests with a common prefix (system prompts,
-few-shot, multi-turn). llama.cpp gives `llama_kv_cache_seq_cp` / `seq_rm`.
+few-shot, multi-turn). Two hard constraints discovered against this llama build's
+KV caches (the available models are Gated Delta Net — a hybrid/linear-attention
+arch):
 
-- [ ] **Radix tree** of token-prefix → cached KV span (`src/prefix_cache.zig`).
-      On admit: match longest cached prefix, `seq_cp` its KV into the new slot,
-      prefill only the suffix.
-- [ ] LRU eviction by KV-block budget; ref-count spans in use by live slots.
-- [ ] Metric: prefix-cache hit rate, tokens saved.
+1. **Ranged `seq_cp` aborts** (`GGML_ASSERT: seq_cp() is only supported for full
+   KV buffers`). The classic RadixAttention move — copy a shared prefix's KV
+   between sequences — is impossible on these caches. So cross-slot KV *copy* is
+   out; sharing is done by **prefix-affinity admission** (routing) instead.
+2. **Prefix reuse via partial `seq_rm` corrupts output** on recurrent/hybrid
+   models — their recurrent state is not position-indexed, so trimming the KV
+   tail leaves stale state and the model emits garbage. And llama does **not**
+   flag these models (`is_recurrent`/`is_hybrid` both return false), so it can't
+   be auto-detected.
 
-Acceptance: repeated system-prompt workloads show measured prefill reduction;
-hit-rate visible in `/metrics`.
+Delivered, given those constraints:
+
+- [x] **Opt-in prefix cache** (`prefix_cache`, default **false** — config:
+      `serve.prefix_cache`, `MLZ_PREFIX_CACHE`, `--prefix-cache`). Off → every
+      request decodes a clean KV (correct on every architecture). On → per-slot
+      prefix reuse for plain-transformer KV caches.
+- [x] **Prefix-affinity admission**: when on, route each request to the idle slot
+      whose retained prefix shares the most tokens (`pickSlot`), so a prefix
+      family (shared system prompt) lands on a warm slot. `seq_rm`-trim the
+      divergent tail, prefill only the suffix; graceful full-clear fallback.
+- [x] **Hit-rate metric**: `n_requests`, `reused_tokens`, `prefilled_tokens` →
+      logged as reuse % on scheduler shutdown (wire into `/metrics` in Phase 5).
+- [x] Benchmark modes `--prefix-test` / `--affinity-test` exercise it.
+- [ ] **Deferred** (needs a plain-KV-cache model / backend, untestable on the
+      hybrid models on hand): true cross-slot `seq_cp` radix tree with LRU
+      eviction + ref-counted spans. Validate the opt-in path's perf on a
+      transformer model.
+
+Validated: default (off) → correct output + 3.16x throughput on gemma-3-4b Q6_K;
+no crash with the opt-in machinery present. The `seq_cp`/corruption findings are
+why the feature is gated rather than on-by-default.
 
 ---
 

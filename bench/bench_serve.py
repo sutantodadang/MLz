@@ -87,7 +87,11 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--prefix-test", action="store_true",
-                    help="measure prefix-cache benefit with a shared long system prompt")
+                    help="measure prefix-cache benefit with a shared long system prompt "
+                         "(needs the server started with --prefix-cache)")
+    ap.add_argument("--affinity-test", action="store_true",
+                    help="mixed workload: several distinct long prefixes cycled through, "
+                         "exercising prefix-affinity slot routing (needs --prefix-cache)")
     args = ap.parse_args()
 
     print(f"Benchmarking {args.url} (model={args.model})")
@@ -106,6 +110,26 @@ def main():
         if cold["p50"] and warm["p50"]:
             print(f"prefix-cache p50 latency: {cold['p50']*1000:.0f}ms -> "
                   f"{warm['p50']*1000:.0f}ms  ({cold['p50']/warm['p50']:.2f}x faster)")
+        return
+
+    if args.affinity_test:
+        # N distinct long prefixes (> slot count) cycled through. Prefix-affinity
+        # routing should keep each prefix family on a warm slot -> high reuse even
+        # though prefixes outnumber slots.
+        personas = ["a terse pirate", "a formal historian", "a cheerful chef",
+                    "a stoic engineer", "a poetic gardener", "a blunt lawyer"]
+        prefixes = [(f"You are {p}. " * 30).strip() for p in personas]
+        prompts = [f"{prefixes[i % len(prefixes)]}\n\nName one color." for i in range(args.requests)]
+        print(f"\n-- affinity test ({len(personas)} distinct prefixes, "
+              f"concurrency={args.concurrency}) --")
+        w1 = run_batch(args.url, args.model, prompts, args.max_tokens, args.concurrency)
+        print(fmt("wave 1 (cold)", w1))
+        w2 = run_batch(args.url, args.model, prompts, args.max_tokens, args.concurrency)
+        print(fmt("wave 2 (warmed)", w2))
+        if w1["p50"] and w2["p50"]:
+            print(f"affinity p50 latency: {w1['p50']*1000:.0f}ms -> "
+                  f"{w2['p50']*1000:.0f}ms  ({w1['p50']/w2['p50']:.2f}x)")
+        print("(server prints overall prefix-reuse % on shutdown)")
         return
 
     topics = ["the ocean", "mountains", "rivers", "forests", "deserts",

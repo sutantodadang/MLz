@@ -44,6 +44,10 @@ pub const EngineConfig = struct {
     /// Max concurrent sequences. >1 enables the continuous-batching scheduler;
     /// 1 keeps the single-stream path (prefix cache + speculative decoding).
     max_concurrent: u32 = 1,
+
+    /// Enable prefix reuse across requests. Default false: safe on all model
+    /// architectures. Only enable for standard transformer models.
+    prefix_cache: bool = false,
 };
 
 pub const ChatOptions = struct {
@@ -169,7 +173,7 @@ pub const Engine = struct {
         // Continuous-batching scheduler (opt-in via max_concurrent > 1).
         var scheduler: ?*sched.Scheduler = null;
         if (cfg.max_concurrent > 1) {
-            scheduler = try sched.Scheduler.init(allocator, ctx, vocab, cfg.max_concurrent, 1024);
+            scheduler = try sched.Scheduler.init(allocator, ctx, vocab, cfg.max_concurrent, 1024, cfg.prefix_cache);
         }
         errdefer if (scheduler) |s| s.deinit();
 

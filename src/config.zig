@@ -76,6 +76,7 @@ pub const Config = struct {
     server_port: u16 = 8080,
     server_api_key: ?[]const u8 = null,
     max_concurrent: u32 = 1,
+    prefix_cache: bool = false,
 
     // Custom SIMD backend runtime controls (consumed before model load to set
     // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
@@ -246,6 +247,8 @@ pub const Config = struct {
                 self.server_api_key = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--max-concurrent")) {
                 self.max_concurrent = try parseNextInt(u32, &i, args);
+            } else if (std.mem.eql(u8, arg, "--prefix-cache")) {
+                self.prefix_cache = true;
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
                 self.no_simd = true;
             } else if (std.mem.eql(u8, arg, "--n-predict")) {
@@ -337,6 +340,8 @@ pub const Config = struct {
                     self.server_mode = parseBool(str_val);
                 } else if (std.mem.eql(u8, key, "max_concurrent")) {
                     self.max_concurrent = std.fmt.parseInt(u32, str_val, 10) catch return ParseError.InvalidInt;
+                } else if (std.mem.eql(u8, key, "prefix_cache")) {
+                    self.prefix_cache = parseBool(str_val);
                 } else {
                     std.log.warn("mlz.toml: unknown key serve.{s}", .{key});
                 }
@@ -423,6 +428,10 @@ pub const Config = struct {
             defer allocator.free(v);
             self.max_concurrent = std.fmt.parseInt(u32, v, 10) catch return ParseError.InvalidInt;
         }
+        if (std.process.getEnvVarOwned(allocator, "MLZ_PREFIX_CACHE") catch null) |v| {
+            defer allocator.free(v);
+            self.prefix_cache = parseBool(v);
+        }
         if (std.process.getEnvVarOwned(allocator, "MLZ_TEMP") catch null) |v| {
             defer allocator.free(v);
             self.temp = std.fmt.parseFloat(f32, v) catch return ParseError.InvalidFloat;
@@ -464,6 +473,7 @@ pub const Config = struct {
         try writer.print("host = \"{s}\"\n", .{self.server_host});
         try writer.print("port = {d}\n", .{self.server_port});
         try writer.print("max_concurrent = {d}\n", .{self.max_concurrent});
+        try writer.print("prefix_cache = {}\n", .{self.prefix_cache});
         if (self.server_api_key) |k| {
             try writer.print("api_key = \"{s}\"\n", .{k});
         }
@@ -540,4 +550,11 @@ test "max_concurrent toml" {
     try cfg.applyToml(std.testing.allocator, "[serve]\nmax_concurrent = 8\n");
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 8), cfg.max_concurrent);
+}
+
+test "prefix_cache toml" {
+    var cfg = Config{};
+    try cfg.applyToml(std.testing.allocator, "[serve]\nprefix_cache = true\n");
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.prefix_cache == true);
 }

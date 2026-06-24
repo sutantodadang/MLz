@@ -117,6 +117,7 @@ pub fn main() !void {
             .grammar_root = cfg.grammar_root,
             .draft_model_path = cfg.draft_model_path,
             .max_concurrent = cfg.max_concurrent,
+            .prefix_cache = cfg.prefix_cache,
         });
         return;
     }
@@ -136,6 +137,7 @@ pub fn main() !void {
         .chat_template = cfg.chat_template,
         .draft_model_path = cfg.draft_model_path,
         .max_concurrent = cfg.max_concurrent,
+        .prefix_cache = cfg.prefix_cache,
     };
 
     var engine = try server.Engine.init(allocator, model_path, engine_cfg);

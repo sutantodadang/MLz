@@ -12,6 +12,7 @@ enabled = false
 host = "127.0.0.1"
 port = 8080
 max_concurrent = 1      # >1 enables continuous batching (concurrent requests share decode steps)
+prefix_cache = false    # prefix reuse across requests; ONLY enable for standard transformer models (corrupts recurrent/hybrid model output)
 # api_key = "secret"
 
 [sampling]
