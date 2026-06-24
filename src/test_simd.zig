@@ -63,6 +63,7 @@ extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, r: *f32, vx: ?*const anyopaq
 extern "c" fn simd_check_avx512_vnni() bool;
 extern "c" fn simd_gemm_s8s8s32_avx2(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32_avx512vnni(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
+extern "c" fn simd_gemm_s8s8s32_avx2_t(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32_avx512vnni_t(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 
@@ -481,13 +482,14 @@ pub fn main() !void {
         const have_vnni = simd_check_avx512_vnni();
         std.debug.print("CPU caps: AVX512-VNNI={any}\n", .{have_vnni});
         const gemm_cases = [_][3]usize{ .{ 1, 1, 32 }, .{ 2, 3, 64 }, .{ 4, 5, 256 }, .{ 3, 7, 96 }, .{ 5, 4, 160 }, .{ 1, 1, 40 }, .{ 2, 2, 35 } };
+        const gemm_t_cases = [_][3]usize{ .{ 4, 2, 32 }, .{ 8, 4, 64 }, .{ 4, 6, 96 }, .{ 12, 8, 256 }, .{ 8, 2, 160 } };
         if (have_avx2) {
             try runGemmTest(allocator, "gemm_s8s8s32 avx2", simd_gemm_s8s8s32_avx2, &gemm_cases, &rng, &pass, &fail);
+            try runGemmTest(allocator, "gemm_s8s8s32 avx2-tiled", simd_gemm_s8s8s32_avx2_t, &gemm_t_cases, &rng, &pass, &fail);
         }
         if (have_vnni) {
             try runGemmTest(allocator, "gemm_s8s8s32 avx512vnni", simd_gemm_s8s8s32_avx512vnni, &gemm_cases, &rng, &pass, &fail);
             // tiled microkernel — aligned shapes only (M%4, N%2, K%32)
-            const gemm_t_cases = [_][3]usize{ .{ 4, 2, 32 }, .{ 8, 4, 64 }, .{ 4, 6, 96 }, .{ 12, 8, 256 }, .{ 8, 2, 160 } };
             try runGemmTest(allocator, "gemm_s8s8s32 vnni-tiled", simd_gemm_s8s8s32_avx512vnni_t, &gemm_t_cases, &rng, &pass, &fail);
         }
         // dispatcher: must be correct for any shape (aligned -> tiled, else naive)

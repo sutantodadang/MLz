@@ -1273,6 +1273,17 @@ pub fn build(b: *std.Build) void {
             gemm_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx2.asm"));
             ggml_lib.addObjectFile(gemm_avx2_obj);
 
+            const gemm_avx2_t_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const gemm_avx2_t_obj = gemm_avx2_t_asm.addOutputFileArg("gemm_s8s8s32_avx2_tiled.o");
+            gemm_avx2_t_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx2_tiled.asm"));
+            ggml_lib.addObjectFile(gemm_avx2_t_obj);
+
             if (!no_avx512) {
                 const gemm_vnni_asm = b.addSystemCommand(&[_][]const u8{
                     "nasm",

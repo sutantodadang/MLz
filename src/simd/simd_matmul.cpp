@@ -222,6 +222,8 @@ void matrix_mult_avx512(const float *A, const float *B, float *C, size_t M,
 extern "C" {
 void simd_gemm_s8s8s32_avx2(int M, int N, int K, const signed char *A,
                             const signed char *B, int *C);
+void simd_gemm_s8s8s32_avx2_t(int M, int N, int K, const signed char *A,
+                              const signed char *B, int *C);
 void simd_gemm_s8s8s32_avx512vnni(int M, int N, int K, const signed char *A,
                                   const signed char *B, int *C);
 void simd_gemm_s8s8s32_avx512vnni_t(int M, int N, int K, const signed char *A,
@@ -233,8 +235,11 @@ void simd_gemm_s8s8s32_avx512vnni_t(int M, int N, int K, const signed char *A,
 // (which handles any shape, including the K%32 tail).
 extern "C" void simd_gemm_s8s8s32(int M, int N, int K, const signed char *A,
                                   const signed char *B, int *C) {
-  if (simd_check_avx512_vnni() && (M % 4 == 0) && (N % 2 == 0) && (K % 32 == 0)) {
+  const bool aligned = (M % 4 == 0) && (N % 2 == 0) && (K % 32 == 0);
+  if (aligned && simd_check_avx512_vnni()) {
     simd_gemm_s8s8s32_avx512vnni_t(M, N, K, A, B, C);
+  } else if (aligned && simd_check_avx2()) {
+    simd_gemm_s8s8s32_avx2_t(M, N, K, A, B, C);
   } else {
     simd_gemm_s8s8s32_avx2(M, N, K, A, B, C);
   }

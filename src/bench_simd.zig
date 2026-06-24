@@ -53,6 +53,7 @@ extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, result: *f32, vx: ?*const an
 extern "c" fn simd_check_avx512_vnni() bool;
 extern "c" fn simd_gemm_s8s8s32_avx2(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32_avx512vnni(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
+extern "c" fn simd_gemm_s8s8s32_avx2_t(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32_avx512vnni_t(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 
 // NEON kernels (aarch64)
@@ -256,6 +257,7 @@ pub fn main() !void {
         for (ga, 0..) |*v, i| v.* = @intCast(@as(i32, @intCast(i % 255)) - 127);
         for (gb, 0..) |*v, i| v.* = @intCast(@as(i32, @intCast((i * 7) % 255)) - 127);
         run_gemm("gemm_s8s8s32 (AVX2)", simd_gemm_s8s8s32_avx2, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);
+        run_gemm("gemm_s8s8s32 (AVX2-tiled)", simd_gemm_s8s8s32_avx2_t, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);
         if (simd_check_avx512_vnni()) {
             run_gemm("gemm_s8s8s32 (VNNI)", simd_gemm_s8s8s32_avx512vnni, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);
             run_gemm("gemm_s8s8s32 (VNNI-tiled)", simd_gemm_s8s8s32_avx512vnni_t, GM, GN, GK, ga.ptr, gb.ptr, gc.ptr, gemm_iters);

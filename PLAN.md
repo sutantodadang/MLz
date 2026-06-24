@@ -226,8 +226,14 @@ the actual compute and SIMD matters).
       the tile, else the naive AVX2 kernel. Validated (test-simd pass=164 fail=0,
       incl. dispatcher on arbitrary shapes). **~359 GOPS vs ~123 naive VNNI =
       2.9×** at 64×64×512.
-      - further levers: larger MR/NR (more reuse, more reg pressure); an AVX2
-        sign-trick tiled variant; K-panel packing.
+      - further levers: larger MR/NR (more reuse, more reg pressure); K-panel
+        packing.
+- [x] **AVX2 sign-trick GEMM tile** (`gemm_s8s8s32_avx2_t`, 4×2). AVX2 can't use
+      the unsigned-offset trick (`vpmaddubsw` would overflow int16 at u8∈[0,255]),
+      so it keeps the `|a|` sign trick — the fold is per (m,n) but the A/B loads
+      are still shared across the tile. ~156 GOPS vs ~135 naive AVX2 = 1.22× (the
+      extra sign folds eat into the reuse win; VNNI's offset trick is cleaner).
+      Dispatcher now picks vnni-tile → avx2-tile → naive. test-simd pass=174/0.
 - [x] **Fused RoPE + attention** (`simd_fused_rope_attn_f32`, f32 single head).
       Applies rotary embedding to Q and K *inline* inside the online-softmax
       (flash) loop, so rotated Q/K are never materialised — removes the separate
@@ -239,8 +245,24 @@ the actual compute and SIMD matters).
       per-position sin/cos tables is the next lever (would widen the gap), then a
       hand-tuned AVX/VNNI inner loop. C++ (consistent with the existing
       function-pointer flash-attn path), not asm.
+- [x] **RoPE sin/cos tables + AVX2 fused inner loop.** Precompute per-(position,
+      pair) cos/sin once (kill inner libm; reused across queries), and vectorise
+      rotation + score dot + V accumulation with AVX2/FMA. Rotation uses the
+      pair-swap identity `out = x*cos + sign*swap(x)*sin` (vpermilps 0xB1). Also
+      fixed the algorithm: the fused kernel now rotates K **once** for n_q>1
+      (re-rotating per query was n_q-fold waste) and inlines only at n_q==1.
+      Speedup vs the pure-scalar baseline: **decode (n_q=1) 1.31×**,
+      **prefill 2.5× (n_q=32) – 3.5× (n_q=128)**. Decode stays rotation-libm-
+      bound; a vectorised sin/cos approximation (with mod-2π range reduction) is
+      the remaining lever there. Why not asm: see the asm note below.
+- [ ] **Decision — asm vs C++ for RoPE+attention:** kept in C++ with AVX2
+      intrinsics, not monolithic `.asm`. The online-softmax needs `exp` +
+      running-max control flow; hand-coding that in `.asm` is high-risk for
+      little gain (same reason `flash_attn_quantized` is C++). The pure-data GEMM
+      kernels stay `.asm`. The remaining asm-worthy piece is a vectorised
+      sin/cos, which can be intrinsics too.
 - [ ] **Remaining:** AMX dispatch (needs Sapphire Rapids — untestable on this
-      Zen4 box, deferred); RoPE sin/cos tables + AVX fused inner loop.
+      Zen4 box, deferred); vectorised sin/cos for decode RoPE.
 
 ---
 
