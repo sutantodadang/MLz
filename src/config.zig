@@ -76,7 +76,7 @@ pub const Config = struct {
     server_port: u16 = 8080,
     server_api_key: ?[]const u8 = null,
     max_concurrent: u32 = 1,
-    prefix_cache: bool = false,
+    prefix_cache: bool = true,
 
     // Custom SIMD backend runtime controls (consumed before model load to set
     // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
@@ -249,6 +249,8 @@ pub const Config = struct {
                 self.max_concurrent = try parseNextInt(u32, &i, args);
             } else if (std.mem.eql(u8, arg, "--prefix-cache")) {
                 self.prefix_cache = true;
+            } else if (std.mem.eql(u8, arg, "--no-prefix-cache")) {
+                self.prefix_cache = false;
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
                 self.no_simd = true;
             } else if (std.mem.eql(u8, arg, "--n-predict")) {

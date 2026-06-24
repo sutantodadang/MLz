@@ -151,11 +151,18 @@ these caches. The per-slot approach uses only `seq_rm`, which works.)
       slot.
 - [x] **Hit-rate metric** (`n_requests` / `reused_tokens` / `prefilled_tokens`)
       logged on shutdown; wire into `/metrics` in Phase 5.
-- [x] `prefix_cache` opt-in: `serve.prefix_cache` / `MLZ_PREFIX_CACHE` /
-      `--prefix-cache`. Default off (safe everywhere); on → reuse.
+- [x] `prefix_cache` **on by default** (`serve.prefix_cache` / `MLZ_PREFIX_CACHE`
+      / `--prefix-cache`; disable with `--no-prefix-cache`). Validated correct on
+      Llama (transformer), gemma (hybrid), and Qwen3, plus a 12-way concurrent
+      stress run (queue overflow, 0 errors). Graceful full-clear fallback when a
+      backend can't partially remove KV.
 - [ ] **Deferred:** cross-slot `seq_cp` radix tree with LRU eviction +
-      ref-counted spans (blocked by `seq_cp` aborting on this llama build);
-      default-on once validated across more model families.
+      ref-counted spans. Ranged `seq_cp` aborts on this llama build
+      (`GGML_ASSERT`); a viable path is one dedicated sequence per cached prefix
+      reused via FULL-sequence `seq_cp` (p0=0,p1=-1) — needs verifying that full
+      copies are allowed where sub-range copies are not, plus a seq-pool budget.
+      Lower priority: per-slot reuse already captures the multi-turn / shared-
+      prefix win.
 
 Validated (`--max-concurrent 4 --prefix-cache`, greedy):
 - correctness: distinct prompts, 4-way concurrent, and multi-turn recall all

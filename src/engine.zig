@@ -47,10 +47,11 @@ pub const EngineConfig = struct {
 
     /// Enable prefix reuse in the batched scheduler: each slot keeps its KV and
     /// a new request reuses the longest common prefix (prefix-affinity routing +
-    /// seq_rm tail trim), prefilling only the suffix. Default off; validated
-    /// correct + 6-13x lower prefill latency on transformer and hybrid models.
-    /// Falls back to a full clear when a backend can't partially remove KV.
-    prefix_cache: bool = false,
+    /// seq_rm tail trim), prefilling only the suffix. Default on (validated
+    /// correct + 6-13x lower prefill latency on transformer/hybrid/Qwen3 models);
+    /// disable with --no-prefix-cache. Falls back to a full clear when a backend
+    /// can't partially remove KV.
+    prefix_cache: bool = true,
 };
 
 pub const ChatOptions = struct {

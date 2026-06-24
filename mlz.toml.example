@@ -12,7 +12,7 @@ enabled = false
 host = "127.0.0.1"
 port = 8080
 max_concurrent = 1      # >1 enables continuous batching (concurrent requests share decode steps)
-prefix_cache = false    # reuse a slot's KV prefix across requests (affinity routing); ~6-13x lower prefill latency on shared prefixes / multi-turn
+prefix_cache = true     # reuse a slot's KV prefix across requests (affinity routing); ~6-13x lower prefill latency on shared prefixes / multi-turn. false or --no-prefix-cache to disable
 # api_key = "secret"
 
 [sampling]
