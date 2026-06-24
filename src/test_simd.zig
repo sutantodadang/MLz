@@ -66,6 +66,9 @@ extern "c" fn simd_gemm_s8s8s32_avx512vnni(M: c_int, N: c_int, K: c_int, A: [*]c
 extern "c" fn simd_gemm_s8s8s32_avx512vnni_t(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 extern "c" fn simd_gemm_s8s8s32(M: c_int, N: c_int, K: c_int, A: [*]const i8, B: [*]const i8, C: [*]i32) void;
 
+// Fused RoPE + attention (f32, single head)
+extern "c" fn simd_fused_rope_attn_f32(n_q: c_int, n_kv: c_int, D: c_int, Q: [*]const f32, K: [*]const f32, V: [*]const f32, qpos: [*]const c_int, kpos: [*]const c_int, scale: f32, base: f32, causal: c_int, O: [*]f32) void;
+
 // -----------------------------------------------------------------------------
 // ggml reference quantize/dequantize (canonical, scalar)
 // -----------------------------------------------------------------------------
@@ -491,6 +494,11 @@ pub fn main() !void {
         try runGemmTest(allocator, "gemm_s8s8s32 dispatch", simd_gemm_s8s8s32, &gemm_cases, &rng, &pass, &fail);
     }
 
+    // -------------------------------------------------------------------------
+    // Fused RoPE + attention vs a two-pass scalar reference (rotate then attend).
+    // -------------------------------------------------------------------------
+    try runFusedRopeAttnTest(allocator, &rng, &pass, &fail);
+
     std.debug.print("\n=== SUMMARY: pass={d} fail={d} kernel-skipped={d} ===\n", .{ pass, fail, skip });
     if (fail > 0) std.process.exit(1);
 }
@@ -548,6 +556,101 @@ fn runGemmTest(
             std.debug.print(" {d}x{d}x{d}:ok", .{ M, N, K });
             pass.* += 1;
         } else {
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// Fused RoPE + attention validator (vs two-pass scalar reference).
+// -----------------------------------------------------------------------------
+fn fraRopeRow(x: []const f32, out: []f32, D: usize, pos: i32, base: f32) void {
+    const half = D / 2;
+    for (0..half) |i| {
+        const freq = std.math.pow(f32, base, -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(D)));
+        const th = @as(f32, @floatFromInt(pos)) * freq;
+        const c = @cos(th);
+        const s = @sin(th);
+        const a = x[2 * i];
+        const b = x[2 * i + 1];
+        out[2 * i] = a * c - b * s;
+        out[2 * i + 1] = a * s + b * c;
+    }
+    if (D & 1 == 1) out[D - 1] = x[D - 1];
+}
+
+fn runFusedRopeAttnTest(allocator: std.mem.Allocator, rng: *std.Random.DefaultPrng, pass: *usize, fail: *usize) !void {
+    std.debug.print("[fused_rope_attn_f32]", .{});
+    const r = rng.random();
+    const cases = [_][3]usize{ .{ 1, 64, 128 }, .{ 1, 200, 64 }, .{ 4, 50, 96 }, .{ 8, 128, 128 }, .{ 1, 1, 32 } };
+    for (cases) |c| {
+        const NQ = c[0];
+        const NKV = c[1];
+        const D = c[2];
+        const Q = try allocator.alloc(f32, NQ * D);
+        defer allocator.free(Q);
+        const K = try allocator.alloc(f32, NKV * D);
+        defer allocator.free(K);
+        const V = try allocator.alloc(f32, NKV * D);
+        defer allocator.free(V);
+        const qpos = try allocator.alloc(c_int, NQ);
+        defer allocator.free(qpos);
+        const kpos = try allocator.alloc(c_int, NKV);
+        defer allocator.free(kpos);
+        const Og = try allocator.alloc(f32, NQ * D);
+        defer allocator.free(Og);
+        const qr = try allocator.alloc(f32, D);
+        defer allocator.free(qr);
+        const Kr = try allocator.alloc(f32, NKV * D);
+        defer allocator.free(Kr);
+        for (Q) |*v| v.* = (r.float(f32) - 0.5) * 2;
+        for (K) |*v| v.* = (r.float(f32) - 0.5) * 2;
+        for (V) |*v| v.* = (r.float(f32) - 0.5) * 2;
+        for (kpos, 0..) |*v, j| v.* = @intCast(j);
+        for (qpos, 0..) |*v, i| v.* = @intCast(NKV - NQ + i);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+        const base: f32 = 10000.0;
+
+        simd_fused_rope_attn_f32(@intCast(NQ), @intCast(NKV), @intCast(D), Q.ptr, K.ptr, V.ptr, qpos.ptr, kpos.ptr, scale, base, 1, Og.ptr);
+
+        // two-pass reference
+        for (0..NKV) |j| fraRopeRow(K[j * D ..][0..D], Kr[j * D ..][0..D], D, kpos[j], base);
+        var maxerr: f32 = 0;
+        for (0..NQ) |i| {
+            fraRopeRow(Q[i * D ..][0..D], qr, D, qpos[i], base);
+            var mx: f32 = -std.math.floatMax(f32);
+            for (0..NKV) |j| {
+                if (kpos[j] > qpos[i]) continue;
+                var s: f32 = 0;
+                for (0..D) |d| s += qr[d] * Kr[j * D + d];
+                s *= scale;
+                if (s > mx) mx = s;
+            }
+            var den: f32 = 0;
+            var acc = try allocator.alloc(f32, D);
+            defer allocator.free(acc);
+            @memset(acc, 0);
+            for (0..NKV) |j| {
+                if (kpos[j] > qpos[i]) continue;
+                var s: f32 = 0;
+                for (0..D) |d| s += qr[d] * Kr[j * D + d];
+                const p = @exp(s * scale - mx);
+                den += p;
+                for (0..D) |d| acc[d] += p * V[j * D + d];
+            }
+            const inv = 1.0 / den;
+            for (0..D) |d| {
+                const ref = acc[d] * inv;
+                const e = @abs(Og[i * D + d] - ref);
+                if (e > maxerr) maxerr = e;
+            }
+        }
+        if (maxerr < 2e-4) {
+            std.debug.print(" {d}x{d}x{d}:ok", .{ NQ, NKV, D });
+            pass.* += 1;
+        } else {
+            std.debug.print(" {d}x{d}x{d}:FAIL(err={e})", .{ NQ, NKV, D, maxerr });
             fail.* += 1;
         }
     }

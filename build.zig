@@ -616,6 +616,10 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/simd/flash_attention.cpp"),
             .flags = simd_cpp_flags.items,
         });
+        ggml_lib.addCSourceFile(.{
+            .file = b.path("src/simd/fused_rope_attn.cpp"),
+            .flags = simd_cpp_flags.items,
+        });
 
         // Handwritten C++ intrinsic kernels (PLAN-ASSEMBLY-REWRITE step 8).
         // Q5_K x Q8_K vec_dot is implemented as handwritten NASM:

@@ -228,8 +228,19 @@ the actual compute and SIMD matters).
       2.9×** at 64×64×512.
       - further levers: larger MR/NR (more reuse, more reg pressure); an AVX2
         sign-trick tiled variant; K-panel packing.
-- [ ] **Remaining:** fused RoPE+attention; AMX dispatch (needs Sapphire Rapids —
-      untestable on this Zen4 box, deferred).
+- [x] **Fused RoPE + attention** (`simd_fused_rope_attn_f32`, f32 single head).
+      Applies rotary embedding to Q and K *inline* inside the online-softmax
+      (flash) loop, so rotated Q/K are never materialised — removes the separate
+      RoPE pass and the read-back of the rotated tensors. GGML "standard"
+      adjacent-pair RoPE; numerically matches a two-pass reference (rotate→attend)
+      to ~1e-7 (test-simd pass=169 fail=0). Decode bench (n_q=1, n_kv=4096,
+      D=128) **1.27× over the unfused two-pass** — the rotated-K memory
+      round-trip; both still pay the per-element libm cos/sin, so precomputing
+      per-position sin/cos tables is the next lever (would widen the gap), then a
+      hand-tuned AVX/VNNI inner loop. C++ (consistent with the existing
+      function-pointer flash-attn path), not asm.
+- [ ] **Remaining:** AMX dispatch (needs Sapphire Rapids — untestable on this
+      Zen4 box, deferred); RoPE sin/cos tables + AVX fused inner loop.
 
 ---
 
