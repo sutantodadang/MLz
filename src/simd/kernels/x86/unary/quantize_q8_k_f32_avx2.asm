@@ -163,28 +163,24 @@ simd_quantize_q8_k_f32_avx2:
     vpminsd ymm2, ymm2, ymm13
     vpminsd ymm3, ymm3, ymm13
 
-    ; --- pack 4 ymm int32 -> 1 ymm int8  (SSE pack on xmm, then combine) ---
-    ; ymm0: extract high 128, packdw with low 128 -> xmm with 8 int16
-    vextracti128 xmm8, ymm0, 1
-    vpackssdw xmm8, xmm0, xmm8               ; 8 int16 from ymm0
+    ; --- pack 4 ymm int32 -> 1 ymm int8 ---
+    ; CRITICAL: use only xmm7 as scratch and reuse ymm0..3. Do NOT touch the
+    ; constant/accumulator regs (ymm10/11/12/13/14) — ymm13 is the 127 clamp
+    ; read every batch; clobbering it over-saturates batches 2..8 to -128.
+    vextracti128 xmm7, ymm0, 1
+    vpackssdw xmm0, xmm0, xmm7               ; 8 int16 from ymm0 (zeroes upper)
+    vextracti128 xmm7, ymm1, 1
+    vpackssdw xmm1, xmm1, xmm7               ; 8 int16 from ymm1
+    vextracti128 xmm7, ymm2, 1
+    vpackssdw xmm2, xmm2, xmm7               ; 8 int16 from ymm2
+    vextracti128 xmm7, ymm3, 1
+    vpackssdw xmm3, xmm3, xmm7               ; 8 int16 from ymm3
 
-    vextracti128 xmm9, ymm1, 1
-    vpackssdw xmm9, xmm1, xmm9               ; 8 int16 from ymm1
+    vpacksswb xmm0, xmm0, xmm1               ; 16 int8 from ymm0+ymm1
+    vpacksswb xmm2, xmm2, xmm3               ; 16 int8 from ymm2+ymm3
+    vinserti128 ymm0, ymm0, xmm2, 1          ; 32 int8
 
-    vextracti128 xmm10, ymm2, 1
-    vpackssdw xmm10, xmm2, xmm10             ; 8 int16 from ymm2
-
-    vextracti128 xmm11, ymm3, 1
-    vpackssdw xmm11, xmm3, xmm11             ; 8 int16 from ymm3
-
-    ; int16 -> int8: combine pairs into 16-byte xmm registers
-    vpacksswb xmm12, xmm8, xmm9            ; 16 int8 from ymm0+ymm1
-    vpacksswb xmm13, xmm10, xmm11          ; 16 int8 from ymm2+ymm3
-
-    ; combine into 32 int8 in ymm
-    vinserti128 ymm14, ymm12, xmm13, 1  ; [xmm12 lo, xmm13 hi]
-
-    vmovdqu [rbx], ymm14
+    vmovdqu [rbx], ymm0
     add     rbx, 32
 
     dec     r11d

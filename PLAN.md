@@ -188,8 +188,8 @@ the actual compute and SIMD matters).
       — all pass across sizes on AVX2 + AVX-512.
 - [x] **New unary/vec kernels integrated + fixed** (layer_norm, quantize
       q8_0/q8_k, silu, rope_standard, vec_dot_f32; AVX2/AVX-512 + NEON). Wired
-      into `build.zig`; **11 of 12 x86 variants pass golden-vector correctness**
-      (test-simd pass=135, fail=0). Bugs fixed:
+      into `build.zig`; **all 12/12 x86 variants pass golden-vector correctness**
+      (test-simd pass=138, fail=0). Bugs fixed:
   - nasm assembly: 32-bit dest ← 64-bit `ARG_N`; `cmovg` immediate; bogus `_t`
     register suffix; vpermd rodata 32-byte alignment.
   - **silu** segfault — the scalar tail clamped the exponent through `eax`, which
@@ -202,12 +202,14 @@ the actual compute and SIMD matters).
     `vunpckhps` + `vinsertf128`.
   - **quantize_q8_0 avx512** — used the 14-bit `vrcp14ps` reciprocal for
     `127/amax` → off-by-one quant; switched to exact `vdivss`.
+  - **quantize_q8_k avx2** over-saturated batches 2..8 to -128: pass-2 pack
+    reused `ymm13` (the int32 `127` clamp) and `ymm10/11/12/14` (consts +
+    accumulators) as scratch, clobbering the clamp after the first batch. Not an
+    smax bug as first thought — rewrote pack to use only `xmm7` scratch + reuse
+    `ymm0..3`, leaving constants intact. Now passes all sizes.
   - Build gotcha found: zig caches nasm output by argv only, so editing a `.asm`
     does NOT re-assemble in some cases — clear `.zig-cache` to force it.
-- [ ] **Remaining:** `quantize_q8_k_f32 avx2` over-saturates some elements to
-      -128 (an `smax`/iscale extraction bug; the avx512 variant is correct). It
-      is the only skipped variant (`if (false)` in test-simd, documented inline).
-      Then: INT8 GEMM microkernels, AVX512-VNNI / AMX dispatch, fused
+- [ ] **Remaining:** INT8 GEMM microkernels, AVX512-VNNI / AMX dispatch, fused
       RoPE+attention.
 
 ---

@@ -398,10 +398,7 @@ pub fn main() !void {
     // -------------------------------------------------------------------------
     if (enable_new_kernels and builtin.cpu.arch == .x86_64) {
         const quant_k_sizes = [_]usize{ 256, 1024, 4096 };
-        // KNOWN ISSUE: quantize_q8_k_f32 avx2 over-saturates some elements to
-        // -128 (smax/iscale extraction bug). The avx512 variant is correct.
-        // Skipped until fixed.
-        if (false and have_avx2) {
+        if (have_avx2) {
             try runQuantizeKTest(allocator, "quantize_q8_k_f32 avx2", simd_quantize_q8_k_f32_avx2, &quant_k_sizes, &rng, &pass, &fail);
         }
         if (have_avx512) {
