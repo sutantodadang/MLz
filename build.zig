@@ -1284,6 +1284,19 @@ pub fn build(b: *std.Build) void {
             gemm_avx2_t_asm.addFileArg(b.path("src/simd/kernels/x86/vec/gemm_s8s8s32_avx2_tiled.asm"));
             ggml_lib.addObjectFile(gemm_avx2_t_obj);
 
+            // rope_row vectorised-sincos kernel (asm side of the asm-vs-intrinsics
+            // RoPE comparison; C++ intrinsic path in fused_rope_attn.cpp wins).
+            const rope_row_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const rope_row_obj = rope_row_asm.addOutputFileArg("rope_row_f32_avx2.o");
+            rope_row_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rope_row_f32_avx2.asm"));
+            ggml_lib.addObjectFile(rope_row_obj);
+
             if (!no_avx512) {
                 const gemm_vnni_asm = b.addSystemCommand(&[_][]const u8{
                     "nasm",

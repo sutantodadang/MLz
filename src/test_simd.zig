@@ -69,6 +69,9 @@ extern "c" fn simd_gemm_s8s8s32(M: c_int, N: c_int, K: c_int, A: [*]const i8, B:
 
 // Fused RoPE + attention (f32, single head)
 extern "c" fn simd_fused_rope_attn_f32(n_q: c_int, n_kv: c_int, D: c_int, Q: [*]const f32, K: [*]const f32, V: [*]const f32, qpos: [*]const c_int, kpos: [*]const c_int, scale: f32, base: f32, causal: c_int, O: [*]f32) void;
+// Vectorised-sincos RoPE row: asm vs C++ intrinsics (compared for the same poly)
+extern "c" fn simd_rope_row_avx2(half: c_int, pos: c_int, freq: [*]const f32, x: [*]const f32, out: [*]f32) void;
+extern "c" fn simd_rope_row_cpp(half: c_int, pos: c_int, freq: [*]const f32, x: [*]const f32, out: [*]f32) void;
 
 // -----------------------------------------------------------------------------
 // ggml reference quantize/dequantize (canonical, scalar)
@@ -501,6 +504,13 @@ pub fn main() !void {
     // -------------------------------------------------------------------------
     try runFusedRopeAttnTest(allocator, &rng, &pass, &fail);
 
+    // Vectorised-sincos RoPE row: both the asm and the C++ intrinsic variant
+    // must match the scalar libm reference (poly approximation, ~1e-5 tol).
+    if (builtin.cpu.arch == .x86_64 and have_avx2) {
+        try runRopeRowTest(allocator, "rope_row asm", simd_rope_row_avx2, &rng, &pass, &fail);
+        try runRopeRowTest(allocator, "rope_row cpp", simd_rope_row_cpp, &rng, &pass, &fail);
+    }
+
     std.debug.print("\n=== SUMMARY: pass={d} fail={d} kernel-skipped={d} ===\n", .{ pass, fail, skip });
     if (fail > 0) std.process.exit(1);
 }
@@ -653,6 +663,46 @@ fn runFusedRopeAttnTest(allocator: std.mem.Allocator, rng: *std.Random.DefaultPr
             pass.* += 1;
         } else {
             std.debug.print(" {d}x{d}x{d}:FAIL(err={e})", .{ NQ, NKV, D, maxerr });
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+const RopeRowFn = *const fn (half: c_int, pos: c_int, freq: [*]const f32, x: [*]const f32, out: [*]f32) callconv(.c) void;
+
+fn runRopeRowTest(allocator: std.mem.Allocator, name: []const u8, fp: RopeRowFn, rng: *std.Random.DefaultPrng, pass: *usize, fail: *usize) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    const Ds = [_]usize{ 64, 128, 256 };
+    const positions = [_]i32{ 0, 1, 37, 512, 4095 };
+    const base: f32 = 10000.0;
+    for (Ds) |D| {
+        const half = D / 2;
+        const freq = try allocator.alloc(f32, half);
+        defer allocator.free(freq);
+        for (0..half) |i| freq[i] = std.math.pow(f32, base, -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(D)));
+        const x = try allocator.alloc(f32, D);
+        defer allocator.free(x);
+        const out = try allocator.alloc(f32, D);
+        defer allocator.free(out);
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 2;
+        var worst: f32 = 0;
+        for (positions) |pos| {
+            fp(@intCast(half), pos, freq.ptr, x.ptr, out.ptr);
+            for (0..half) |i| {
+                const th = @as(f32, @floatFromInt(pos)) * freq[i];
+                const c = @cos(th);
+                const s = @sin(th);
+                worst = @max(worst, @abs(out[2 * i] - (x[2 * i] * c - x[2 * i + 1] * s)));
+                worst = @max(worst, @abs(out[2 * i + 1] - (x[2 * i] * s + x[2 * i + 1] * c)));
+            }
+        }
+        if (worst < 1e-4) {
+            std.debug.print(" D={d}:ok", .{D});
+            pass.* += 1;
+        } else {
+            std.debug.print(" D={d}:FAIL(err={e})", .{ D, worst });
             fail.* += 1;
         }
     }

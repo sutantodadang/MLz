@@ -255,14 +255,24 @@ the actual compute and SIMD matters).
       **prefill 2.5× (n_q=32) – 3.5× (n_q=128)**. Decode stays rotation-libm-
       bound; a vectorised sin/cos approximation (with mod-2π range reduction) is
       the remaining lever there. Why not asm: see the asm note below.
-- [ ] **Decision — asm vs C++ for RoPE+attention:** kept in C++ with AVX2
-      intrinsics, not monolithic `.asm`. The online-softmax needs `exp` +
-      running-max control flow; hand-coding that in `.asm` is high-risk for
-      little gain (same reason `flash_attn_quantized` is C++). The pure-data GEMM
-      kernels stay `.asm`. The remaining asm-worthy piece is a vectorised
-      sin/cos, which can be intrinsics too.
+- [x] **Vectorised sin/cos for decode RoPE — asm vs C++, measured.** Decode was
+      rotation-libm-bound; replaced the per-element `cosf/sinf` with a Cephes
+      single-precision polynomial sin/cos (Pommier `sincos_ps`), 8 angles/instr,
+      computed in BOTH a C++ AVX2-intrinsic path (`fra_rope_row_vec` /
+      `simd_rope_row_cpp`) and a hand-written NASM kernel
+      (`simd_rope_row_avx2`). Both match the scalar libm reference to ~1e-7
+      (test-simd pass=180 fail=0). Decode (n_q=1, n_kv=4096, D=128) is now
+      **~32× over the scalar baseline**.
+  - **Head-to-head (rotate 4096×64 pairs ×4000): C++ intrinsics 1385 Mpair/s vs
+    asm 1118 Mpair/s — intrinsics 1.24× faster.** The poly needs ~11 constants;
+    the compiler keeps them in registers and schedules across iterations, while
+    the asm re-broadcasts them from `.rodata` each use (too few ymm to cache them
+    alongside the ~10 live sincos temps), and there is no control-flow edge for
+    asm here. So the **C++ intrinsic path is the dispatch path**; the asm kernel
+    is kept only as the reproducible comparison. Confirms the earlier call: keep
+    RoPE+attention in C++ intrinsics, `.asm` for pure-data GEMM only.
 - [ ] **Remaining:** AMX dispatch (needs Sapphire Rapids — untestable on this
-      Zen4 box, deferred); vectorised sin/cos for decode RoPE.
+      Zen4 box, deferred).
 
 ---
 
