@@ -1,0 +1,37 @@
+name: SIMD
+
+# Gate the custom SIMD kernels on every push/PR: assemble + link, run the
+# golden-vector correctness tests vs scalar references, and a bench liveness
+# smoke (every kernel produces a finite, non-zero metric). Runs on Windows
+# because the kernels are assembled with the Win64 ABI (-DWINDOWS in build.zig).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  simd:
+    name: SIMD kernels (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install NASM
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: SIMD correctness (golden-vector vs scalar)
+        run: zig build test-simd -Dsimd-backend=true
+
+      - name: SIMD bench liveness smoke
+        run: python tools/bench_gate.py --smoke
+
+      # Regression gating against bench/baseline.json is intentionally NOT run
+      # here: absolute GFLOPS vary per CI runner. Run `python tools/bench_gate.py`
+      # (and `--update`) on consistent hardware to catch perf regressions.

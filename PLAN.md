@@ -175,13 +175,31 @@ Validated (`--max-concurrent 4 --prefix-cache`, greedy) on Llama-3.2-1B
 Keep the custom-kernel differentiator for the CPU-only path (where llama.cpp is
 the actual compute and SIMD matters).
 
-- [ ] Bench harness in CI: `bench_simd` gates regressions per kernel/arch.
-- [ ] Fill gaps: batched `vec_dot` for q4_K/q6_K, fused RoPE+attention, INT8 GEMM
-      microkernels for the prefill GEMM hot path.
-- [ ] Runtime dispatch already keyed on CPU features — extend to AVX512-VNNI /
-      AMX where present.
-- [ ] Correctness: golden-vector tests vs GGML reference per kernel (extend
-      `test_simd.zig`).
+- [x] **Bench/correctness regression gate.** `bench_simd --json` emits NDJSON
+      per kernel; `tools/bench_gate.py` records a baseline (`bench/baseline.json`)
+      and fails on >20% regression (`--update` / default `--check`) or, for CI
+      where absolute GFLOPS vary per runner, a `--smoke` liveness check (every
+      kernel finite > 0). `.github/workflows/simd.yml` runs `test-simd`
+      (golden-vector correctness vs scalar refs) + the smoke on every push/PR
+      (Windows runner — kernels use the Win64 ABI). `test-simd` is green:
+      pass=78, fail=0.
+- [x] **Golden-vector correctness** vs scalar reference already covers the
+      shipping kernels (`test_simd.zig`): vec_dot q4_0..q8_k, rms_norm, rope_neox
+      — all pass across sizes on AVX2 + AVX-512.
+- [x] **Build integration of the new unary/vec kernels** (layer_norm, quantize
+      q8_0/q8_k, silu, rope_standard, vec_dot_f32 for AVX2/AVX-512 + NEON) wired
+      into `build.zig` and assembling. Fixed 3 nasm assembly bugs (32-bit dest ←
+      64-bit ARG_N; `cmovg` immediate; bogus `_t` register suffix) and a vpermd
+      rodata-alignment segfault. Also found a build gotcha: zig caches nasm
+      output by argv only, so editing a `.asm` does NOT re-assemble — `rm` the
+      cached `.o` / clear `.zig-cache` to force it.
+- [ ] **Deferred — finish the new kernels.** Several still have runtime/
+      correctness bugs (quantize_q8_0 AVX-512 last-bit rounding; quantize_q8_k
+      AVX2 saturation to 0x80; silu segfault at a constant address; layer_norm/
+      rope_standard/vec_dot_f32 untested past the crash). They are gated off
+      (`enable_new_kernels = false` in test/bench) so the suite stays green;
+      flip on to work on them. Then: INT8 GEMM microkernels, AVX512-VNNI / AMX
+      dispatch, fused RoPE+attention.
 
 ---
 

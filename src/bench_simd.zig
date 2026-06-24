@@ -1,5 +1,18 @@
 const std = @import("std");
 
+/// When true (--json), each kernel emits one NDJSON line instead of a table row,
+/// and the human-readable headers are suppressed. Consumed by tools/bench_gate.py.
+var json_mode: bool = false;
+
+/// Emit one kernel result: NDJSON in --json mode, otherwise a table row.
+fn report(name: []const u8, sec: f64, metric: f64) void {
+    if (json_mode) {
+        std.debug.print("{{\"kernel\":\"{s}\",\"metric\":{d:.4}}}\n", .{ name, metric });
+    } else {
+        std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, metric });
+    }
+}
+
 // vec_dot kernels (x86_64 AVX2 + AVX-512)
 extern "c" fn simd_vec_dot_q4_0_q8_0_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q4_0_q8_0_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
@@ -70,6 +83,14 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
+    {
+        const args = try std.process.argsAlloc(allocator);
+        defer std.process.argsFree(allocator, args);
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--json")) json_mode = true;
+        }
+    }
+
     // Align to 64 bytes for AVX-512
     const alignment = comptime std.mem.Alignment.fromByteUnits(64);
 
@@ -121,10 +142,12 @@ pub fn main() !void {
     const iterations = 100_000;
     var res: f32 = 0;
 
-    std.debug.print("=== MLz SIMD Baseline Bench (PLAN-ASSEMBLY-REWRITE Step 2) ===\n", .{});
-    std.debug.print("N={d}  iterations={d}\n\n", .{ N, iterations });
-    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GFLOPS" });
-    std.debug.print("{s:-<56}\n", .{""});
+    if (!json_mode) {
+        std.debug.print("=== MLz SIMD Baseline Bench (PLAN-ASSEMBLY-REWRITE Step 2) ===\n", .{});
+        std.debug.print("N={d}  iterations={d}\n\n", .{ N, iterations });
+        std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GFLOPS" });
+        std.debug.print("{s:-<56}\n", .{""});
+    }
 
     // ------- vec_dot benchmarks -------
     // Warmup
@@ -163,9 +186,11 @@ pub fn main() !void {
     run_vec_dot("Q8_K x Q8_K (AVX-512)", simd_vec_dot_q8_k_q8_k_avx512, N, vx_q8_k.ptr, vy_q8_k.ptr, iterations);
 
     // ------- unary benchmarks -------
-    std.debug.print("\n--- Unary (Opt-in, env-gated) ---\n", .{});
-    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
-    std.debug.print("{s:-<56}\n", .{""});
+    if (!json_mode) {
+        std.debug.print("\n--- Unary (Opt-in, env-gated) ---\n", .{});
+        std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
+        std.debug.print("{s:-<56}\n", .{""});
+    }
 
     const eps: f32 = 1e-5;
     const rope_iterations = 50_000;
@@ -179,10 +204,14 @@ pub fn main() !void {
     run_rope("rope_neox_f32 (AVX2)", simd_rope_neox_f32_avx2, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
     run_rope("rope_neox_f32 (AVX-512)", simd_rope_neox_f32_avx512, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
 
-    // ------- new kernel benchmarks -------
-    std.debug.print("\n--- New Kernels ---\n", .{});
-    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
-    std.debug.print("{s:-<56}\n", .{""});
+    // ------- new kernel benchmarks (WIP, gated off — see PLAN Phase 3) -------
+    const enable_new_kernels = false;
+    if (enable_new_kernels) {
+        if (!json_mode) {
+            std.debug.print("\n--- New Kernels ---\n", .{});
+        std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
+        std.debug.print("{s:-<56}\n", .{""});
+    }
 
     // quantize_q8_0_f32
     run_quantize("quantize_q8_0_f32 (AVX2)", simd_quantize_q8_0_f32_avx2, N, @ptrCast(x_quant.ptr), @ptrCast(y_quant_q8_0.ptr), iterations);
@@ -207,6 +236,7 @@ pub fn main() !void {
     // vec_dot_f32_f32
     run_vec_dot("vec_dot_f32_f32 (AVX2)", simd_vec_dot_f32_f32_avx2, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
     run_vec_dot("vec_dot_f32_f32 (AVX-512)", simd_vec_dot_f32_f32_avx512, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+    } // end enable_new_kernels
 
     // Prevent optimizer from eliminating unused result
     std.process.cleanExit();
@@ -223,7 +253,7 @@ fn run_vec_dot(name: []const u8, kernel: anytype, N: usize, vx: ?*const anyopaqu
     // vec_dot: 2*N - 1 FLOPS per call (N muls + N-1 adds)
     const flops = @as(f64, @floatFromInt(2 * N - 1)) * @as(f64, @floatFromInt(iter));
     const gflops = flops / sec / 1e9;
-    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gflops });
+    report(name, sec, gflops);
 }
 
 fn run_rms_norm(name: []const u8, kernel: anytype, n: usize, eps: f32, x: ?*const f32, y: ?*f32, iter: usize) void {
@@ -238,7 +268,7 @@ fn run_rms_norm(name: []const u8, kernel: anytype, n: usize, eps: f32, x: ?*cons
     // rms_norm: ~2*N ops (N squares, reduce add, N mults by 1/rms)
     const ops = @as(f64, @floatFromInt(2 * n)) * @as(f64, @floatFromInt(iter));
     const gops = ops / sec / 1e9;
-    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+    report(name, sec, gops);
 }
 
 fn run_rope(name: []const u8, kernel: anytype, n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32, iter: usize) void {
@@ -253,7 +283,7 @@ fn run_rope(name: []const u8, kernel: anytype, n_pairs: i64, cache: ?*const f32,
     // rope_neox: 6 FLOPS per pair (4 muls + 2 adds per complex rotation)
     const ops = @as(f64, @floatFromInt(6 * @as(usize, @intCast(n_pairs)))) * @as(f64, @floatFromInt(iter));
     const gops = ops / sec / 1e9;
-    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+    report(name, sec, gops);
 }
 
 fn run_quantize(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: ?*anyopaque, iter: usize) void {
@@ -268,7 +298,7 @@ fn run_quantize(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: 
     // quantize: ~4*N ops (abs max scan, scale compute, N quantizations)
     const ops = @as(f64, @floatFromInt(4 * n)) * @as(f64, @floatFromInt(iter));
     const gops = ops / sec / 1e9;
-    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+    report(name, sec, gops);
 }
 
 fn run_unary(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: ?*f32, iter: usize) void {
@@ -283,5 +313,5 @@ fn run_unary(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: ?*f
     // unary: ~3*N ops (exp, add, div or similar per element)
     const ops = @as(f64, @floatFromInt(3 * n)) * @as(f64, @floatFromInt(iter));
     const gops = ops / sec / 1e9;
-    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+    report(name, sec, gops);
 }

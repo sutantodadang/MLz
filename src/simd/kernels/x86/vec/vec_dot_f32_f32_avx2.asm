@@ -58,7 +58,7 @@ simd_vec_dot_f32_f32_avx2:
     vmovdqu [rsp+128], xmm14
     vmovdqu [rsp+144], xmm15
 
-    mov     r10d, ARG_N
+    mov     r10, ARG_N
     mov     r11, ARG_X
     mov     r12, ARG_Y
     mov     r13, ARG_R            ; output pointer

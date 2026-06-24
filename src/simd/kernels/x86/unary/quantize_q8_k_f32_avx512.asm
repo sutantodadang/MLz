@@ -107,8 +107,8 @@ simd_quantize_q8_k_f32_avx512:
     je      .zero_block
 
     ; --- find lane index (0..15) holding global amax ---
-    vbroadcastss zmm13_t, xmm8
-    vcmpps  k1, zmm15, zmm13_t, 0           ; EQ mask (16 bits)
+    vbroadcastss zmm13, xmm8
+    vcmpps  k1, zmm15, zmm13, 0           ; EQ mask (16 bits)
     kmovw   eax, k1
     tzcnt   eax, eax                         ; first matching lane
 

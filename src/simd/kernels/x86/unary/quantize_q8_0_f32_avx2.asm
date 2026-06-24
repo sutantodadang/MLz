@@ -53,6 +53,7 @@ q8_sign_mask:
     dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
 q8_const_127:
     dd 0x42FE0000                     ; 127.0f
+align 32                              ; vpermd mask is loaded with vmovaps (needs 32B align)
 q8_perm_mask:
     dd 0, 4, 1, 5, 2, 6, 3, 7        ; vpermd dword shuffle
 

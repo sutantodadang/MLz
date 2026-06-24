@@ -1101,6 +1101,162 @@ pub fn build(b: *std.Build) void {
                 ggml_lib.addObjectFile(rope_avx512_obj);
             }
 
+            // layer_norm_f32 (Phase 3 kernel expansion)
+            const ln_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const ln_avx2_obj = ln_avx2_asm.addOutputFileArg("layer_norm_f32_avx2.o");
+            ln_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/layer_norm_f32_avx2.asm"));
+            ggml_lib.addObjectFile(ln_avx2_obj);
+
+            if (!no_avx512) {
+                const ln_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const ln_avx512_obj = ln_avx512_asm.addOutputFileArg("layer_norm_f32_avx512.o");
+                ln_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/layer_norm_f32_avx512.asm"));
+                ggml_lib.addObjectFile(ln_avx512_obj);
+            }
+
+            // quantize_q8_0_f32 (Phase 3 kernel expansion)
+            const qz80_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const qz80_avx2_obj = qz80_avx2_asm.addOutputFileArg("quantize_q8_0_f32_avx2.o");
+            qz80_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/quantize_q8_0_f32_avx2.asm"));
+            ggml_lib.addObjectFile(qz80_avx2_obj);
+
+            if (!no_avx512) {
+                const qz80_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const qz80_avx512_obj = qz80_avx512_asm.addOutputFileArg("quantize_q8_0_f32_avx512.o");
+                qz80_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/quantize_q8_0_f32_avx512.asm"));
+                ggml_lib.addObjectFile(qz80_avx512_obj);
+            }
+
+            // quantize_q8_k_f32 (Phase 3 kernel expansion)
+            const qz8k_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const qz8k_avx2_obj = qz8k_avx2_asm.addOutputFileArg("quantize_q8_k_f32_avx2.o");
+            qz8k_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/quantize_q8_k_f32_avx2.asm"));
+            ggml_lib.addObjectFile(qz8k_avx2_obj);
+
+            if (!no_avx512) {
+                const qz8k_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const qz8k_avx512_obj = qz8k_avx512_asm.addOutputFileArg("quantize_q8_k_f32_avx512.o");
+                qz8k_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/quantize_q8_k_f32_avx512.asm"));
+                ggml_lib.addObjectFile(qz8k_avx512_obj);
+            }
+
+            // rope_standard_f32 (Phase 3 kernel expansion)
+            const rstd_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const rstd_avx2_obj = rstd_avx2_asm.addOutputFileArg("rope_standard_f32_avx2.o");
+            rstd_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rope_standard_f32_avx2.asm"));
+            ggml_lib.addObjectFile(rstd_avx2_obj);
+
+            if (!no_avx512) {
+                const rstd_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const rstd_avx512_obj = rstd_avx512_asm.addOutputFileArg("rope_standard_f32_avx512.o");
+                rstd_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/rope_standard_f32_avx512.asm"));
+                ggml_lib.addObjectFile(rstd_avx512_obj);
+            }
+
+            // silu_f32 (Phase 3 kernel expansion)
+            const silu_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const silu_avx2_obj = silu_avx2_asm.addOutputFileArg("silu_f32_avx2.o");
+            silu_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/unary/silu_f32_avx2.asm"));
+            ggml_lib.addObjectFile(silu_avx2_obj);
+
+            if (!no_avx512) {
+                const silu_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const silu_avx512_obj = silu_avx512_asm.addOutputFileArg("silu_f32_avx512.o");
+                silu_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/unary/silu_f32_avx512.asm"));
+                ggml_lib.addObjectFile(silu_avx512_obj);
+            }
+
+            // vec_dot_f32_f32 (Phase 3 kernel expansion)
+            const vdf_avx2_asm = b.addSystemCommand(&[_][]const u8{
+                "nasm",
+                "-f",
+                nasm_format,
+                "-DWINDOWS",
+                "-o",
+            });
+            const vdf_avx2_obj = vdf_avx2_asm.addOutputFileArg("vec_dot_f32_f32_avx2.o");
+            vdf_avx2_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_f32_f32_avx2.asm"));
+            ggml_lib.addObjectFile(vdf_avx2_obj);
+
+            if (!no_avx512) {
+                const vdf_avx512_asm = b.addSystemCommand(&[_][]const u8{
+                    "nasm",
+                    "-f",
+                    nasm_format,
+                    "-DWINDOWS",
+                    "-DAVX512_ENABLED",
+                    "-o",
+                });
+                const vdf_avx512_obj = vdf_avx512_asm.addOutputFileArg("vec_dot_f32_f32_avx512.o");
+                vdf_avx512_asm.addFileArg(b.path("src/simd/kernels/x86/vec/vec_dot_f32_f32_avx512.asm"));
+                ggml_lib.addObjectFile(vdf_avx512_obj);
+            }
+
             const q8_k_asm = b.addSystemCommand(&[_][]const u8{
                 "nasm",
                 "-f",
@@ -1344,6 +1500,12 @@ pub fn build(b: *std.Build) void {
                 // Unary ops (opt-in env-gated hooks)
                 "src/simd/kernels/aarch64/unary/rms_norm_f32_neon.S",
                 "src/simd/kernels/aarch64/unary/rope_neox_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/layer_norm_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/quantize_q8_0_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/quantize_q8_k_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/rope_standard_f32_neon.S",
+                "src/simd/kernels/aarch64/unary/silu_f32_neon.S",
+                "src/simd/kernels/aarch64/vec/vec_dot_f32_f32_neon.S",
                 // Matrix multiplication kernel
                 "src/simd/kernels/aarch64/matrix_mult_neon.S",
             };

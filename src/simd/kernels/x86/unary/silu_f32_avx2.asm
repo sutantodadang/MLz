@@ -66,7 +66,7 @@ simd_silu_f32_avx2:
     vmovdqu [rsp+144], xmm15
 
     ; Save args; early-out if n == 0
-    mov     r12d, ARG_N
+    mov     r12, ARG_N
     mov     r13, ARG_X
     mov     r14, ARG_Y
     test    r12d, r12d
@@ -95,13 +95,12 @@ simd_silu_f32_avx2:
     vbroadcastss  ymm15, [rel .const_poly_c4]
 
     ; --- Main vector loop (8 floats / iter) -----------------------------------
+    mov     rax, r13                ; src ptr (set before the n<8 branch so the
+    mov     rdx, r14                ; dst ptr  tail loop has valid pointers)
     mov     ebx, r12d
     shr     ebx, 3                  ; ebx = n / 8
     test    ebx, ebx
     jz      .tail_check
-
-    mov     rax, r13                ; src ptr
-    mov     rdx, r14                ; dst ptr
     align 32
 
 .vec_loop:
@@ -174,7 +173,8 @@ simd_silu_f32_avx2:
     cmp     r15d, eax
     cmovl   r15d, eax               ; clamp lo: max(0, n+127)
     cmp     r15d, 254
-    cmovg   r15d, 254               ; clamp hi: min(254, ...)
+    mov     eax, 254
+    cmovg   r15d, eax               ; clamp hi: min(254, ...)
     shl     r15d, 23                ; construct float bit pattern
     vmovd   xmm5, r15d              ; xmm5 = 2^n
 

@@ -62,7 +62,7 @@ simd_silu_f32_avx512:
     vmovdqu [rsp+128], xmm14
     vmovdqu [rsp+144], xmm15
 
-    mov     r12d, ARG_N
+    mov     r12, ARG_N
     mov     r13, ARG_X
     mov     r14, ARG_Y
     test    r12d, r12d
@@ -81,13 +81,12 @@ simd_silu_f32_avx512:
     vbroadcastss  zmm29, [rel .const_poly_c4]
 
     ; --- Main vector loop (16 floats / iter) ----------------------------------
+    mov     rax, r13                ; src/dst set before the n<16 branch so the
+    mov     rdx, r14                ; tail loop has valid pointers
     mov     ebx, r12d
     shr     ebx, 4                  ; ebx = n / 16
     test    ebx, ebx
     jz      .tail_check
-
-    mov     rax, r13
-    mov     rdx, r14
     align 64
 
 .vec_loop:
@@ -154,7 +153,8 @@ simd_silu_f32_avx512:
     cmp     r15d, eax
     cmovl   r15d, eax               ; clamp lo
     cmp     r15d, 254
-    cmovg   r15d, 254               ; clamp hi
+    mov     eax, 254
+    cmovg   r15d, eax               ; clamp hi
     shl     r15d, 23
     vmovd   xmm5, r15d
 

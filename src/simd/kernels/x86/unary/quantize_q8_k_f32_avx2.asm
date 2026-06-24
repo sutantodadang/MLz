@@ -115,8 +115,8 @@ simd_quantize_q8_k_f32_avx2:
     je      .zero_block
 
     ; --- find which lane (0..7) holds the global amax ---
-    vbroadcastss ymm13_t, xmm8
-    vcmpps  ymm15, ymm15, ymm13_t, 0        ; EQ: which lanes match global amax?
+    vbroadcastss ymm13, xmm8
+    vcmpps  ymm15, ymm15, ymm13, 0        ; EQ: which lanes match global amax?
     vmovmskps eax, ymm15
     tzcnt   eax, eax                         ; first matching lane (0-7)
 
@@ -177,13 +177,13 @@ simd_quantize_q8_k_f32_avx2:
     vpackssdw xmm11, xmm3, xmm11             ; 8 int16 from ymm3
 
     ; int16 -> int8: combine pairs into 16-byte xmm registers
-    vpacksswb xmm12_t, xmm8, xmm9            ; 16 int8 from ymm0+ymm1
-    vpacksswb xmm13_t, xmm10, xmm11          ; 16 int8 from ymm2+ymm3
+    vpacksswb xmm12, xmm8, xmm9            ; 16 int8 from ymm0+ymm1
+    vpacksswb xmm13, xmm10, xmm11          ; 16 int8 from ymm2+ymm3
 
     ; combine into 32 int8 in ymm
-    vinserti128 ymm14_t, ymm12_t, xmm13_t, 1  ; [xmm12_t lo, xmm13_t hi]
+    vinserti128 ymm14, ymm12, xmm13, 1  ; [xmm12 lo, xmm13 hi]
 
-    vmovdqu [rbx], ymm14_t
+    vmovdqu [rbx], ymm14
     add     rbx, 32
 
     dec     r11d
