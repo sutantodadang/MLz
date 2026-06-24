@@ -72,6 +72,11 @@ const Slot = struct {
     n_decoded: usize = 0,
     /// Last sampled token, fed at the next decode step.
     last_token: llama.Token = 0,
+    /// Prompt tokens whose KV currently occupies this slot at positions
+    /// [0, len) — the prefix of the previous request served here. Lets a new
+    /// request that shares a prefix (e.g. same system prompt) skip re-prefilling
+    /// it. Owner-thread-only.
+    cached: std.ArrayList(llama.Token) = .empty,
 };
 
 pub const Scheduler = struct {
@@ -135,6 +140,7 @@ pub const Scheduler = struct {
         if (self.thread) |t| t.join();
         self.batch.deinit();
         self.queue.deinit(self.allocator);
+        for (self.slots) |*slot| slot.cached.deinit(self.allocator);
         self.allocator.free(self.sample_idx);
         self.allocator.free(self.slots);
         self.allocator.destroy(self);
@@ -157,11 +163,32 @@ pub const Scheduler = struct {
                 if (slot.state != .idle) continue;
                 if (self.queue.items.len == 0) break;
                 const req = self.queue.orderedRemove(0);
-                _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+
+                // Prefix reuse against this slot's own retained KV. Keep the
+                // longest common prefix, trim the divergent tail with seq_rm,
+                // prefill only the suffix. Cap at prompt.len-1 so at least one
+                // prompt token is decoded this step to produce logits.
+                const shared = lcp(req.prompt_tokens, slot.cached.items);
+                var start = if (shared >= req.prompt_tokens.len)
+                    req.prompt_tokens.len - 1
+                else
+                    shared;
+                if (start < slot.cached.items.len) {
+                    // Drop KV cells at positions >= start (prior suffix + any
+                    // generated tokens). seq_rm returns false when the backend
+                    // can't partially remove (e.g. recurrent/SSM caches) — fall
+                    // back to a full clear and re-prefill from scratch.
+                    if (start == 0 or !self.ctx.kvCacheSeqRm(slot.seq_id, @intCast(start), -1)) {
+                        _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
+                        start = 0;
+                    }
+                }
+                // else start == cached.len: all cached KV is a valid prefix, keep it.
+
                 slot.req = req;
                 slot.state = .prefill;
-                slot.prefill_pos = 0;
-                slot.n_past = 0;
+                slot.prefill_pos = start;
+                slot.n_past = start;
                 slot.n_decoded = 0;
             }
             var active: usize = 0;
@@ -243,8 +270,14 @@ pub const Scheduler = struct {
                 // The token fed this step is now committed to KV.
                 slot.n_past += 1;
             } else {
-                // Prefill just finished; n_past already == prompt length.
+                // Prefill just finished; n_past == prompt length and the slot's
+                // KV[0, prompt.len) is exactly the prompt. Record it so the next
+                // request on this slot can reuse the shared prefix. (Generated
+                // tokens get appended after; the next admit's seq_rm trims them.)
                 slot.state = .decode;
+                slot.cached.clearRetainingCapacity();
+                slot.cached.appendSlice(self.allocator, req.prompt_tokens) catch
+                    slot.cached.clearRetainingCapacity();
             }
 
             if (llama.c.llama_vocab_is_eog(self.vocab, tok)) {
@@ -297,3 +330,19 @@ pub const Scheduler = struct {
         }
     }
 };
+
+/// Length of the longest common prefix of two token slices.
+fn lcp(a: []const llama.Token, b: []const llama.Token) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+test "lcp" {
+    const T = llama.Token;
+    try std.testing.expectEqual(@as(usize, 3), lcp(&[_]T{ 1, 2, 3, 4 }, &[_]T{ 1, 2, 3, 9 }));
+    try std.testing.expectEqual(@as(usize, 0), lcp(&[_]T{ 5, 2 }, &[_]T{ 1, 2 }));
+    try std.testing.expectEqual(@as(usize, 2), lcp(&[_]T{ 1, 2 }, &[_]T{ 1, 2, 3 }));
+    try std.testing.expectEqual(@as(usize, 0), lcp(&[_]T{}, &[_]T{1}));
+}

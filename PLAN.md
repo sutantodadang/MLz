@@ -103,15 +103,29 @@ vLLM/SGLang on the same hardware.
 - [x] **Chunked prefill** (budget split: decode tokens first, then prefill
       chunks fill the rest).
 - [x] Backpressure: bounded queue (`n_seq_max * 4`), `error.QueueFull` when full.
-- [ ] **Deferred:** prefix cache + speculative decoding in the batched path
-      (single-stream keeps both); proper criterion-style throughput benchmark in
-      CI (Phase 3). Slow-client head-of-line blocking (owner thread does socket
-      I/O) — upgrade to per-slot writer threads if it bites.
+- [x] **Per-slot prefix cache**: each slot retains its last prompt's KV;
+      a new request reuses the longest common prefix and `seq_rm`-trims the
+      divergent tail (graceful full-clear fallback when the backend can't
+      partially remove, e.g. recurrent/SSM caches — never crashes).
+- [x] **Reliable benchmark** (`bench/bench_serve.py`, stdlib threads):
+      sequential vs concurrent tok/s + the prefix-cache A/B.
+- [ ] **Deferred:** speculative decoding in the batched path (single-stream
+      keeps it); shared cross-slot prefix tree (RadixAttention, Phase 2 — ranged
+      `seq_cp` is rejected by recurrent KV caches in this llama build); CI gating
+      of the benchmark (Phase 3). Slow-client head-of-line blocking (owner thread
+      does socket I/O) — upgrade to per-slot writer threads if it bites.
 
-Validated end-to-end (gemma-3-4b Q6_K, `--max-concurrent 4`): 6 concurrent
-requests → 6 correct distinct answers with 2 queued past the 4 slots; no
-crash/deadlock/leak. Also fixed a pre-existing `openai.writeJson` bug (adapter
-buffer never flushed → empty HTTP bodies) found during validation.
+Validated end-to-end (gemma-3-4b Q6_K, `--max-concurrent 4`):
+- correctness: 6 concurrent → 6 correct distinct answers, 2 queued past 4 slots;
+  no crash/deadlock/leak.
+- **throughput: 3.16x** (9.9 → 31.3 tok/s, 4 slots) via `bench_serve.py`.
+- **prefix cache: 10.8x** warm-cache p50 latency drop (9584 → 887 ms) with a
+  long shared prefix.
+
+Two pre-existing server bugs fixed while validating: (1) `openai.writeJson` never
+flushed the `adaptToNewApi` adapter → every HTTP body/SSE chunk came out empty;
+(2) `readHttpRequest` held method/path/header slices into a buffer that the body
+read reallocated → any request whose body spanned multiple `recv()`s 404'd.
 
 ---
 

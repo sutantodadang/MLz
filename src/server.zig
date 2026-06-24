@@ -643,10 +643,47 @@ fn readHttpRequest(
     }
 
     const header_end = std.mem.indexOf(u8, scratch.items, "\r\n\r\n").? + 4;
-    const header_bytes = scratch.items[0..header_end];
     const body_start = header_end;
 
-    // Parse request line + headers.
+    // Determine body length from Content-Length first, WITHOUT retaining any
+    // slice into `scratch`. The body read below may reallocate `scratch`, so we
+    // must not hold pointers into it across that growth.
+    var body_len: usize = 0;
+    {
+        const hb = scratch.items[0..header_end];
+        var lit = std.mem.splitSequence(u8, hb, "\r\n");
+        _ = lit.next(); // request line
+        while (lit.next()) |line| {
+            if (line.len == 0) break;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                body_len = std.fmt.parseInt(usize, v, 10) catch return error.BadRequest;
+                break;
+            }
+        }
+    }
+    if (body_len > max_body_bytes) return error.BodyTooLarge;
+
+    // Reserve the full request size up front so appending the body never
+    // reallocates `scratch`. Otherwise the method/path/header-value slices taken
+    // below would dangle once the buffer grows — a real bug: any request whose
+    // body spanned multiple recv() calls reallocated `scratch` and 404'd because
+    // the parsed path pointed at freed memory.
+    try scratch.ensureTotalCapacity(allocator, body_start + body_len);
+
+    var have: usize = scratch.items.len - body_start;
+    while (have < body_len) {
+        var tmp2: [4096]u8 = undefined;
+        const n2 = try std.posix.recv(stream.handle, &tmp2, 0);
+        if (n2 == 0) return error.UnexpectedEof;
+        try scratch.appendSlice(allocator, tmp2[0..n2]);
+        have = scratch.items.len - body_start;
+    }
+
+    // `scratch` no longer grows — slices into it are now stable.
+    const header_bytes = scratch.items[0..header_end];
     var lines_it = std.mem.splitSequence(u8, header_bytes, "\r\n");
     const req_line = lines_it.next() orelse return error.BadRequest;
 
@@ -672,26 +709,6 @@ fn readHttpRequest(
         for (name, 0..) |cch, i| name_lc[i] = std.ascii.toLower(cch);
 
         try headers_list.append(allocator, .{ .name_lc = name_lc, .value = value });
-    }
-
-    // Read body if present.
-    const content_length_str = headerValue(headers_list.items, "content-length");
-    var body_len: usize = 0;
-    if (content_length_str) |s| {
-        body_len = std.fmt.parseInt(usize, s, 10) catch return error.BadRequest;
-    } else {
-        body_len = 0;
-    }
-
-    if (body_len > max_body_bytes) return error.BodyTooLarge;
-
-    var have: usize = scratch.items.len - body_start;
-    while (have < body_len) {
-        var tmp2: [4096]u8 = undefined;
-        const n2 = try std.posix.recv(stream.handle, &tmp2, 0);
-        if (n2 == 0) return error.UnexpectedEof;
-        try scratch.appendSlice(allocator, tmp2[0..n2]);
-        have = scratch.items.len - body_start;
     }
 
     const body = scratch.items[body_start .. body_start + body_len];
