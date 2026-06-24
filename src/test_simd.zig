@@ -1,4 +1,4 @@
-//! U1 — Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
+﻿//! U1 â€” Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
 //!
 //! For each compiled vec_dot kernel, generate random F32 input, quantize via
 //! ggml's reference implementation, call the kernel, and compare the result
@@ -36,6 +36,28 @@ extern "c" fn simd_vec_dot_q5_k_q8_k_avx512(n: c_int, r: *f32, vx: ?*const anyop
 
 extern "c" fn simd_check_avx2() bool;
 extern "c" fn simd_check_avx512() bool;
+
+// New kernel symbols â€” quantization
+extern "c" fn simd_quantize_q8_0_f32_avx2(n: c_int, x: [*]const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_0_f32_avx512(n: c_int, x: [*]const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_k_f32_avx2(n: c_int, x: [*]const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_k_f32_avx512(n: c_int, x: [*]const f32, y: ?*anyopaque) void;
+
+// New kernel symbols â€” SiLU
+extern "c" fn simd_silu_f32_avx2(n: c_int, x: [*]const f32, y: [*]f32) void;
+extern "c" fn simd_silu_f32_avx512(n: c_int, x: [*]const f32, y: [*]f32) void;
+
+// New kernel symbols â€” layer_norm (reuses rms_norm signature)
+extern "c" fn simd_layer_norm_f32_avx2(n: c_int, eps: f32, x: [*]const f32, y: [*]f32) void;
+extern "c" fn simd_layer_norm_f32_avx512(n: c_int, eps: f32, x: [*]const f32, y: [*]f32) void;
+
+// New kernel symbols â€” rope_standard (reuses rope_neox signature)
+extern "c" fn simd_rope_standard_f32_avx2(n_pairs: c_longlong, cache: [*]const f32, src: [*]const f32, dst: [*]f32) void;
+extern "c" fn simd_rope_standard_f32_avx512(n_pairs: c_longlong, cache: [*]const f32, src: [*]const f32, dst: [*]f32) void;
+
+// New kernel symbols â€” vec_dot_f32_f32
+extern "c" fn simd_vec_dot_f32_f32_avx2(n: c_int, r: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, r: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 
 // -----------------------------------------------------------------------------
 // ggml reference quantize/dequantize (canonical, scalar)
@@ -304,7 +326,7 @@ pub fn main() !void {
         for (sizes) |K| {
             const blk = block_size(spec.kind, .x).blk;
             if (@mod(@as(i64, @intCast(K)), blk) != 0) {
-                std.debug.print(" K={d}:skip", .{K});
+                std.debug.print(" K={d}:skip", .{ K, });
                 continue;
             }
             any_run = true;
@@ -314,7 +336,7 @@ pub fn main() !void {
                 continue;
             };
             if (ok) {
-                std.debug.print(" K={d}:ok", .{K});
+                std.debug.print(" K={d}:ok", .{ K, });
                 pass += 1;
             } else {
                 fail += 1;
@@ -323,10 +345,7 @@ pub fn main() !void {
         if (!any_run) skip += 1;
         std.debug.print("\n", .{});
     }
-
     // -------------------------------------------------------------------------
-    // Unary kernels: rms_norm_f32  (PLAN-ASSEMBLY-REWRITE Section 3.4)
-    // ULP-bounded equivalence vs reference (allow 4 ULP @ rel-tol 4e-5).
     // -------------------------------------------------------------------------
     if (builtin.cpu.arch == .x86_64) {
         const rms_sizes = [_]usize{ 7, 64, 256, 1024, 4096, 8193 };
@@ -352,9 +371,449 @@ pub fn main() !void {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // New kernels: quantize_q8_0_f32
+    // Compare output against ggml's quantize_row_q8_0_ref (byte-exact).
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const quant_sizes = [_]usize{ 32, 256, 1024, 4096 };
+        if (have_avx2) {
+            try runQuantizeTest(allocator, "quantize_q8_0_f32 avx2", simd_quantize_q8_0_f32_avx2, &quant_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runQuantizeTest(allocator, "quantize_q8_0_f32 avx512", simd_quantize_q8_0_f32_avx512, &quant_sizes, &rng, &pass, &fail);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // New kernels: quantize_q8_k_f32
+    // Compare output against ggml's quantize_row_q8_K_ref (byte-exact).
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const quant_k_sizes = [_]usize{ 256, 1024, 4096 };
+        if (have_avx2) {
+            try runQuantizeKTest(allocator, "quantize_q8_k_f32 avx2", simd_quantize_q8_k_f32_avx2, &quant_k_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runQuantizeKTest(allocator, "quantize_q8_k_f32 avx512", simd_quantize_q8_k_f32_avx512, &quant_k_sizes, &rng, &pass, &fail);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // New kernels: silu_f32
+    // Compare against reference x * sigmoid(x) implementation.
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const silu_sizes = [_]usize{ 7, 64, 256, 1024, 4096, 8193 };
+        if (have_avx2) {
+            try runSiluTest(allocator, "silu_f32 avx2", simd_silu_f32_avx2, &silu_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runSiluTest(allocator, "silu_f32 avx512", simd_silu_f32_avx512, &silu_sizes, &rng, &pass, &fail);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // New kernels: layer_norm_f32
+    // Compare against reference layer norm implementation.
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const ln_sizes = [_]usize{ 7, 64, 256, 1024, 4096, 8193 };
+        if (have_avx2) {
+            try runLayerNormTest(allocator, "layer_norm_f32 avx2", simd_layer_norm_f32_avx2, &ln_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runLayerNormTest(allocator, "layer_norm_f32 avx512", simd_layer_norm_f32_avx512, &ln_sizes, &rng, &pass, &fail);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // New kernels: rope_standard_f32
+    // Compare against reference interleaved RoPE (same as neox but standard layout).
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const rope_std_sizes = [_]usize{ 4, 32, 64, 128, 256, 1024, 4099 };
+        if (have_avx2) {
+            try runRopeStandardTest(allocator, "rope_standard_f32 avx2", simd_rope_standard_f32_avx2, &rope_std_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runRopeStandardTest(allocator, "rope_standard_f32 avx512", simd_rope_standard_f32_avx512, &rope_std_sizes, &rng, &pass, &fail);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // New kernels: vec_dot_f32_f32
+    // Compare against reference dot product.
+    // -------------------------------------------------------------------------
+    if (builtin.cpu.arch == .x86_64) {
+        const vdot_sizes = [_]usize{ 32, 256, 1024, 4096 };
+        if (have_avx2) {
+            try runVecDotF32Test(allocator, "vec_dot_f32_f32 avx2", simd_vec_dot_f32_f32_avx2, &vdot_sizes, &rng, &pass, &fail);
+        }
+        if (have_avx512) {
+            try runVecDotF32Test(allocator, "vec_dot_f32_f32 avx512", simd_vec_dot_f32_f32_avx512, &vdot_sizes, &rng, &pass, &fail);
+        }
+    }
+
     std.debug.print("\n=== SUMMARY: pass={d} fail={d} kernel-skipped={d} ===\n", .{ pass, fail, skip });
     if (fail > 0) std.process.exit(1);
 }
+
+    std.debug.print("\nResults: {d} pass, {d} fail, {d} skip\n", .{ pass, fail, skip });
+}
+
+// -----------------------------------------------------------------------------
+// quantize_q8_0_f32 validator
+// -----------------------------------------------------------------------------
+const QuantizeFn = *const fn (n: c_int, x: [*]const f32, y: ?*anyopaque) callconv(.c) void;
+
+fn runQuantizeTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: QuantizeFn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n| {
+        const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(x);
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+        const num_blocks = n / 32;
+        const out_bytes = num_blocks * 34; // Q8_0 block size
+
+        const got = try allocator.alignedAlloc(u8, .fromByteUnits(64), out_bytes);
+        defer allocator.free(got);
+        const ref = try allocator.alignedAlloc(u8, .fromByteUnits(64), out_bytes);
+        defer allocator.free(ref);
+        @memset(got, 0);
+        @memset(ref, 0);
+
+        quantize_row_q8_0_ref(x.ptr, @ptrCast(ref.ptr), @intCast(n));
+        fp(@intCast(n), x.ptr, @ptrCast(got.ptr));
+
+        var ok = true;
+        for (got, ref, 0..) |g, r_byte, i| {
+            if (g != r_byte) {
+                ok = false;
+                std.debug.print(" n={d}:FAIL byte[{d}] got=0x{x} ref=0x{x}", .{ n, i, g, r_byte });
+                break;
+            }
+        }
+        if (ok) {
+            std.debug.print(" n={d}:ok", .{ n, });
+            pass.* += 1;
+        } else {
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// quantize_q8_k_f32 validator
+// -----------------------------------------------------------------------------
+const QuantizeKFn = *const fn (n: c_int, x: [*]const f32, y: ?*anyopaque) callconv(.c) void;
+
+fn runQuantizeKTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: QuantizeKFn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n| {
+        if (@mod(n, 256) != 0) {
+            std.debug.print(" n={d}:skip", .{ n, });
+            continue;
+        }
+        const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(x);
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+        const num_blocks = n / 256;
+        const out_bytes = num_blocks * 292; // Q8_K block size
+
+        const got = try allocator.alignedAlloc(u8, .fromByteUnits(64), out_bytes);
+        defer allocator.free(got);
+        const ref = try allocator.alignedAlloc(u8, .fromByteUnits(64), out_bytes);
+        defer allocator.free(ref);
+        @memset(got, 0);
+        @memset(ref, 0);
+
+        quantize_row_q8_K_ref(x.ptr, @ptrCast(ref.ptr), @intCast(n));
+        fp(@intCast(n), x.ptr, @ptrCast(got.ptr));
+
+        var ok = true;
+        for (got, ref, 0..) |g, r_byte, i| {
+            if (g != r_byte) {
+                ok = false;
+                std.debug.print(" n={d}:FAIL byte[{d}] got=0x{x} ref=0x{x}", .{ n, i, g, r_byte });
+                break;
+            }
+        }
+        if (ok) {
+            std.debug.print(" n={d}:ok", .{ n, });
+            pass.* += 1;
+        } else {
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// silu_f32 validator
+// -----------------------------------------------------------------------------
+const SiluFn = *const fn (n: c_int, x: [*]const f32, y: [*]f32) callconv(.c) void;
+
+fn silu_reference(x: []const f32, y: []f32) void {
+    for (x, 0..) |v, i| {
+        const sigmoid = 1.0 / (1.0 + @exp(-v));
+        y[i] = v * sigmoid;
+    }
+}
+
+fn runSiluTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: SiluFn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n| {
+        const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(x);
+        const y_ref = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(y_ref);
+        const y_got = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(y_got);
+
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+
+        silu_reference(x, y_ref);
+        fp(@intCast(n), x.ptr, y_got.ptr);
+
+        var ok = true;
+        var worst_rel: f32 = 0.0;
+        for (y_ref, y_got) |a, b| {
+            if (!ulpClose(a, b, 1.0e-5, 1.0e-6)) {
+                ok = false;
+            }
+            const denom = @max(@abs(a), @abs(b));
+            if (denom > 0) {
+                const rel = @abs(a - b) / denom;
+                if (rel > worst_rel) worst_rel = rel;
+            }
+        }
+        if (ok) {
+            std.debug.print(" n={d}:ok(rel={e:.1})", .{ n, worst_rel });
+            pass.* += 1;
+        } else {
+            std.debug.print(" n={d}:FAIL(rel={e:.1})", .{ n, worst_rel });
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// layer_norm_f32 validator
+// -----------------------------------------------------------------------------
+const LayerNormFn = *const fn (n: c_int, eps: f32, x: [*]const f32, y: [*]f32) callconv(.c) void;
+
+fn layer_norm_reference(x: []const f32, eps: f32, y: []f32) void {
+    var sum: f64 = 0.0;
+    for (x) |v| sum += @as(f64, v);
+    const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(x.len)));
+
+    var var_sum: f64 = 0.0;
+    for (x) |v| {
+        const diff = v - mean;
+        var_sum += @as(f64, diff * diff);
+    }
+    const variance: f32 = @floatCast(var_sum / @as(f64, @floatFromInt(x.len)));
+    const scale: f32 = 1.0 / @sqrt(variance + eps);
+
+    for (x, 0..) |v, i| y[i] = (v - mean) * scale;
+}
+
+fn runLayerNormTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: LayerNormFn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n| {
+        const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(x);
+        const y_ref = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(y_ref);
+        const y_got = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(y_got);
+
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+
+        const eps: f32 = 1.0e-5;
+        layer_norm_reference(x, eps, y_ref);
+        fp(@intCast(n), eps, x.ptr, y_got.ptr);
+
+        var ok = true;
+        var worst_rel: f32 = 0.0;
+        for (y_ref, y_got) |a, b| {
+            if (!ulpClose(a, b, 4.0e-5, 1.0e-6)) {
+                ok = false;
+            }
+            const denom = @max(@abs(a), @abs(b));
+            if (denom > 0) {
+                const rel = @abs(a - b) / denom;
+                if (rel > worst_rel) worst_rel = rel;
+            }
+        }
+        if (ok) {
+            std.debug.print(" n={d}:ok(rel={e:.1})", .{ n, worst_rel });
+            pass.* += 1;
+        } else {
+            std.debug.print(" n={d}:FAIL(rel={e:.1})", .{ n, worst_rel });
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// rope_standard_f32 validator
+// -----------------------------------------------------------------------------
+const RopeStandardFn = *const fn (n_pairs: c_longlong, cache: [*]const f32, src: [*]const f32, dst: [*]f32) callconv(.c) void;
+
+fn rope_standard_reference(n_pairs: usize, cache: []const f32, src: []const f32, dst: []f32) void {
+    // Standard (interleaved) RoPE layout:
+    //   pair i = (src[2*i], src[2*i+1])
+    //   dst[2*i]   = x0*cos - x1*sin
+    //   dst[2*i+1] = x0*sin + x1*cos
+    var i: usize = 0;
+    while (i < n_pairs) : (i += 1) {
+        const cos_t = cache[2 * i + 0];
+        const sin_t = cache[2 * i + 1];
+        const x0 = src[2 * i];
+        const x1 = src[2 * i + 1];
+        dst[2 * i] = x0 * cos_t - x1 * sin_t;
+        dst[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+fn runRopeStandardTest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: RopeStandardFn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n_pairs| {
+        const n_total = 2 * n_pairs;
+        const cache = try allocator.alignedAlloc(f32, .fromByteUnits(64), 2 * n_pairs);
+        defer allocator.free(cache);
+        const src = try allocator.alignedAlloc(f32, .fromByteUnits(64), n_total);
+        defer allocator.free(src);
+        const ref_dst = try allocator.alignedAlloc(f32, .fromByteUnits(64), n_total);
+        defer allocator.free(ref_dst);
+        const got_dst = try allocator.alignedAlloc(f32, .fromByteUnits(64), n_total);
+        defer allocator.free(got_dst);
+
+        var i: usize = 0;
+        while (i < n_pairs) : (i += 1) {
+            const theta = (r.float(f32) - 0.5) * 6.2831853;
+            cache[2 * i + 0] = @cos(theta);
+            cache[2 * i + 1] = @sin(theta);
+        }
+        for (src) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+
+        rope_standard_reference(n_pairs, cache, src, ref_dst);
+        fp(@intCast(n_pairs), cache.ptr, src.ptr, got_dst.ptr);
+
+        var ok = true;
+        var worst_abs: f32 = 0.0;
+        for (ref_dst, got_dst) |a, b| {
+            const diff = @abs(a - b);
+            if (diff > worst_abs) worst_abs = diff;
+            if (diff > 0) {
+                const denom = @max(@abs(a), @abs(b));
+                const rel = if (denom > 0) diff / denom else diff;
+                if (rel > 1.0e-6 and diff > 1.0e-7) ok = false;
+            }
+        }
+        if (ok) {
+            std.debug.print(" n_pairs={d}:ok(abs={e:.1})", .{ n_pairs, worst_abs });
+            pass.* += 1;
+        } else {
+            std.debug.print(" n_pairs={d}:FAIL(abs={e:.1})", .{ n_pairs, worst_abs });
+            fail.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+// -----------------------------------------------------------------------------
+// vec_dot_f32_f32 validator
+// -----------------------------------------------------------------------------
+const VecDotF32Fn = *const fn (n: c_int, r: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) callconv(.c) void;
+
+fn runVecDotF32Test(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fp: VecDotF32Fn,
+    sizes: []const usize,
+    rng: *std.Random.DefaultPrng,
+    pass: *usize,
+    fail: *usize,
+) !void {
+    std.debug.print("[{s}]", .{ .name = name });
+    const r = rng.random();
+    for (sizes) |n| {
+        const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(x);
+        const y = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
+        defer allocator.free(y);
+
+        for (x) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+        for (y) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+        const ref = scalar_dot(x, y);
+        var got: f32 = 0.0;
+        fp(@intCast(n), &got, @ptrCast(x.ptr), @ptrCast(y.ptr));
+
+        if (!within(got, ref)) {
+            std.debug.print(" n={d}:FAIL got={d:.6} ref={d:.6} diff={d:.6}\n", .{ n, got, ref, got - ref });
+            fail.* += 1;
+        } else {
+            std.debug.print(" n={d}:ok", .{ n, });
+            pass.* += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 
 // -----------------------------------------------------------------------------
 // rms_norm_f32 validator
@@ -394,7 +853,7 @@ fn runRmsNormTest(
     pass: *usize,
     fail: *usize,
 ) !void {
-    std.debug.print("[{s}]", .{name});
+    std.debug.print("[{s}]", .{ .name = name });
     const r = rng.random();
     for (sizes) |n| {
         const x = try allocator.alignedAlloc(f32, .fromByteUnits(64), n);
@@ -413,7 +872,7 @@ fn runRmsNormTest(
         var ok = true;
         var worst_rel: f32 = 0.0;
         for (y_ref, y_got) |a, b| {
-            // 4 ULP target ≈ 4 * 2^-23 ≈ 4.8e-7; loosen to 4e-5 because
+            // 4 ULP target â‰ˆ 4 * 2^-23 â‰ˆ 4.8e-7; loosen to 4e-5 because
             // parallel f64 reduction reorders rounding vs serial reference.
             if (!ulpClose(a, b, 4.0e-5, 1.0e-6)) {
                 ok = false;
@@ -468,7 +927,7 @@ fn runRopeNeoxTest(
     pass: *usize,
     fail: *usize,
 ) !void {
-    std.debug.print("[{s}]", .{name});
+    std.debug.print("[{s}]", .{ .name = name });
     const r = rng.random();
     for (sizes) |n_pairs| {
         const n_total = 2 * n_pairs;

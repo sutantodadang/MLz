@@ -110,48 +110,97 @@ static quant_cache g_cache_q8_k;
 static std::mutex  g_cache_mtx;
 
 // -----------------------------------------------------------------------------
+// Dispatch: should_take_mul_mat — per-shape decision for mul_mat hook
+// -----------------------------------------------------------------------------
+//
+// Returns 0 to defer to ggml's default path, 1 for AVX2, 2 for AVX-512, 3 for NEON.
+//
+// Per-shape GFLOPS benchmark (Ryzen 5 7500F, N=4096, 100k iterations, from bench_simd.zig):
+//   Kernel        AVX2    AVX-512   Gain
+//   Q4_0 x Q8_0   27.37   27.51     +0.5%
+//   Q8_0 x Q8_0   71.22   77.38     +8.6%
+//   Q2_K x Q8_K   26.37   26.32     -0.2%
+//   Q3_K x Q8_K   22.56   22.43     -0.6%
+//   Q4_K x Q8_K   33.80   34.16     +1.1%
+//   Q5_K x Q8_K   27.04   28.12     +4.0%
+//   Q6_K x Q8_K   23.47   23.79     +1.4%
+//   Q8_K x Q8_K   65.61   129.89    +98.0%
+//
+// Q8_K sees massive AVX-512 gain (2x). Other types are within 9% — AVX2 is nearly
+// identical and avoids AVX-512 frequency throttling on hybrid architectures.
+//
+enum mul_mat_decision_t {
+    MM_DEFER = 0,
+    MM_AVX2  = 1,
+    MM_AVX512 = 2,
+    MM_NEON  = 3,
+};
+
+static mul_mat_decision_t should_take_mul_mat(const struct ggml_tensor * src0,
+                                               const struct ggml_tensor * src1,
+                                               const struct ggml_tensor * dst) {
+    // Runtime kill-switch — MLZ_SIMD=0 forces ggml default path.
+    if (!simd_runtime_enabled()) return MM_DEFER;
+
+    if (dst->type != GGML_TYPE_F32) return MM_DEFER;
+    if (src1->type != GGML_TYPE_F32) return MM_DEFER;
+
+    // Repack gate: if Repack (or any extra-buffer backend) has claimed this
+    // tensor, defer to it. Repack specializes kernels per shape at load time
+    // and wins on its own turf.
+    if (src0->extra != nullptr) return MM_DEFER;
+    if (src1->extra != nullptr) return MM_DEFER;
+
+    if (src1->ne[0] != src0->ne[0]) return MM_DEFER;
+
+    // Require plain contiguous 2D layout (repo memory: mlz-mul-mat-layout-fix)
+    if (dst->ne[2]  != 1 || dst->ne[3]  != 1) return MM_DEFER;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return MM_DEFER;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return MM_DEFER;
+
+    // ISA check
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (!simd_check_neon()) return MM_DEFER;
+    return MM_NEON;
+#else
+    bool has_avx512 = simd_check_avx512();
+    bool has_avx2   = simd_check_avx2();
+    if (!has_avx2 && !has_avx512) return MM_DEFER;
+
+    // Per-shape AVX2 vs AVX-512 decision (benchmark data above).
+    // Default: AVX-512 when available, AVX2 otherwise.
+    // Future refinement: for non-Q8_K types with <5% AVX-512 gain,
+    // AVX2 may be preferable to avoid frequency throttling (Ryzen 7000/9000).
+    if (has_avx512) return MM_AVX512;
+    return MM_AVX2;
+#endif
+}
+
+// -----------------------------------------------------------------------------
 // Hook Implementation
 // -----------------------------------------------------------------------------
 extern "C" int ggml_simd_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // Runtime kill-switch — MLZ_SIMD=0 forces ggml default path (zero-rebuild rollback).
-    if (!simd_runtime_enabled()) return 0;
-
-    if (dst->type != GGML_TYPE_F32) return 0;
-
     const struct ggml_tensor * src0 = dst->src[0]; // Weights (usually quantized)
     const struct ggml_tensor * src1 = dst->src[1]; // Activations (F32)
 
-    // Dispatch gate: if Repack (or any extra-buffer backend) has claimed this
-    // tensor, defer to it.  Repack repacks weights at load time and is faster
-    // than our generic kernels for K-quants — don't fight it on its own turf.
-    if (src0->extra != nullptr) return 0;
-    if (src1->extra != nullptr) return 0;
+    mul_mat_decision_t decision = should_take_mul_mat(src0, src1, dst);
+    if (decision == MM_DEFER) return 0;
 
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
 
-    if (src1->ne[0] != K) return 0;
-    if (src1->type != GGML_TYPE_F32) return 0; // Only handle F32 activations for now
-
-    // Require plain contiguous 2D layout (per repo memory: mlz-mul-mat-layout-fix)
-    if (dst->ne[2] != 1 || dst->ne[3] != 1) return 0;
-    if (src0->ne[2] != 1 || src0->ne[3] != 1) return 0;
-    if (src1->ne[2] != 1 || src1->ne[3] != 1) return 0;
-
     if (simd_trace_enabled()) {
-        fprintf(stderr, "[mlz-simd] mul_mat type=%d M=%lld N=%lld K=%lld\n",
-                (int)src0->type, (long long)M, (long long)N, (long long)K);
+        fprintf(stderr, "[mlz-simd] mul_mat type=%d M=%lld N=%lld K=%lld isa=%s\n",
+                (int)src0->type, (long long)M, (long long)N, (long long)K,
+                decision == MM_AVX512 ? "avx512" : (decision == MM_AVX2 ? "avx2" : "neon"));
     }
 
-    // Check Hardware Support
 #if defined(__aarch64__) || defined(_M_ARM64)
-    bool use_neon = simd_check_neon();
-    if (!use_neon) return 0;
+    bool use_neon = (decision == MM_NEON);
 #else
-    bool use_avx2 = simd_check_avx2();
-    bool use_avx512 = simd_check_avx512();
-    if (!use_avx2 && !use_avx512) return 0;
+    bool use_avx2   = (decision == MM_AVX2);
+    bool use_avx512 = (decision == MM_AVX512);
 #endif
 
     // Threading
@@ -184,7 +233,17 @@ extern "C" int ggml_simd_try_mul_mat(const struct ggml_compute_params * params, 
                 for (int64_t j = 0; j < N; j++) {
                     const float * src1_col = (const float *)((char *)src1->data + j * src1->nb[1]);
                     void * dst_q = src1_q8 + j * q8_row_size;
+#if defined(__x86_64__) || defined(_M_X64)
+                    if (simd_check_avx512()) {
+                        simd_quantize_q8_0_f32_avx512((int)K, src1_col, dst_q);
+                    } else {
+                        simd_quantize_q8_0_f32_avx2((int)K, src1_col, dst_q);
+                    }
+#elif defined(__aarch64__)
+                    simd_quantize_q8_0_f32_neon((int)K, src1_col, dst_q);
+#else
                     quantize_row_q8_0(src1_col, dst_q, K);
+#endif
                 }
                 g_cache_q8_0.tag(src1->data, K, N, q8_row_size);
             } else {
@@ -245,7 +304,17 @@ extern "C" int ggml_simd_try_mul_mat(const struct ggml_compute_params * params, 
                 for (int64_t j = 0; j < N; j++) {
                     const float * src1_col = (const float *)((char *)src1->data + j * src1->nb[1]);
                     void * dst_q = src1_q8k + j * q8_k_row_size;
+#if defined(__x86_64__) || defined(_M_X64)
+                    if (simd_check_avx512()) {
+                        simd_quantize_q8_k_f32_avx512((int)K, src1_col, dst_q);
+                    } else {
+                        simd_quantize_q8_k_f32_avx2((int)K, src1_col, dst_q);
+                    }
+#elif defined(__aarch64__)
+                    simd_quantize_q8_k_f32_neon((int)K, src1_col, dst_q);
+#else
                     quantize_row_q8_K(src1_col, dst_q, K);
+#endif
                 }
                 g_cache_q8_k.tag(src1->data, K, N, q8_k_row_size);
             } else {
@@ -737,5 +806,82 @@ extern "C" int ggml_simd_try_rope(const struct ggml_compute_params * params, str
         }
     }
 done:
+    return 1;
+}
+
+// =============================================================================
+// Unary hook: ggml_simd_hook_silu
+// =============================================================================
+//
+// Replacement for `ggml_compute_forward_silu`.
+//
+// y[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(-x[i]))
+//
+// Only handles GGML_TYPE_F32 with contiguous innermost stride.
+// Returns 1 if handled, 0 to fall back to ggml default.
+// =============================================================================
+
+extern "C" int ggml_simd_hook_silu(const float * src, float * dst, int n) {
+    if (!simd_runtime_enabled()) return 0;
+    if (n <= 0) return 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (simd_trace_enabled()) {
+        fprintf(stderr, "[mlz-simd] silu n=%d (neon)\n", n);
+    }
+    simd_silu_f32_neon(n, src, dst);
+#else
+    static const bool g_have_avx512 = simd_check_avx512() != 0;
+    static const bool g_have_avx2   = simd_check_avx2()   != 0;
+    if (!g_have_avx2) return 0;
+
+    if (simd_trace_enabled()) {
+        fprintf(stderr, "[mlz-simd] silu n=%d\n", n);
+    }
+    if (g_have_avx512) {
+        simd_silu_f32_avx512(n, src, dst);
+    } else {
+        simd_silu_f32_avx2(n, src, dst);
+    }
+#endif
+    return 1;
+}
+
+// =============================================================================
+// Unary hook: ggml_simd_hook_norm (LayerNorm)
+// =============================================================================
+//
+// Replacement for `ggml_compute_forward_norm` when used as layer normalization.
+//
+// y[i] = (x[i] - mean) / sqrt(variance + eps)
+//
+// Reuses the rms_norm_f32 signature (same input/output layout).
+// Returns 1 if handled, 0 to fall back to ggml default.
+// =============================================================================
+
+extern "C" int ggml_simd_hook_norm(const float * src, float * dst, int n, float eps) {
+    if (!simd_runtime_enabled()) return 0;
+    if (n <= 0) return 0;
+    if (eps < 0.0f) return 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (simd_trace_enabled()) {
+        fprintf(stderr, "[mlz-simd] layer_norm n=%d eps=%g (neon)\n", n, (double)eps);
+    }
+    simd_layer_norm_f32_neon(n, eps, src, dst);
+#else
+    static const bool g_have_avx512 = simd_check_avx512() != 0;
+    static const bool g_have_avx2   = simd_check_avx2()   != 0;
+    if (!g_have_avx2) return 0;
+
+    if (simd_trace_enabled()) {
+        fprintf(stderr, "[mlz-simd] layer_norm n=%d eps=%g\n", n, (double)eps);
+    }
+    if (g_have_avx512) {
+        simd_layer_norm_f32_avx512(n, eps, src, dst);
+    } else {
+        simd_layer_norm_f32_avx2(n, eps, src, dst);
+    }
+#endif
     return 1;
 }

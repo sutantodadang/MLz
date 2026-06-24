@@ -1,5 +1,6 @@
 const std = @import("std");
 
+// vec_dot kernels (x86_64 AVX2 + AVX-512)
 extern "c" fn simd_vec_dot_q4_0_q8_0_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q4_0_q8_0_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q8_0_q8_0_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
@@ -10,10 +11,40 @@ extern "c" fn simd_vec_dot_q3_k_q8_k_avx2(n: c_int, result: *f32, vx: ?*const an
 extern "c" fn simd_vec_dot_q3_k_q8_k_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q4_k_q8_k_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q4_k_q8_k_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+extern "c" fn simd_vec_dot_q5_k_q8_k_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+extern "c" fn simd_vec_dot_q5_k_q8_k_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q6_k_q8_k_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q6_k_q8_k_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q8_k_q8_k_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 extern "c" fn simd_vec_dot_q8_k_q8_k_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+
+// unary kernels (x86_64 AVX2 + AVX-512, opt-in env-gated)
+extern "c" fn simd_rms_norm_f32_avx2(n: c_int, eps: f32, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_rms_norm_f32_avx512(n: c_int, eps: f32, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_rope_neox_f32_avx2(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
+extern "c" fn simd_rope_neox_f32_avx512(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
+
+// new unary kernels — quantization, SiLU, layer_norm, rope_standard, vec_dot_f32
+extern "c" fn simd_quantize_q8_0_f32_avx2(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_0_f32_avx512(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_k_f32_avx2(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_k_f32_avx512(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_silu_f32_avx2(n: c_int, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_silu_f32_avx512(n: c_int, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_layer_norm_f32_avx2(n: c_int, eps: f32, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_layer_norm_f32_avx512(n: c_int, eps: f32, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_rope_standard_f32_avx2(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
+extern "c" fn simd_rope_standard_f32_avx512(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
+extern "c" fn simd_vec_dot_f32_f32_avx2(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+extern "c" fn simd_vec_dot_f32_f32_avx512(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
+
+// NEON kernels (aarch64)
+extern "c" fn simd_quantize_q8_0_f32_neon(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_quantize_q8_k_f32_neon(n: c_int, x: ?*const f32, y: ?*anyopaque) void;
+extern "c" fn simd_silu_f32_neon(n: c_int, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_layer_norm_f32_neon(n: c_int, eps: f32, x: ?*const f32, y: ?*f32) void;
+extern "c" fn simd_rope_standard_f32_neon(n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32) void;
+extern "c" fn simd_vec_dot_f32_f32_neon(n: c_int, result: *f32, vx: ?*const anyopaque, vy: ?*const anyopaque) void;
 
 pub fn main() !void {
     const N = 4096;
@@ -23,211 +54,234 @@ pub fn main() !void {
     const q4_row_size = num_blocks_legacy * 18;
     const q8_row_size = num_blocks_legacy * 34;
 
-    // K-Quants sizes (GGML_TYPE_Q2_K = 256 elements per block)
-    // Q2_K: block size 256.
-    //   - scales: 16 bytes (u8)
-    //   - qs: 64 bytes (2-bit weights)
-    //   - d: 2 bytes (f16), dmin: 2 bytes (f16) -> 4 bytes
-    //   Total: 16 + 64 + 4 = 84 bytes per block (256 elements)
+    // Q2_K: block 256 → 84 bytes/block
     const q2_k_row_size = num_blocks_k * 84;
-
-    // Q6_K: block size 256.
-    //   - ql: 128 bytes (4-bit)
-    //   - qh: 64 bytes (2-bit)
-    //   - scales: 16 bytes (i8)
-    //   - d: 2 bytes (f16)
-    //   Total: 128 + 64 + 16 + 2 = 210 bytes per block
-    const q6_k_row_size = num_blocks_k * 210;
-
-    // Q3_K: block size 256.
-    //   - d: 2 bytes (f16)
-    //   - scales: 12 bytes (u8)
-    //   - hmask: 16 bytes (sign mask, 1 bit per 2 weights)
-    //   - qs: 96 bytes (3-bit weights packed)
-    //   Total: 2 + 12 + 16 + 96 = 126 bytes per block
+    // Q3_K: block 256 → 126 bytes/block
     const q3_k_row_size = num_blocks_k * 126;
-
-    // Q4_K: block size 256.
-    //   - d, dmin: 4 bytes (2 * f16)
-    //   - scales: 12 bytes (u8)
-    //   - qs: 128 bytes (4-bit)
-    //   Total: 4 + 12 + 128 = 144 bytes per block
+    // Q4_K: block 256 → 144 bytes/block
     const q4_k_row_size = num_blocks_k * 144;
-
-    // Q8_K: block size 256.
-    //   - d: 4 bytes (f32)
-    //   - qs: 256 bytes (i8)
-    //   - bsums: 32 bytes (16 x i16)
-    //   Total: 4 + 256 + 32 = 292 bytes per block
+    // Q5_K: block 256 → 176 bytes/block (d+dmin=4, scales=12, qh=32, qs=128)
+    const q5_k_row_size = num_blocks_k * 176;
+    // Q6_K: block 256 → 210 bytes/block
+    const q6_k_row_size = num_blocks_k * 210;
+    // Q8_K: block 256 → 292 bytes/block
     const q8_k_row_size = num_blocks_k * 292;
-
-    // Allocate 8 rows for GEMM test
-    const q4_size = q4_row_size;
-    const q8_size = q8_row_size;
-
-    const q2_k_size = q2_k_row_size;
-    const q3_k_size = q3_k_row_size;
-    const q4_k_size = q4_k_row_size;
-    const q6_k_size = q6_k_row_size;
-    const q8_k_size = q8_k_row_size;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    // Align to 64 bytes for AVX-512 (Alignment is enum, must be comptime)
+    // Align to 64 bytes for AVX-512
     const alignment = comptime std.mem.Alignment.fromByteUnits(64);
-    const vx_q4 = try allocator.alignedAlloc(u8, alignment, q4_size);
-    const vy_q8 = try allocator.alignedAlloc(u8, alignment, q8_size);
-    const vx_q8 = try allocator.alignedAlloc(u8, alignment, q8_size);
 
-    const vx_q2_k = try allocator.alignedAlloc(u8, alignment, q2_k_size);
-    const vx_q3_k = try allocator.alignedAlloc(u8, alignment, q3_k_size);
-    const vx_q4_k = try allocator.alignedAlloc(u8, alignment, q4_k_size);
-    const vx_q6_k = try allocator.alignedAlloc(u8, alignment, q6_k_size);
-    const vx_q8_k = try allocator.alignedAlloc(u8, alignment, q8_k_size);
-    const vy_q8_k = try allocator.alignedAlloc(u8, alignment, q8_k_size);
+    // vec_dot buffers
+    const vx_q4 = try allocator.alignedAlloc(u8, alignment, q4_row_size);
+    const vy_q8 = try allocator.alignedAlloc(u8, alignment, q8_row_size);
+    const vx_q8 = try allocator.alignedAlloc(u8, alignment, q8_row_size);
+    const vx_q2_k = try allocator.alignedAlloc(u8, alignment, q2_k_row_size);
+    const vx_q3_k = try allocator.alignedAlloc(u8, alignment, q3_k_row_size);
+    const vx_q4_k = try allocator.alignedAlloc(u8, alignment, q4_k_row_size);
+    const vx_q5_k = try allocator.alignedAlloc(u8, alignment, q5_k_row_size);
+    const vx_q6_k = try allocator.alignedAlloc(u8, alignment, q6_k_row_size);
+    const vx_q8_k = try allocator.alignedAlloc(u8, alignment, q8_k_row_size);
+    const vy_q8_k = try allocator.alignedAlloc(u8, alignment, q8_k_row_size);
 
-    // Initialize with random data
+    // unary buffers (f32, aligned)
+    const x_rms = try allocator.alignedAlloc(f32, alignment, N);
+    const y_rms = try allocator.alignedAlloc(f32, alignment, N);
+    const rope_cache = try allocator.alignedAlloc(f32, alignment, N); // N/2 pairs * 2 = N floats
+    const rope_src = try allocator.alignedAlloc(f32, alignment, N);
+    const rope_dst = try allocator.alignedAlloc(f32, alignment, N);
+
+    // quantize output buffers
+    const x_quant = try allocator.alignedAlloc(f32, alignment, N);
+    const y_quant_q8_0 = try allocator.alignedAlloc(u8, alignment, q8_row_size);
+    const y_quant_q8_k = try allocator.alignedAlloc(u8, alignment, q8_k_row_size);
+
+    // Random init
     std.crypto.random.bytes(vx_q4);
     std.crypto.random.bytes(vy_q8);
     std.crypto.random.bytes(vx_q8);
     std.crypto.random.bytes(vx_q2_k);
     std.crypto.random.bytes(vx_q3_k);
     std.crypto.random.bytes(vx_q4_k);
+    std.crypto.random.bytes(vx_q5_k);
     std.crypto.random.bytes(vx_q6_k);
     std.crypto.random.bytes(vx_q8_k);
     std.crypto.random.bytes(vy_q8_k);
 
+    // Fill unary buffers with valid f32
+    for (x_rms) |*v| v.* = @as(f32, @floatFromInt(std.crypto.random.int(u32) % 1000)) - 500.0;
+    // rope cache: cos/sin interleaved for N/2 pairs → N floats
+    for (rope_cache) |*v| v.* = @as(f32, @floatFromInt(std.crypto.random.int(u32) % 2000)) / 1000.0;
+    for (rope_src) |*v| v.* = @as(f32, @floatFromInt(std.crypto.random.int(u32) % 2000)) / 1000.0;
+
+    // Fill quantize input with valid f32
+    for (x_quant) |*v| v.* = @as(f32, @floatFromInt(std.crypto.random.int(u32) % 1000)) - 500.0;
+
     const iterations = 100_000;
     var res: f32 = 0;
 
-    std.debug.print("Benchmarking N={} Iterations={}\n", .{ N, iterations });
-    std.debug.print("--------------------------------------------------\n", .{});
-    std.debug.print("{s:<25} | {s:<10} | {s:<15}\n", .{ "Kernel", "Time (s)", "Throughput" });
-    std.debug.print("--------------------------------------------------\n", .{});
+    std.debug.print("=== MLz SIMD Baseline Bench (PLAN-ASSEMBLY-REWRITE Step 2) ===\n", .{});
+    std.debug.print("N={d}  iterations={d}\n\n", .{ N, iterations });
+    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GFLOPS" });
+    std.debug.print("{s:-<56}\n", .{""});
 
+    // ------- vec_dot benchmarks -------
     // Warmup
     simd_vec_dot_q4_0_q8_0_avx2(N, &res, vx_q4.ptr, vy_q8.ptr);
 
-    // Benchmark Q4 AVX2
-    var timer = try std.time.Timer.start();
-    for (0..iterations) |_| {
-        simd_vec_dot_q4_0_q8_0_avx2(N, &res, vx_q4.ptr, vy_q8.ptr);
-    }
-    var t_ns = timer.read();
-    printStats("Q4_0 x Q8_0 (AVX2)", t_ns, N, iterations); // Single row throughput
+    // Q4_0
+    run_vec_dot("Q4_0 x Q8_0 (AVX2)", simd_vec_dot_q4_0_q8_0_avx2, N, vx_q4.ptr, vy_q8.ptr, iterations);
+    run_vec_dot("Q4_0 x Q8_0 (AVX-512)", simd_vec_dot_q4_0_q8_0_avx512, N, vx_q4.ptr, vy_q8.ptr, iterations);
 
-    // Benchmark Q4 AVX512 (Scalar)
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q4_0_q8_0_avx512(N, &res, vx_q4.ptr, vy_q8.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q4_0 x Q8_0 (AVX-512)", t_ns, N, iterations);
+    // Q8_0
+    run_vec_dot("Q8_0 x Q8_0 (AVX2)", simd_vec_dot_q8_0_q8_0_avx2, N, vx_q8.ptr, vy_q8.ptr, iterations);
+    run_vec_dot("Q8_0 x Q8_0 (AVX-512)", simd_vec_dot_q8_0_q8_0_avx512, N, vx_q8.ptr, vy_q8.ptr, iterations);
 
-    // Benchmark Q8 AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q8_0_q8_0_avx2(N, &res, vx_q8.ptr, vy_q8.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q8_0 x Q8_0 (AVX2)", t_ns, N, iterations);
+    // Q2_K
+    run_vec_dot("Q2_K x Q8_K (AVX2)", simd_vec_dot_q2_k_q8_k_avx2, N, vx_q2_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q2_K x Q8_K (AVX-512)", simd_vec_dot_q2_k_q8_k_avx512, N, vx_q2_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q8 AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q8_0_q8_0_avx512(N, &res, vx_q8.ptr, vy_q8.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q8_0 x Q8_0 (AVX-512)", t_ns, N, iterations);
+    // Q3_K
+    run_vec_dot("Q3_K x Q8_K (AVX2)", simd_vec_dot_q3_k_q8_k_avx2, N, vx_q3_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q3_K x Q8_K (AVX-512)", simd_vec_dot_q3_k_q8_k_avx512, N, vx_q3_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q2_K AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q2_k_q8_k_avx2(N, &res, vx_q2_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q2_K x Q8_K (AVX2)", t_ns, N, iterations);
+    // Q4_K
+    run_vec_dot("Q4_K x Q8_K (AVX2)", simd_vec_dot_q4_k_q8_k_avx2, N, vx_q4_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q4_K x Q8_K (AVX-512)", simd_vec_dot_q4_k_q8_k_avx512, N, vx_q4_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q2_K AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q2_k_q8_k_avx512(N, &res, vx_q2_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q2_K x Q8_K (AVX-512)", t_ns, N, iterations);
+    // Q5_K
+    run_vec_dot("Q5_K x Q8_K (AVX2)", simd_vec_dot_q5_k_q8_k_avx2, N, vx_q5_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q5_K x Q8_K (AVX-512)", simd_vec_dot_q5_k_q8_k_avx512, N, vx_q5_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q3_K AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q3_k_q8_k_avx2(N, &res, vx_q3_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q3_K x Q8_K (AVX2)", t_ns, N, iterations);
+    // Q6_K
+    run_vec_dot("Q6_K x Q8_K (AVX2)", simd_vec_dot_q6_k_q8_k_avx2, N, vx_q6_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q6_K x Q8_K (AVX-512)", simd_vec_dot_q6_k_q8_k_avx512, N, vx_q6_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q3_K AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q3_k_q8_k_avx512(N, &res, vx_q3_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q3_K x Q8_K (AVX-512)", t_ns, N, iterations);
+    // Q8_K
+    run_vec_dot("Q8_K x Q8_K (AVX2)", simd_vec_dot_q8_k_q8_k_avx2, N, vx_q8_k.ptr, vy_q8_k.ptr, iterations);
+    run_vec_dot("Q8_K x Q8_K (AVX-512)", simd_vec_dot_q8_k_q8_k_avx512, N, vx_q8_k.ptr, vy_q8_k.ptr, iterations);
 
-    // Benchmark Q4_K AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q4_k_q8_k_avx2(N, &res, vx_q4_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q4_K x Q8_K (AVX2)", t_ns, N, iterations);
+    // ------- unary benchmarks -------
+    std.debug.print("\n--- Unary (Opt-in, env-gated) ---\n", .{});
+    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
+    std.debug.print("{s:-<56}\n", .{""});
 
-    // Benchmark Q4_K AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q4_k_q8_k_avx512(N, &res, vx_q4_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q4_K x Q8_K (AVX-512)", t_ns, N, iterations);
+    const eps: f32 = 1e-5;
+    const rope_iterations = 50_000;
 
-    // Benchmark Q6_K AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q6_k_q8_k_avx2(N, &res, vx_q6_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q6_K x Q8_K (AVX2)", t_ns, N, iterations);
+    // rms_norm
+    run_rms_norm("rms_norm_f32 (AVX2)", simd_rms_norm_f32_avx2, N, eps, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+    run_rms_norm("rms_norm_f32 (AVX-512)", simd_rms_norm_f32_avx512, N, eps, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
 
-    // Benchmark Q6_K AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q6_k_q8_k_avx512(N, &res, vx_q6_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q6_K x Q8_K (AVX-512)", t_ns, N, iterations);
+    // rope_neox — n_pairs = N/2
+    const n_pairs: i64 = N / 2;
+    run_rope("rope_neox_f32 (AVX2)", simd_rope_neox_f32_avx2, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
+    run_rope("rope_neox_f32 (AVX-512)", simd_rope_neox_f32_avx512, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
 
-    // Benchmark Q8_K AVX2
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q8_k_q8_k_avx2(N, &res, vx_q8_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q8_K x Q8_K (AVX2)", t_ns, N, iterations);
+    // ------- new kernel benchmarks -------
+    std.debug.print("\n--- New Kernels ---\n", .{});
+    std.debug.print("{s:<28} | {s:<10} | {s:<14}\n", .{ "Kernel", "Time (s)", "GigaOps/s" });
+    std.debug.print("{s:-<56}\n", .{""});
 
-    // Benchmark Q8_K AVX512
-    timer.reset();
-    for (0..iterations) |_| {
-        simd_vec_dot_q8_k_q8_k_avx512(N, &res, vx_q8_k.ptr, vy_q8_k.ptr);
-    }
-    t_ns = timer.read();
-    printStats("Q8_K x Q8_K (AVX-512)", t_ns, N, iterations);
+    // quantize_q8_0_f32
+    run_quantize("quantize_q8_0_f32 (AVX2)", simd_quantize_q8_0_f32_avx2, N, @ptrCast(x_quant.ptr), @ptrCast(y_quant_q8_0.ptr), iterations);
+    run_quantize("quantize_q8_0_f32 (AVX-512)", simd_quantize_q8_0_f32_avx512, N, @ptrCast(x_quant.ptr), @ptrCast(y_quant_q8_0.ptr), iterations);
+
+    // quantize_q8_k_f32
+    run_quantize("quantize_q8_k_f32 (AVX2)", simd_quantize_q8_k_f32_avx2, N, @ptrCast(x_quant.ptr), @ptrCast(y_quant_q8_k.ptr), iterations);
+    run_quantize("quantize_q8_k_f32 (AVX-512)", simd_quantize_q8_k_f32_avx512, N, @ptrCast(x_quant.ptr), @ptrCast(y_quant_q8_k.ptr), iterations);
+
+    // silu_f32
+    run_unary("silu_f32 (AVX2)", simd_silu_f32_avx2, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+    run_unary("silu_f32 (AVX-512)", simd_silu_f32_avx512, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+
+    // layer_norm_f32
+    run_rms_norm("layer_norm_f32 (AVX2)", simd_layer_norm_f32_avx2, N, eps, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+    run_rms_norm("layer_norm_f32 (AVX-512)", simd_layer_norm_f32_avx512, N, eps, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+
+    // rope_standard_f32
+    run_rope("rope_standard_f32 (AVX2)", simd_rope_standard_f32_avx2, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
+    run_rope("rope_standard_f32 (AVX-512)", simd_rope_standard_f32_avx512, n_pairs, @ptrCast(rope_cache.ptr), @ptrCast(rope_src.ptr), @ptrCast(rope_dst.ptr), rope_iterations);
+
+    // vec_dot_f32_f32
+    run_vec_dot("vec_dot_f32_f32 (AVX2)", simd_vec_dot_f32_f32_avx2, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+    run_vec_dot("vec_dot_f32_f32 (AVX-512)", simd_vec_dot_f32_f32_avx512, N, @ptrCast(x_rms.ptr), @ptrCast(y_rms.ptr), iterations);
+
+    // Prevent optimizer from eliminating unused result
+    std.process.cleanExit();
 }
 
-fn printStats(name: []const u8, ns: u64, N: usize, iter: usize) void {
+fn run_vec_dot(name: []const u8, kernel: anytype, N: usize, vx: ?*const anyopaque, vy: ?*const anyopaque, iter: usize) void {
+    var res: f32 = 0;
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(@intCast(N), &res, vx, vy);
+    }
+    const ns = timer.read();
     const sec = @as(f64, @floatFromInt(ns)) / 1e9;
-    const ops = @as(f64, @floatFromInt(N)) * @as(f64, @floatFromInt(iter)); // elements processed
-    // Throughput in elements/sec
-    const elems_per_sec = ops / sec;
-    const gelem_per_sec = elems_per_sec / 1e9;
+    // vec_dot: 2*N - 1 FLOPS per call (N muls + N-1 adds)
+    const flops = @as(f64, @floatFromInt(2 * N - 1)) * @as(f64, @floatFromInt(iter));
+    const gflops = flops / sec / 1e9;
+    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gflops });
+}
 
-    std.debug.print("{s:<25} | {d:<10.4} | {d:<10.2} GElem/s\n", .{ name, sec, gelem_per_sec });
+fn run_rms_norm(name: []const u8, kernel: anytype, n: usize, eps: f32, x: ?*const f32, y: ?*f32, iter: usize) void {
+    // Compute y once (kernel writes to y, we don't care about results)
+    kernel(@intCast(n), eps, x, y);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(@intCast(n), eps, x, y);
+    }
+    const ns = timer.read();
+    const sec = @as(f64, @floatFromInt(ns)) / 1e9;
+    // rms_norm: ~2*N ops (N squares, reduce add, N mults by 1/rms)
+    const ops = @as(f64, @floatFromInt(2 * n)) * @as(f64, @floatFromInt(iter));
+    const gops = ops / sec / 1e9;
+    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+}
+
+fn run_rope(name: []const u8, kernel: anytype, n_pairs: i64, cache: ?*const f32, src: ?*const f32, dst: ?*f32, iter: usize) void {
+    // Warmup
+    kernel(n_pairs, cache, src, dst);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(n_pairs, cache, src, dst);
+    }
+    const ns = timer.read();
+    const sec = @as(f64, @floatFromInt(ns)) / 1e9;
+    // rope_neox: 6 FLOPS per pair (4 muls + 2 adds per complex rotation)
+    const ops = @as(f64, @floatFromInt(6 * @as(usize, @intCast(n_pairs)))) * @as(f64, @floatFromInt(iter));
+    const gops = ops / sec / 1e9;
+    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+}
+
+fn run_quantize(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: ?*anyopaque, iter: usize) void {
+    // Warmup
+    kernel(@intCast(n), x, y);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(@intCast(n), x, y);
+    }
+    const ns = timer.read();
+    const sec = @as(f64, @floatFromInt(ns)) / 1e9;
+    // quantize: ~4*N ops (abs max scan, scale compute, N quantizations)
+    const ops = @as(f64, @floatFromInt(4 * n)) * @as(f64, @floatFromInt(iter));
+    const gops = ops / sec / 1e9;
+    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
+}
+
+fn run_unary(name: []const u8, kernel: anytype, n: usize, x: ?*const f32, y: ?*f32, iter: usize) void {
+    // Warmup
+    kernel(@intCast(n), x, y);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..iter) |_| {
+        kernel(@intCast(n), x, y);
+    }
+    const ns = timer.read();
+    const sec = @as(f64, @floatFromInt(ns)) / 1e9;
+    // unary: ~3*N ops (exp, add, div or similar per element)
+    const ops = @as(f64, @floatFromInt(3 * n)) * @as(f64, @floatFromInt(iter));
+    const gops = ops / sec / 1e9;
+    std.debug.print("{s:<28} | {d:<10.4} | {d:<10.2}\n", .{ name, sec, gops });
 }

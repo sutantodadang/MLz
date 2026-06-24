@@ -393,8 +393,14 @@ fn generateSpeculative(
             eval_pos += 1;
 
             // Rewind both contexts to the committed prefix and re-sync draft.
-            ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1);
-            draft_ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1);
+            if (!ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1) or
+                !draft_ctx.kvCacheSeqRm(0, @intCast(eval_pos), -1))
+            {
+                // M-RoPE: partial rewind impossible.
+                // Abort — engine will detect state mismatch on next turn and do a full clear.
+                finish = .aborted;
+                break :spec_loop;
+            }
             draft_pos = eval_pos;
 
             if (eog) {

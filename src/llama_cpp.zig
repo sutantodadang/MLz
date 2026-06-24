@@ -98,8 +98,8 @@ pub const Context = struct {
         return c.llama_get_logits_ith(self.handle, i);
     }
 
-    pub fn kvCacheSeqRm(self: Context, seq_id: i32, p0: i32, p1: i32) void {
-        _ = c.llama_memory_seq_rm(c.llama_get_memory(self.handle), seq_id, p0, p1);
+    pub fn kvCacheSeqRm(self: Context, seq_id: i32, p0: i32, p1: i32) bool {
+        return c.llama_memory_seq_rm(c.llama_get_memory(self.handle), seq_id, p0, p1);
     }
 
     pub fn nCtx(self: Context) u32 {

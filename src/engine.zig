@@ -33,6 +33,10 @@ pub const EngineConfig = struct {
     /// Root rule name for the grammar.
     grammar_root: []const u8 = "root",
 
+    /// Override chat template name (e.g. "gemma") passed to
+    /// llama_chat_apply_template instead of the model's Jinja template.
+    chat_template: ?[]const u8 = null,
+
     /// Path to a draft model for speculative decoding.
     draft_model_path: ?[]const u8 = null,
 };
@@ -68,6 +72,7 @@ pub const Engine = struct {
     cfg: EngineConfig,
     grammar_z: ?[:0]u8,
     grammar_root_z: ?[:0]u8,
+    chat_template_z: ?[:0]u8,
 
     /// Monotonic counter for completion IDs. Accessed lock-free across
     /// concurrent request handlers (server.zig:279 calls nextIdAlloc outside
@@ -106,6 +111,12 @@ pub const Engine = struct {
 
         const vocab = model.vocab() orelse return error.ModelLoadFailed;
         const tmpl = model.chatTemplate();
+
+        var chat_template_z: ?[:0]u8 = null;
+        if (cfg.chat_template) |ct| {
+            chat_template_z = try chat_lib.dupeZ(allocator, ct);
+        }
+        errdefer if (chat_template_z) |t| allocator.free(t);
 
         var grammar_z: ?[:0]u8 = null;
         var grammar_root_z: ?[:0]u8 = null;
@@ -158,6 +169,7 @@ pub const Engine = struct {
             .cfg = cfg,
             .grammar_z = grammar_z,
             .grammar_root_z = grammar_root_z,
+            .chat_template_z = chat_template_z,
             .id_counter = std.atomic.Value(u64).init(1),
             .cached_tokens = .{},
             .mutex = .{},
@@ -175,14 +187,15 @@ pub const Engine = struct {
         self.model.deinit();
         if (self.grammar_z) |g| allocator.free(g);
         if (self.grammar_root_z) |r| allocator.free(r);
+        if (self.chat_template_z) |t| allocator.free(t);
     }
 
     pub fn reset(self: *Engine) void {
         self.cached_tokens.clearRetainingCapacity();
-        self.ctx.kvCacheSeqRm(0, -1, -1);
+        _ = self.ctx.kvCacheSeqRm(0, -1, -1);
         self.batch.clear();
         if (self.draft_batch) |*b| b.clear();
-        if (self.draft_ctx) |c| c.kvCacheSeqRm(0, -1, -1);
+        if (self.draft_ctx) |c| _ = c.kvCacheSeqRm(0, -1, -1);
     }
 
     pub fn modelId(self: *Engine) []const u8 {
@@ -236,11 +249,12 @@ pub const Engine = struct {
         const ctx_reserve: usize = 256;
         const ctx_limit: usize = @as(usize, @intCast(self.ctx.nCtx())) - ctx_reserve;
 
-        var prompt = try inference.buildPrompt(allocator, self.tmpl, self.vocab, msgs.items);
+        const tmpl: ?[*:0]const u8 = if (self.chat_template_z) |t| t.ptr else self.tmpl;
+        var prompt = try inference.buildPrompt(allocator, tmpl, self.vocab, msgs.items);
         while (prompt.tokens.len > ctx_limit) {
             prompt.deinit(allocator);
             if (!chat_lib.dropOldestNonSystem(&msgs, allocator)) break;
-            prompt = try inference.buildPrompt(allocator, self.tmpl, self.vocab, msgs.items);
+            prompt = try inference.buildPrompt(allocator, tmpl, self.vocab, msgs.items);
         }
         defer prompt.deinit(allocator);
 
@@ -261,8 +275,14 @@ pub const Engine = struct {
 
         // Reset KV cache after the common prefix.
         if (n_past < self.cached_tokens.items.len) {
-            self.ctx.kvCacheSeqRm(0, @intCast(n_past), -1);
-            self.cached_tokens.shrinkRetainingCapacity(n_past);
+            if (!self.ctx.kvCacheSeqRm(0, @intCast(n_past), -1)) {
+                // M-RoPE: partial sequence removal failed. Fall back to full clear.
+                _ = self.ctx.kvCacheSeqRm(0, -1, -1); // whole sequence always succeeds
+                self.cached_tokens.clearRetainingCapacity();
+                n_past = 0;
+            } else {
+                self.cached_tokens.shrinkRetainingCapacity(n_past);
+            }
         }
 
         // Sampler config with request overrides.

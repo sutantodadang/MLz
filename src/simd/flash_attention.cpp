@@ -53,7 +53,16 @@ enum {
 extern "C" int flash_attn_dispatch(const flash_attn_config_t* config) {
     if (!config) return 0;
     if (config->head_dim_k <= 0 || config->head_dim_k > FA_MAX_HEAD_DIM) return 0;
+    if (config->head_dim_v <= 0 || config->head_dim_v > FA_MAX_HEAD_DIM) return 0;
     if (config->n_queries <= 0 || config->n_kv <= 0) return 0;
+    if (config->n_head_kv <= 0) return 0;
+    if (config->window_size != 0) return 0;
+    if (!config->q || !config->k || !config->v || !config->dst) return 0;
+
+    // Q8_0 kernel: known crash in long-context inference (>1024 tokens).
+    // Root cause undiagnosed (static analysis shows no stack/buffer/race issues).
+    // Gated behind MLZ_SIMD_FLASH_ATTN=1 opt-in; must NOT be default.
+    // AGENTS.md rule 4.
 
 #if defined(__aarch64__) || defined(_M_ARM64)
     // ARM NEON dispatch — always available on AArch64

@@ -21,6 +21,7 @@ pub const Config = struct {
     load_chat_path: ?[]const u8 = null,
     grammar_path: ?[]const u8 = null,
     grammar_root: []const u8 = "root",
+    chat_template: ?[]const u8 = null,
 
     // One-shot prompt mode
     prompt_mode: bool = false,
@@ -127,6 +128,8 @@ pub const Config = struct {
                 cfg.grammar_path = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--grammar-root")) {
                 cfg.grammar_root = try getNextArg(&i, args) orelse "root";
+            } else if (std.mem.eql(u8, arg, "--chat-template")) {
+                cfg.chat_template = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--draft-model")) {
                 cfg.draft_model_path = try getNextArg(&i, args);
             } else if (std.mem.eql(u8, arg, "--server")) {

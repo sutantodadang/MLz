@@ -41,6 +41,7 @@ pub fn main() !void {
                     \\  --save-chat <file>    Save conversation to JSON
                     \\  --grammar <file>      Constrain output with a GBNF grammar file
                     \\  --grammar-root <name> Start rule name for grammar (default: root)
+                    \\  --chat-template <name>Override chat template (e.g. gemma)
                     \\  --server              Run as an OpenAI-compatible server
                     \\  --host <string>        Server host (default: 127.0.0.1)
                     \\  --port <int>           Server port (default: 8080)
@@ -104,6 +105,7 @@ pub fn main() !void {
         .seed = cfg.seed,
         .grammar_path = cfg.grammar_path,
         .grammar_root = cfg.grammar_root,
+        .chat_template = cfg.chat_template,
         .draft_model_path = cfg.draft_model_path,
     };
 

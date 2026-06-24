@@ -208,6 +208,10 @@ pub fn build(b: *std.Build) void {
         .file = llama_cpp_dep.path("ggml/src/ggml-backend.cpp"),
         .flags = cpp_flags.items,
     });
+    ggml_lib.addCSourceFile(.{
+        .file = llama_cpp_dep.path("ggml/src/ggml-backend-meta.cpp"),
+        .flags = cpp_flags.items,
+    });
     // ggml (registry)
     ggml_lib.addCSourceFile(.{
         .file = llama_cpp_dep.path("ggml/src/ggml-backend-reg.cpp"),
@@ -1955,7 +1959,7 @@ fn compileCudaSources(
 // ----------------------------------------------------------------------------
 const SimdManifestEntry = struct {
     symbol: []const u8,
-    sig: enum { vec_dot, rms_norm_f32, rope_neox_f32 },
+    sig: enum { vec_dot, rms_norm_f32, rope_neox_f32, quantize_row, silu_f32, softmax_f32 },
     needs_avx512: bool = false,
 };
 
@@ -1995,6 +1999,30 @@ const simd_manifest = [_]SimdManifestEntry{
     // unary ops — aarch64 NEON (opt-in via MLZ_SIMD_RMS_NORM=1 / MLZ_SIMD_ROPE=1)
     .{ .symbol = "simd_rms_norm_f32_neon", .sig = .rms_norm_f32 },
     .{ .symbol = "simd_rope_neox_f32_neon", .sig = .rope_neox_f32 },
+    // Quantization kernels — x86
+    .{ .symbol = "simd_quantize_q8_0_f32_avx2", .sig = .quantize_row },
+    .{ .symbol = "simd_quantize_q8_0_f32_avx512", .sig = .quantize_row, .needs_avx512 = true },
+    .{ .symbol = "simd_quantize_q8_k_f32_avx2", .sig = .quantize_row },
+    .{ .symbol = "simd_quantize_q8_k_f32_avx512", .sig = .quantize_row, .needs_avx512 = true },
+    // SiLU — x86
+    .{ .symbol = "simd_silu_f32_avx2", .sig = .silu_f32 },
+    .{ .symbol = "simd_silu_f32_avx512", .sig = .silu_f32, .needs_avx512 = true },
+    // LayerNorm — x86 (reuses rms_norm_f32 sig)
+    .{ .symbol = "simd_layer_norm_f32_avx2", .sig = .rms_norm_f32 },
+    .{ .symbol = "simd_layer_norm_f32_avx512", .sig = .rms_norm_f32, .needs_avx512 = true },
+    // Standard RoPE — x86 (reuses rope_neox_f32 sig)
+    .{ .symbol = "simd_rope_standard_f32_avx2", .sig = .rope_neox_f32 },
+    .{ .symbol = "simd_rope_standard_f32_avx512", .sig = .rope_neox_f32, .needs_avx512 = true },
+    // F32 vec_dot — x86 (reuses vec_dot sig)
+    .{ .symbol = "simd_vec_dot_f32_f32_avx2", .sig = .vec_dot },
+    .{ .symbol = "simd_vec_dot_f32_f32_avx512", .sig = .vec_dot, .needs_avx512 = true },
+    // NEON — aarch64
+    .{ .symbol = "simd_quantize_q8_0_f32_neon", .sig = .quantize_row },
+    .{ .symbol = "simd_quantize_q8_k_f32_neon", .sig = .quantize_row },
+    .{ .symbol = "simd_silu_f32_neon", .sig = .silu_f32 },
+    .{ .symbol = "simd_layer_norm_f32_neon", .sig = .rms_norm_f32 },
+    .{ .symbol = "simd_rope_standard_f32_neon", .sig = .rope_neox_f32 },
+    .{ .symbol = "simd_vec_dot_f32_f32_neon", .sig = .vec_dot },
 };
 
 fn generateSimdManifestHeader(allocator: std.mem.Allocator, no_avx512: bool) ![]const u8 {
@@ -2021,6 +2049,9 @@ fn generateSimdManifestHeader(allocator: std.mem.Allocator, no_avx512: bool) ![]
             .vec_dot => try std.fmt.allocPrint(allocator, "void {s}(int n, float * r, const void * vx, const void * vy);\n", .{e.symbol}),
             .rms_norm_f32 => try std.fmt.allocPrint(allocator, "void {s}(int n, float eps, const float * x, float * y);\n", .{e.symbol}),
             .rope_neox_f32 => try std.fmt.allocPrint(allocator, "void {s}(long long n_pairs, const float * cache, const float * src, float * dst);\n", .{e.symbol}),
+            .quantize_row => try std.fmt.allocPrint(allocator, "void {s}(int n, const float * x, void * y);\n", .{e.symbol}),
+            .silu_f32 => try std.fmt.allocPrint(allocator, "void {s}(int n, const float * x, float * y);\n", .{e.symbol}),
+            .softmax_f32 => try std.fmt.allocPrint(allocator, "void {s}(const float * x, float * y, int n);\n", .{e.symbol}),
         };
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
