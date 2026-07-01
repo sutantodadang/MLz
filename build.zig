@@ -2106,6 +2106,10 @@ fn compileCudaSources(
             cc.addArg("-std=c++17");
             cc.addArg("--extended-lambda");
             cc.addArg("--use-local-env");
+            // GitHub windows runners ship newer MSVC (VS 18/2026) than CUDA's
+            // nvcc host_config.h whitelists (VS 2017-2022). Bypass the version
+            // gate; the CUDA kernels compile fine with the newer cl.
+            cc.addArg("-allow-unsupported-compiler");
             cc.addArg("-ccbin");
             cc.addArg(cl_path_win);
             cc.addArg("-Xcompiler");

@@ -1,15 +1,15 @@
 // ===========================================================================
 //   quantize_q8_0_f32_neon.S — Q8_0 quantization of f32 floats, AArch64 NEON
 // ===========================================================================
-// void simd_quantize_q8_0_f32_neon(int n, const float * x, void * y);
+// void simd_quantize_q8_0_f32_neon(int n, const float * x, void * y)//
 //
 // AAPCS64: w0 = n, x1 = x, x2 = y
 //
 // Quantizes groups of 32 floats into block_q8_0 structs (34 bytes each):
 //   typedef struct {
-//       ggml_half d;       // f16 scale — amax / 127.0f  (2 bytes)
-//       int8_t    qs[32];  // 32 quantised int8 values
-//   } block_q8_0;
+//       ggml_half d//       // f16 scale — amax / 127.0f  (2 bytes)
+//       int8_t    qs[32]//  // 32 quantised int8 values
+//   } block_q8_0//
 //
 // Algorithm — matches ggml's quantize_row_q8_0 (arch/arm/quants.c):
 //   For each block of 32 floats:
@@ -26,7 +26,7 @@
 // Narrowing chain: sqxtn (4×i32→4×i16) + sqxtn2 → then sqxtn (8×i16→8×i8)
 // + sqxtn2 → 16 int8 per q-reg.  Final two q-regs stored at offsets 2 and 18.
 //
-// Validation: U1 (`zig build test-simd`) must be re-run on a real arm64 host;
+// Validation: U1 (`zig build test-simd`) must be re-run on a real arm64 host//
 // this file ships from an x86 dev box and has not been executed locally.
 // License: MIT
 // ===========================================================================
@@ -100,7 +100,7 @@
     // ---------------------------------------------------------------
     fdiv    s6, s5, s16             // s6 = d = amax / 127.0f
     fcvt    h6, s6                  // h6 = f16(d)
-    strh    h6, [x4]                // store at offset 0
+    str     h6, [x4]                // store at offset 0
 
     // ---------------------------------------------------------------
     // 4. id = (amax != 0) ? 127.0f / amax : 0.0f
@@ -169,17 +169,17 @@
     sqxtn   v18.4h, v4.4s
     sqxtn2  v18.8h, v5.4s
 
-    sqxtn   v19.4h, v6.4s           ; v6.4s still contains q6's int32
+    sqxtn   v19.4h, v6.4s           // v6.4s still contains q6's int32
     sqxtn2  v19.8h, v7.4s
 
     // Stage 2 — i16 → i8
-    sqxtn   v0.8b, v16.8h           ; v0[0..7] = narrow(v16)
-    sqxtn2  v0.16b, v17.8h          ; v0[8..15] = narrow(v17)
-    ; v0.16b = [v0_i8, v1_i8, v2_i8, v3_i8] — 16 bytes
+    sqxtn   v0.8b, v16.8h           // v0[0..7] = narrow(v16)
+    sqxtn2  v0.16b, v17.8h          // v0[8..15] = narrow(v17)
+    // v0.16b = [v0_i8, v1_i8, v2_i8, v3_i8] — 16 bytes
 
-    sqxtn   v1.8b, v18.8h           ; v1[0..7] = narrow(v18)
-    sqxtn2  v1.16b, v19.8h          ; v1[8..15] = narrow(v19)
-    ; v1.16b = [v4_i8, v5_i8, v6_i8, v7_i8] — 16 bytes
+    sqxtn   v1.8b, v18.8h           // v1[0..7] = narrow(v18)
+    sqxtn2  v1.16b, v19.8h          // v1[8..15] = narrow(v19)
+    // v1.16b = [v4_i8, v5_i8, v6_i8, v7_i8] — 16 bytes
 
     // ---------------------------------------------------------------
     // 8. Store 32 int8 values at y[i].qs (offset 2)

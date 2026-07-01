@@ -1,7 +1,7 @@
 // ===========================================================================
 //   silu_f32_neon.S — SiLU activation forward pass, AArch64 NEON
 // ===========================================================================
-// void simd_silu_f32_neon(int n, const float * x, float * y);
+// void simd_silu_f32_neon(int n, const float * x, float * y)//
 //
 // AAPCS64: w0 = n, x1 = x, x2 = y
 //
@@ -60,7 +60,7 @@
     dup     v26.4s, v26.s[0]
     dup     v27.4s, v27.s[0]
 
-    ; Polynomial coefficients
+    // Polynomial coefficients
     ldr     s28, [x22, #16]         // c1
     ldr     s29, [x22, #20]         // c2
     ldr     s30, [x22, #24]         // c3
@@ -70,7 +70,7 @@
     dup     v30.4s, v30.s[0]
     dup     v31.4s, v31.s[0]
 
-    ; Clamp constants
+    // Clamp constants
     movi    v20.4s, #0              // clamp lo = 0
     ldr     s21, [x22, #32]         // clamp hi = 254
     dup     v21.4s, v21.s[0]
@@ -78,53 +78,53 @@
     mov     x7, x20                 // src
     mov     x8, x21                 // dst
 
-    ; We'll use v0-v1 for x, v2-v3 for -x/t, v4-v5 for n, v6-v7 for f
-    ; and reuse v0-v1 for results
-    ; Process two q-regs per iteration: v0 (lanes 0-3), v1 (lanes 4-7)
-    ; When we have non-4-wide instructions, process per-q-reg.
+    // We'll use v0-v1 for x, v2-v3 for -x/t, v4-v5 for n, v6-v7 for f
+    // and reuse v0-v1 for results
+    // Process two q-regs per iteration: v0 (lanes 0-3), v1 (lanes 4-7)
+    // When we have non-4-wide instructions, process per-q-reg.
 
 .Lsilu_loop:
-    ld1     {v0.4s, v1.4s}, [x7], #32   ; load 8 floats
+    ld1     {v0.4s, v1.4s}, [x7], #32   // load 8 floats
 
-    ; ---- Process v0 (lanes 0-3) ----
-    ; -x
-    orr     v2.4s, v0.4s, v25.4s        ; v2 = -x (flip sign bit)
-    ; t = -x * log2e
-    fmul    v2.4s, v2.4s, v24.4s        ; v2 = t
-    ; n = round(t)
-    frintn  v4.4s, v2.4s                ; v4 = n
-    ; f = t - n
-    fsub    v6.4s, v2.4s, v4.4s         ; v6 = f in [-0.5, 0.5]
+    // ---- Process v0 (lanes 0-3) ----
+    // -x
+    fneg    v2.4s, v0.4s                // v2 = -x (flip sign bit)
+    // t = -x * log2e
+    fmul    v2.4s, v2.4s, v24.4s        // v2 = t
+    // n = round(t)
+    frintn  v4.4s, v2.4s                // v4 = n
+    // f = t - n
+    fsub    v6.4s, v2.4s, v4.4s         // v6 = f in [-0.5, 0.5]
 
-    ; Polynomial 2^f: (((c4*f + c3)*f + c2)*f + c1)*f + 1.0
-    fmul    v16.4s, v31.4s, v6.4s       ; c4 * f
-    fadd    v16.4s, v16.4s, v30.4s      ; + c3
-    fmul    v16.4s, v16.4s, v6.4s       ; * f
-    fadd    v16.4s, v16.4s, v29.4s      ; + c2
-    fmul    v16.4s, v16.4s, v6.4s       ; * f
-    fadd    v16.4s, v16.4s, v28.4s      ; + c1
-    fmul    v16.4s, v16.4s, v6.4s       ; * f
-    fadd    v16.4s, v16.4s, v27.4s      ; + 1.0 = 2^f
+    // Polynomial 2^f: (((c4*f + c3)*f + c2)*f + c1)*f + 1.0
+    fmul    v16.4s, v31.4s, v6.4s       // c4 * f
+    fadd    v16.4s, v16.4s, v30.4s      // + c3
+    fmul    v16.4s, v16.4s, v6.4s       // * f
+    fadd    v16.4s, v16.4s, v29.4s      // + c2
+    fmul    v16.4s, v16.4s, v6.4s       // * f
+    fadd    v16.4s, v16.4s, v28.4s      // + c1
+    fmul    v16.4s, v16.4s, v6.4s       // * f
+    fadd    v16.4s, v16.4s, v27.4s      // + 1.0 = 2^f
 
-    ; 2^n: (n + 127) << 23, clamped
-    fcvtzs  v17.4s, v4.4s               ; n as int32
-    add     v17.4s, v17.4s, v26.4s      ; n + 127
-    smax    v17.4s, v17.4s, v20.4s      ; clamp lo: max(0, ...)
-    smin    v17.4s, v17.4s, v21.4s      ; clamp hi: min(254, ...)
-    shl     v17.4s, v17.4s, #23         ; float bit pattern for 2^n
+    // 2^n: (n + 127) << 23, clamped
+    fcvtzs  v17.4s, v4.4s               // n as int32
+    add     v17.4s, v17.4s, v26.4s      // n + 127
+    smax    v17.4s, v17.4s, v20.4s      // clamp lo: max(0, ...)
+    smin    v17.4s, v17.4s, v21.4s      // clamp hi: min(254, ...)
+    shl     v17.4s, v17.4s, #23         // float bit pattern for 2^n
 
-    ; exp(-x) = 2^n * 2^f
-    fmul    v2.4s, v17.4s, v16.4s       ; v2 = exp(-x)
+    // exp(-x) = 2^n * 2^f
+    fmul    v2.4s, v17.4s, v16.4s       // v2 = exp(-x)
 
-    ; sigmoid = 1 / (1 + exp(-x))
-    fadd    v2.4s, v2.4s, v27.4s        ; 1 + exp(-x)
-    fdiv    v2.4s, v27.4s, v2.4s        ; sigmoid
+    // sigmoid = 1 / (1 + exp(-x))
+    fadd    v2.4s, v2.4s, v27.4s        // 1 + exp(-x)
+    fdiv    v2.4s, v27.4s, v2.4s        // sigmoid
 
-    ; silu = x * sigmoid
+    // silu = x * sigmoid
     fmul    v0.4s, v0.4s, v2.4s
 
-    ; ---- Process v1 (lanes 4-7) ----
-    orr     v3.4s, v1.4s, v25.4s
+    // ---- Process v1 (lanes 4-7) ----
+    fneg    v3.4s, v1.4s
     fmul    v3.4s, v3.4s, v24.4s
     frintn  v5.4s, v3.4s
     fsub    v7.4s, v3.4s, v5.4s
@@ -140,8 +140,8 @@
 
     fcvtzs  v19.4s, v5.4s
     add     v19.4s, v19.4s, v26.4s
-    smax    v19.4s, v19.4s, v20.4s      ; clamp lo
-    smin    v19.4s, v19.4s, v21.4s      ; clamp hi
+    smax    v19.4s, v19.4s, v20.4s      // clamp lo
+    smin    v19.4s, v19.4s, v21.4s      // clamp hi
     shl     v19.4s, v19.4s, #23
 
     fmul    v3.4s, v19.4s, v18.4s
@@ -174,7 +174,7 @@
 .Lsilu_tail_loop:
     ldr     s0, [x9], #4            // x
 
-    orr     s2, s0, s25             // -x
+    fneg    s2, s0                  // -x
     fmul    s2, s2, s24             // t
     frintn  s4, s2                  // n
     fsub    s6, s2, s4              // f

@@ -2,7 +2,7 @@
 //   vec_dot_f32_f32_neon.S — F32 × F32 Dot Product, AArch64 NEON
 // ===========================================================================
 // void simd_vec_dot_f32_f32_neon(int n, float * r,
-//                                 const void * vx, const void * vy);
+//                                 const void * vx, const void * vy)//
 //
 // AAPCS64: w0=n, x1=r (pointer), x2=vx, x3=vy
 //
@@ -68,19 +68,19 @@
 .Ldot_tail_loop:
     ldr     s0, [x7], #4
     ldr     s2, [x8], #4
-    fmla    s16, s0, s2             // acc into s16 (first lane of v16)
+    fmadd   s16, s0, s2, s16        // acc into s16 (first lane of v16)
 
     subs    w6, w6, #1
     b.ne    .Ldot_tail_loop
 
-    ; --- Horizontal sum -------------------------------------------------------
+    // --- Horizontal sum -------------------------------------------------------
 .Ldot_reduce:
-    ; v16 = 4 accs (lanes 0-3), v17 = 4 accs (lanes 4-7)
-    fadd    v16.4s, v16.4s, v17.4s  ; v16 = combined [s0+s4, s1+s5, s2+s6, s3+s7]
-    faddp   v16.4s, v16.4s, v16.4s  ; v16 = [s0+s4+s1+s5, ..., s2+s6+s3+s7, ...]
-    faddp   v16.4s, v16.4s, v16.4s  ; v16 = [total, total, total, total]
+    // v16 = 4 accs (lanes 0-3), v17 = 4 accs (lanes 4-7)
+    fadd    v16.4s, v16.4s, v17.4s  // v16 = combined [s0+s4, s1+s5, s2+s6, s3+s7]
+    faddp   v16.4s, v16.4s, v16.4s  // v16 = [s0+s4+s1+s5, ..., s2+s6+s3+s7, ...]
+    faddp   v16.4s, v16.4s, v16.4s  // v16 = [total, total, total, total]
 
-    str     s16, [x20]              ; store to *r
+    str     s16, [x20]              // store to *r
     b       .Ldot_done
 
 .Ldot_zero:

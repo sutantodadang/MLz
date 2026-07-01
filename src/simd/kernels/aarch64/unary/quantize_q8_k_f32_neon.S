@@ -72,26 +72,27 @@
     fmax    v16.4s, v16.4s, v2.4s            // update amax[0..3]
     fmax    v17.4s, v17.4s, v3.4s            // update amax[4..7]
 
-    vbit    v18.4s, v0.4s, v4.4s             // update smax[0..3] where GT
-    vbit    v19.4s, v1.4s, v5.4s             // update smax[4..7] where GT
+    bit     v18.16b, v0.16b, v4.16b          // update smax[0..3] where GT
+    bit     v19.16b, v1.16b, v5.16b          // update smax[4..7] where GT
 
     subs    w22, w22, #1
     b.ne    .Lp1_loop
 
     // --- store per-lane results to frame for scalar reduction ---
-    st1     {v16.4s}, [sp, #48]              // amax[0..3]
-    st1     {v17.4s}, [sp, #64]              // amax[4..7]
-    st1     {v18.4s}, [sp, #80]              // smax[0..3]
-    st1     {v19.4s}, [sp, #96]              // smax[4..7]
+    str     q16, [sp, #48]                   // amax[0..3]
+    str     q17, [sp, #64]                   // amax[4..7]
+    str     q18, [sp, #80]                   // smax[0..3]
+    str     q19, [sp, #96]                   // smax[4..7]
 
     // --- scalar search: find global max amax and its signed value ---
     mov     w4, #0                            // best index
     ldr     s0, [sp, #48]                     // best = amax[0]
     mov     w5, #1                            // current index
+    add     x6, sp, #48                       // x6 = &amax[0]
 .Lred_loop:
     cmp     w5, #8
     b.eq    .Lred_done
-    ldr     s1, [sp, #48, w5, uxtw #2]       // amax[w5]
+    ldr     s1, [x6, w5, uxtw #2]            // amax[w5]
     fcmp    s1, s0
     ble     .Lred_next                         // s1 <= s0: skip
     fmov    s0, s1                             // new best
@@ -107,7 +108,8 @@
     beq     .Lzero_block
 
     // --- extract smax at best index ---
-    ldr     s7, [sp, #80, w4, uxtw #2]       // s7 = smax[w4]
+    add     x7, sp, #80                       // x7 = &smax[0]
+    ldr     s7, [x7, w4, uxtw #2]            // s7 = smax[w4]
 
     // ====================================================================
     // Compute iscale = -127.0f / smax,  d = 1.0f / iscale
