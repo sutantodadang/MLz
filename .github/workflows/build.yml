@@ -37,12 +37,13 @@ jobs:
             os: windows-latest
             test: false
             simd: true
-          # Pinned to macos-14: macos-latest (15/26) ships a newer Xcode SDK
-          # that Zig 0.15.2 fails to link its build runner against
-          # (undefined __availability_version_check / libSystem symbols).
+          # os: macos-15 + an Xcode 16.x SDK (macOS 15.x) selected below.
+          # SDK 15.x has the Metal 3.2 APIs ggml needs AND is old enough for
+          # Zig 0.15.2 to link its build runner. The default macos-latest Xcode
+          # (SDK 26 beta) is what broke the link, not SDK 15 itself.
           - name: macOS ARM64
             target: aarch64-macos
-            os: macos-14
+            os: macos-15
             test: true
             simd: true
 
@@ -100,6 +101,22 @@ jobs:
         run: brew install nasm
 
       # ── Platform SDK setup ──
+      # Select the newest Xcode 16.x (macOS 15.x SDK): has the Metal 3.2 APIs
+      # (MTLResidencySet, …) the vendored ggml Metal backend requires, while
+      # being old enough for Zig 0.15.2 to link its build runner. Deliberately
+      # skips any Xcode 26 (SDK 26 beta) — that newer SDK is what broke the link.
+      - name: Select Xcode 16 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then
+            echo "No Xcode 16 found on runner. Available:"
+            ls -d /Applications/Xcode_*.app
+            exit 1
+          fi
+          echo "Selecting $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+
       - name: Set SDKROOT (macOS)
         if: runner.os == 'macOS'
         run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> $GITHUB_ENV
