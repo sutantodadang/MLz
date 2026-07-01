@@ -93,7 +93,12 @@ jobs:
 
       - name: Install NASM (Windows)
         if: matrix.simd && contains(matrix.target, 'x86_64') && runner.os == 'Windows'
-        run: choco install nasm -y
+        # Append NASM to PATH explicitly: choco's PATH update doesn't survive
+        # into the build step on windows-2022 (the CUDA job also runs
+        # msvc-dev-cmd/vcvars, which rewrites PATH), causing nasm FileNotFound.
+        run: |
+          choco install nasm -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
         shell: pwsh
 
       - name: Install NASM (macOS)
