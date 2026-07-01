@@ -37,9 +37,12 @@ jobs:
             os: windows-latest
             test: false
             simd: true
+          # Pinned to macos-14: macos-latest (15/26) ships a newer Xcode SDK
+          # that Zig 0.15.2 fails to link its build runner against
+          # (undefined __availability_version_check / libSystem symbols).
           - name: macOS ARM64
             target: aarch64-macos
-            os: macos-latest
+            os: macos-14
             test: true
             simd: true
 
@@ -50,9 +53,12 @@ jobs:
             test: false
             cuda: true
             simd: true
+          # Pinned to windows-2022: windows-latest (2025) ships only VS2026
+          # (MSVC 14.5x), which CUDA 12.4's nvcc cannot use. windows-2022 has
+          # VS2022 (14.4x), the newest MSVC CUDA 12.4 supports.
           - name: Windows x86_64 CUDA
             target: x86_64-windows-msvc
-            os: windows-latest
+            os: windows-2022
             test: false
             cuda: true
             simd: true
@@ -147,7 +153,9 @@ jobs:
           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev vulkan-headers shaderc
+          # spirv-headers provides <spirv/unified1/spirv.hpp> (into /usr/include,
+          # already on the compile search path); ggml-vulkan.cpp requires it.
+          sudo apt-get install -y libvulkan-dev vulkan-headers shaderc spirv-headers
         env:
           DEBIAN_FRONTEND: noninteractive
 
