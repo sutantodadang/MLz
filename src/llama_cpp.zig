@@ -96,7 +96,12 @@ pub const Context = struct {
     }
 
     pub fn decode(self: Context, batch: c.llama_batch) LlamaError!void {
-        if (c.llama_decode(self.handle, batch) != 0) return LlamaError.DecodeFailed;
+        const rc = c.llama_decode(self.handle, batch);
+        if (rc != 0) {
+            // rc: 1 = no KV slot for batch, 2 = aborted, <0 = fatal error.
+            std.log.err("llama_decode failed: rc={d}, n_tokens={d}", .{ rc, batch.n_tokens });
+            return LlamaError.DecodeFailed;
+        }
     }
 
     pub fn logitsIth(self: Context, i: i32) ?[*]const f32 {
@@ -312,6 +317,45 @@ pub const Batch = struct {
         return self.handle.n_tokens >= self.capacity;
     }
 };
+
+extern fn mlz_render_chat_template(tmpl: ?[*:0]const u8, messages_json: [*:0]const u8, add_generation_prompt: c_int, buf: ?[*]u8, buf_len: c_int) c_int;
+
+const ChatMsgJson = struct { role: []const u8, content: []const u8 };
+
+/// Render the model's chat template via the full jinja engine.
+/// Returns an owned buffer containing UTF-8 text (NOT null-terminated).
+pub fn applyChatTemplateJinja(
+    allocator: std.mem.Allocator,
+    template: ?[*:0]const u8,
+    chat: []const c.llama_chat_message,
+    add_assistant: bool,
+) LlamaError![]u8 {
+    const msgs = allocator.alloc(ChatMsgJson, chat.len) catch return LlamaError.OutOfMemory;
+    defer allocator.free(msgs);
+    for (chat, 0..) |m, i| {
+        msgs[i] = .{ .role = std.mem.span(m.role), .content = std.mem.span(m.content) };
+    }
+
+    const json_bytes = std.json.Stringify.valueAlloc(allocator, msgs, .{}) catch return LlamaError.OutOfMemory;
+    defer allocator.free(json_bytes);
+    const msgs_z = allocator.dupeZ(u8, json_bytes) catch return LlamaError.OutOfMemory;
+    defer allocator.free(msgs_z);
+
+    const add_flag: c_int = if (add_assistant) 1 else 0;
+    const n = mlz_render_chat_template(template, msgs_z.ptr, add_flag, null, 0);
+    if (n < 0) return LlamaError.TemplateFailed;
+
+    const buf = allocator.alloc(u8, @intCast(n + 1)) catch return LlamaError.OutOfMemory;
+    errdefer allocator.free(buf);
+
+    const n2 = mlz_render_chat_template(template, msgs_z.ptr, add_flag, buf.ptr, @intCast(n + 1));
+    if (n2 < 0) return LlamaError.TemplateFailed;
+
+    return allocator.realloc(buf, @intCast(n2)) catch |err| {
+        allocator.free(buf);
+        return err;
+    };
+}
 
 /// Apply the model's chat template to a list of messages.
 /// Returns an owned buffer containing UTF-8 text (NOT null-terminated).

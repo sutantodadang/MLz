@@ -500,6 +500,7 @@ fn handleChatCompletions(
     try sse.sendRole(id, "assistant");
 
     var resp = engine.complete(allocator, req, sse.tokenSink(), id) catch |err| {
+        std.log.err("chat generation failed: {s}", .{@errorName(err)});
         // SSE headers already sent — emit a final error chunk + DONE so the
         // client sees a graceful stream termination rather than a TCP RST.
         try sse.sendError(engineErrorMessage(err), engineErrorType(err));

@@ -1608,6 +1608,7 @@ pub fn build(b: *std.Build) void {
     });
 
     llama_lib.addIncludePath(llama_cpp_dep.path("include"));
+    llama_lib.addIncludePath(llama_cpp_dep.path("common"));
     llama_lib.addIncludePath(llama_cpp_dep.path("src"));
     llama_lib.addIncludePath(llama_cpp_dep.path("ggml/include"));
     llama_lib.addIncludePath(llama_cpp_dep.path("ggml/src"));
@@ -1671,6 +1672,24 @@ pub fn build(b: *std.Build) void {
             .flags = cpp_flags.items,
         });
     }
+
+    llama_lib.addIncludePath(llama_cpp_dep.path("vendor"));
+    llama_lib.addIncludePath(b.path("src"));
+
+    inline for (.{ "caps", "lexer", "parser", "runtime", "string", "value" }) |jinja_src| {
+        llama_lib.addCSourceFile(.{
+            .file = llama_cpp_dep.path("common/jinja/" ++ jinja_src ++ ".cpp"),
+            .flags = cpp_flags.items,
+        });
+    }
+    llama_lib.addCSourceFile(.{
+        .file = llama_cpp_dep.path("common/unicode.cpp"),
+        .flags = cpp_flags.items,
+    });
+    llama_lib.addCSourceFile(.{
+        .file = b.path("src/jinja_shim.cpp"),
+        .flags = cpp_flags.items,
+    });
 
     llama_lib.linkLibC();
     if (actual_target.query.abi != .msvc) {

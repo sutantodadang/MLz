@@ -43,7 +43,8 @@ pub fn buildPrompt(
         };
     }
 
-    const formatted = try llama_cpp.applyChatTemplate(allocator, tmpl, chat_msgs, true);
+    const formatted = llama_cpp.applyChatTemplateJinja(allocator, tmpl, chat_msgs, true) catch
+        try llama_cpp.applyChatTemplate(allocator, tmpl, chat_msgs, true);
     errdefer allocator.free(formatted);
 
     const tokens = try llama_cpp.tokenize(allocator, vocab, formatted, true, true);
