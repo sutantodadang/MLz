@@ -100,7 +100,12 @@ jobs:
 
       - name: Setup MSVC (Windows CUDA)
         if: matrix.cuda && runner.os == 'Windows'
+        # Pin to VS2022 (MSVC 14.4x). CUDA 12.4's nvcc rejects newer MSVC
+        # (VS2026/14.5x): its host_config.h only allows VS 2017-2022, and even
+        # bypassing that gate the CUDA 12.4 headers fail to compile under 14.5x.
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: "2022"
 
       # ── CUDA setup ──
       - name: Setup CUDA (Linux)

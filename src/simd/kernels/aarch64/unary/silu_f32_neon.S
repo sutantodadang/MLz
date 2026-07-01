@@ -43,8 +43,7 @@
     cbz     w19, .Lsilu_done
 
     // Load scalar constants (will broadcast into vectors below)
-    adrp    x22, .Lsilu_consts
-    add     x22, x22, :lo12:.Lsilu_consts
+    ADRP_LO12(x22, .Lsilu_consts)
 
     // --- Main loop (8 floats / iter) -----------------------------------------
     lsr     w6, w19, #3             // w6 = n / 8
@@ -218,7 +217,7 @@
 // ---------------------------------------------------------------------------
 // Read-only constants
 // ---------------------------------------------------------------------------
-    .section .rodata
+    RODATA_SECTION
     .align 4
 .Lsilu_consts:
     .word   0x3FB8AA3B     // log2(e) = 1.4426950f
