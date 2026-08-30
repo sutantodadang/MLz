@@ -7,3 +7,4 @@ models
 .sisyphus/
 deps/
 mlz.toml
+.kode

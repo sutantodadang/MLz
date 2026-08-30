@@ -1,5 +1,7 @@
 # MLz Roadmap — vLLM/SGLang throughput, LM Studio ease, config-first tuning
 
+> Active implementation tracker: [Bounded Tensor Residency — Plan & Progress](docs/residency-plan.md)
+
 ## Positioning
 
 MLz = thin, fast Zig serving layer over llama.cpp (GGML compute + GPU backends)

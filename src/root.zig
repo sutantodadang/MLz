@@ -13,6 +13,10 @@ pub const chat = @import("chat.zig");
 pub const models = @import("models.zig");
 pub const model_manager = @import("model_manager.zig");
 pub const embeddings = @import("embeddings.zig");
+pub const residency = @import("residency.zig");
+pub const gguf_residency = @import("gguf_residency.zig");
+pub const residency_compute = @import("residency_compute.zig");
+pub const residency_executor = @import("residency_executor.zig");
 
 test {
     // Run tests in all imported modules

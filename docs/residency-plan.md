@@ -1,0 +1,319 @@
+# Bounded Tensor Residency — Implementation Plan & Progress
+
+Dokumen ini adalah tracker hidup untuk implementasi resident memory terbatas di MLz. Status hanya ditandai selesai setelah kode dikompilasi dan diuji.
+
+## Goal
+
+Membuktikan bahwa MLz dapat mengakses tensor/model dari backing file dengan active mapped memory yang dibatasi secara eksplisit, melakukan fault secara transparan, dan mengembalikan data yang benar setelah eviction.
+
+> Catatan scope: `resident_bytes` saat ini mengukur active mmap ranges yang dikelola residency layer, bukan total RSS proses atau filesystem page cache.
+
+## Design invariants
+
+1. Caller menyimpan `TensorHandle`, bukan pointer permanen.
+2. Setiap pointer hanya valid selama `TensorView` masih dipin dan belum `release()`.
+3. `resident_bytes` tidak boleh melebihi `budget_bytes`.
+4. Eviction hanya boleh memilih mapping yang tidak dipin.
+5. Fault ulang harus membaca byte yang sama dari backing file.
+6. Accounting memakai ukuran mapping aktual termasuk alignment prefix OS.
+7. Tensor lebih besar dari budget harus dapat diproses melalui bounded range/chunk views.
+
+## Progress
+
+| Phase | Status | Deliverable | Acceptance criteria |
+|---|---|---|---|
+| 0. Audit & design | Selesai | Adaptasi desain ke Zig 0.15 dan codebase aktual | Tidak mengganti GGML secara paksa; jalur lama tetap build |
+| 1. Residency core | Selesai | `TensorHandle`, `BackingStore`, mmap, budget, LRU, pinning, metrics | Fault/hit/eviction teruji; budget mapping tidak terlampaui |
+| 2. Chunk/range access | Selesai | `Manager.acquireRange()` | Tensor > budget dapat dibaca per window; remap saat pinned ditolak |
+| 3. Benchmark harness | Selesai | `zig build bench-residency` | Baseline, bounded multi-tensor, dan large-tensor chunked dilaporkan |
+| 4. GGUF metadata bridge | Selesai | Parse/index nama, offset, ukuran, tipe, dan dimensi tensor GGUF menjadi descriptor/handle | Descriptor tervalidasi terhadap batas file; fixture GGUF nyata berhasil fault melalui manager |
+| 5. Compute integration | Selesai | `matVecF32` serta quantized dispatch Q4_0/Q4_K/Q6_K mengonsumsi descriptor GGUF melalui range views; validator berjalan pada model GGUF nyata | Proof kernel identik baseline; model Llama 3.2 1B nyata tervalidasi dengan budget 4 MiB |
+| 6. End-to-end memory proof | Selesai | CPU execution adapter dengan bounded pin lifetime, full token path (embedding, seluruh decoder blocks, output norm, LM head), prompt prefill, incremental append/KV reuse, CLI budget, RSS instrumentation, dan llama.cpp reference tersedia | Resident-vs-bounded logits identik; prefill-vs-incremental identik; llama.cpp reference berada dalam toleransi numerik dan top-1 sama pada Llama 3.2 1B nyata |
+| 7. Concurrency/prefetch | Selesai | Thread-safe manager, bounded fixed-worker prefetch scheduler, sync page prefault, adaptive budget-aware tile policy, configurable replacement, dan long token-loop benchmark | Concurrent acquire/release menjaga invariant budget; queue menerapkan backpressure; prefetched acquire menjadi hit; adaptive tiles identik dan mengurangi faults; tuning tidak diklaim lebih cepat bila benchmark tidak mendukung |
+| 8. Batched prefill & execution proof | Selesai | Batched F32/quantized projection, layer-major causal Llama prefill, prompt 128/512 benchmark, same-window shared-manager executor stress, dan bounded Qwen3-Next Q2_K projection probe | Prefill identik dengan incremental; one-scan projection reuse mengurangi faults; prompt tetap dalam weight budget; Qwen probe tidak mengklaim graph DeltaNet/MoE penuh |
+
+## Implemented API
+
+```zig
+var store = try residency.BackingStore.open(path_z);
+var manager = try residency.Manager.init(allocator, &store, budget_bytes);
+
+try manager.register(.{ .id = 1 }, tensor_file_offset, tensor_len);
+
+// Whole tensor, jika muat dalam budget.
+var whole = try manager.acquire(.{ .id = 1 });
+defer whole.release();
+
+// Window tensor, termasuk jika tensor lebih besar dari budget.
+// Compute tiler dapat membatasi ukuran request terhadap overhead alignment OS.
+const capacity = try manager.rangeCapacity(.{ .id = 1 }, chunk_offset);
+var chunk = try manager.acquireRange(.{ .id = 1 }, chunk_offset, @min(chunk_len, capacity));
+defer chunk.release();
+consume(chunk.bytes());
+```
+
+`acquireRange()` menggunakan mapping resident yang sudah mencakup requested range sebagai hit. Jika range baru memerlukan remap pada tensor yang sama sementara view lama masih dipin, operasi mengembalikan `error.TensorBusy` agar pointer lama tidak menjadi dangling.
+
+## Phase 7 API
+
+Seluruh operasi registry, fault, pin/release, LRU, metrics, dan prefetch pada `Manager` sekarang diserialisasi oleh mutex internal. `TensorView` menyimpan slice dari mapping yang telah dipin, sehingga `bytes()` tidak perlu mengakses hash map manager di luar lock.
+
+```zig
+// Synchronous mmap + native-page prefault; pin dilepas sebelum return.
+try manager.prefetchRange(handle, tensor_offset, len);
+
+// Explicit asynchronous task. Caller wajib wait tepat sekali sebelum manager
+// atau backing store dihancurkan.
+var task = try manager.prefetchRangeAsync(allocator, handle, tensor_offset, len);
+try task.wait();
+
+// Bounded fixed-worker scheduler. Submission never grows memory without limit:
+// a saturated queue returns error.PrefetchQueueFull.
+const scheduler = try residency.PrefetchScheduler.init(allocator, &manager, 1, 2);
+defer scheduler.deinit();
+var scheduled = try scheduler.submit(handle, tensor_offset, len);
+try scheduled.wait();
+
+manager.setReplacementPolicy(.largest_first);
+
+try executor.setTilePolicy(.{ .adaptive = .{
+    .target_bytes = 0, // gunakan kapasitas budget/alignment maksimum
+    .max_rows = 256,
+    .prefault = true,
+} });
+```
+
+Adaptive policy dihitung ulang pada setiap offset karena alignment prefix mmap dapat berubah. Existing fixed-row APIs tetap menjadi compatibility wrappers. Prefault menyentuh halaman virtual native dan byte terakhir secara sinkron; ini bukan mlock dan OS tetap boleh membuang page setelahnya.
+
+## Phase 8 API dan hasil
+
+`CpuExecutor.matMul()` menerima activation rows `[batch, columns]` dan menjaga setiap weight tile tetap dipin selama seluruh batch diproses. `modelPrefill()` menggunakan primitive ini secara layer-major untuk Q/K/V/O dan gate/up/down, lalu menjalankan causal attention dengan KV cache yang sama dengan incremental path. Prompt workspace dialokasikan dan dilaporkan eksplisit; batch quantization scratch tumbuh reusable sampai batch terbesar.
+
+```zig
+var prompt = try residency_executor.PrefillWorkspace.init(allocator, token_count, hidden, intermediate);
+defer prompt.deinit();
+try executor.modelPrefill(embedding, layers, output_norm, output_weight,
+    tokens, config, caches, &prompt, states, logits);
+```
+
+Validasi Llama 3.2 1B Q4_K_M, budget mapped weight 4 MiB:
+
+```text
+prompt 128: 5223.42 ms, 24.51 token/s, faults=430, peak-map=4 MiB
+prompt 512: 21663.06 ms, 23.63 token/s, faults=814, peak-map=4 MiB
+resident-vs-bounded max error: 0
+prefill-vs-incremental max error: 0
+llama.cpp top-1: sama untuk prompt 128 dan 512
+```
+
+Fault tidak konstan karena token embedding row lookup tetap satu fault per token; projection weights hanya discan sekali per layer. Strict Phase-6 llama.cpp tolerance tetap berlaku dan menjadi gate untuk prompt pendek. Pada prompt 128/512 scalar reduction drift melewati threshold tersebut; validator menandainya `mismatch` dan hanya mencatat long-prompt reference secara informational. Completion Phase 8 untuk prompt panjang digate oleh exact resident-vs-bounded, exact prefill-vs-incremental, finite logits, budget invariant, dan top-1 reference yang sama—bukan oleh klaim numerical-reference pass.
+
+Probe model `Qwen3-Coder-Next-Q2_K.gguf` (27.2 GiB) sengaja tidak menjalankan graph Qwen penuh. Ia memilih projection Q2_K 2D terkecil yang lebih besar dari budget, lalu membandingkan empat matvec dengan satu batched pass tanpa full-tensor baseline atau llama.cpp model load:
+
+```text
+blk.0.attn_qkv.weight, 8192x2048, 5.25 MiB, batch=4
+repeated: 19.23 ms, faults=128
+batched:   3.83 ms, faults=32
+peak mapped: 0.22 MiB / 4 MiB budget
+max error: 0, current RSS: 6.24 MiB
+```
+
+Ini membuktikan kompatibilitas metadata GGUF + bounded canonical Q2_K projection. DeltaNet, hybrid layer schedule, shared/routed MoE orchestration, dan recurrent state Qwen3-Next belum diimplementasikan sehingga full Qwen inference tidak diklaim.
+
+## Verification log
+
+### Unit tests and existing functionality
+
+```text
+zig build test -Dsimd-backend=false
+PASS
+```
+
+Coverage residency saat ini:
+
+- first fault dan cache hit;
+- LRU ordering dan transparent re-fault;
+- data benar setelah eviction;
+- pinned mapping tidak dapat dieviction;
+- mmap alignment overhead masuk accounting;
+- invalid range dan oversized whole-tensor access ditolak;
+- tensor tiga kali budget dapat ditraverse melalui tiga range views;
+- containing mapping menghasilkan range hit;
+- pinned view mencegah remap tensor yang sama;
+- fixture GGUF v3 nyata mengindeks nama, absolute offset, ukuran, tipe, dan dimensi;
+- descriptor GGUF yang melewati batas backing file ditolak;
+- registrasi index GGUF bersifat transactional dan rollback saat terjadi konflik;
+- byte tensor fixture di-fault melalui handle hasil index, bukan dibaca oleh parser metadata;
+- proof kernel F32 matvec membaca matrix per row tile melalui pinned range views;
+- proof kernel quantized memakai satu dispatch untuk Q4_0, Q4_K, dan Q6_K dengan layout GGUF/GGML asli serta canonical ggml dequantizer per row;
+- baseline resident penuh dan bounded adaptive tiles untuk Q4_0/Q4_K/Q6_K menghasilkan output identik dengan canonical dequantized reference;
+- compute tiling menyesuaikan kapasitas range terhadap alignment prefix mmap aktual;
+- bounded matvec untuk logical matrix tiga kali budget identik dengan baseline resident penuh dan peak mapping tetap dalam budget;
+- executable `validate-residency` membuka GGUF produksi, memilih tensor 2D yang didukung, dan membandingkan full-resident dengan bounded output;
+- RSS current/peak dilaporkan melalui Windows process working set, Linux `/proc`/`getrusage`, dan macOS `getrusage`;
+- `CpuExecutor` tidak menyimpan atau mengembalikan pointer weight; setiap matvec menyelesaikan pinned tile sebelum operasi berikutnya;
+- proof subgraph SwiGLU menjalankan `down(silu(gate(input)) * up(input))` dengan scratch dan dua activation buffer yang di-account terpisah;
+- baseline dan bounded layer-0 FFN dari GGUF produksi menghasilkan output identik;
+- RMSNorm F32 weight dibaca dalam pinned scope dan residual dikerjakan di activation state;
+- single-token grouped-query attention menjalankan bounded Q/K/V/O projections, RoPE, causal softmax, dan writable KV cache;
+- two-token decoder fixture membuktikan bounded layer identik dengan resident baseline serta memisahkan weight, executor activation, attention workspace, dan KV-cache accounting;
+- validator GGUF produksi menjalankan layer 0 lengkap (attention + residual + FFN) baseline-vs-bounded;
+- token embedding lookup membaca dan, bila perlu, mendequantisasi hanya satu row melalui bounded view;
+- full token path menjalankan embedding, seluruh decoder blocks, output RMSNorm, dan LM head tanpa menyimpan pointer mapped weight;
+- prompt-style multi-token execution dan incremental one-token append memakai KV cache yang sama, dengan logits final identik;
+- Llama normal RoPE memakai pasangan nilai berurutan sesuai `LLAMA_ROPE_TYPE_NORM`, bukan layout half-head NeoX;
+- validator GGUF produksi membandingkan seluruh 128.256 logits resident-vs-bounded dan meng-account KV cache semua layer secara terpisah;
+- reference harness memuat model CPU/non-mmap melalui llama.cpp dan memvalidasi error numerik terbatas serta top-1 yang sama;
+- concurrent readers pada beberapa tensor berbagi manager dengan fault/hit/release yang terserialisasi dan peak mapping tetap di bawah budget;
+- synchronous dan asynchronous prefetch menyentuh setiap native OS page, lalu acquire berikutnya tercatat sebagai residency hit;
+- bounded fixed-worker scheduler menerapkan queue backpressure, drain-on-shutdown, task failure propagation, dan tidak membuat satu thread per request;
+- prefault melepas mutex manager saat native page touch berlangsung namun mempertahankan mapping melalui pin;
+- replacement dapat dipilih antara exact LRU dan largest-first; largest-first membebaskan window besar dengan satu eviction pada workload campuran;
+- adaptive F32 tiling mempertahankan output fixed path, memakai window maksimum yang diizinkan budget/alignment, dan mengurangi fault count;
+- `CpuExecutor` menerapkan tile policy yang sama pada dense F32, canonical GGML quantized dot, dan expert/MoE slices.
+
+### Real-model validation
+
+Command:
+
+```text
+zig build validate-residency -Doptimize=ReleaseFast -Dsimd-backend=false -- \
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 4 4
+```
+
+Snapshot lokal Windows:
+
+| Tensor | Type/size | Baseline | Bounded 4 MiB | Peak map | Faults/evictions | Baseline RSS | Bounded RSS | Error |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `token_embd.weight` | Q6_K / 205.49 MiB | 264.17 ms | 288.80 ms | 4.00 MiB | 53 / 52 | 210.09 MiB | 5.82 MiB | 0 |
+| `blk.0.attn_k.weight` | Q4_K / 0.56 MiB | 0.94 ms | 1.01 ms | 0.59 MiB | 1 / 0 | 4.72 MiB | 4.72 MiB | 0 |
+| `blk.0.attn_output.weight` | Q4_K / 2.25 MiB | 3.44 ms | 3.41 ms | 2.29 MiB | 1 / 0 | 6.43 MiB | 6.44 MiB | 0 |
+| `blk.0.attn_q.weight` | Q4_K / 2.25 MiB | 3.50 ms | 3.51 ms | 2.29 MiB | 1 / 0 | 6.44 MiB | 6.45 MiB | 0 |
+
+### Phase 7 benchmark snapshot
+
+Command:
+
+```text
+zig build bench-residency -Doptimize=ReleaseFast -Dsimd-backend=false
+```
+
+Snapshot lokal Windows:
+
+| Workload | Time | Peak map | Faults | Hits/prefetches |
+|---|---:|---:|---:|---:|
+| Semua 8 tensor resident | 2.13 ms | 8 MiB | 8 | 120 / 0 |
+| Budget 2 MiB | 26.13 ms | 2 MiB | 128 | 0 / 0 |
+| Tensor 8 MiB, window 1 MiB | 26.06 ms | 1 MiB | 128 | 0 / 0 |
+| Tensor 8 MiB, sync-prefault 1 MiB | 25.78 ms | 1 MiB | 128 | 128 / 128 |
+| Scheduled look-ahead, budget 2 MiB | 27.88 ms | 2 MiB | 128 | 128 / 128 |
+| Token loop 128 token, bounded | 206.48 ms | 2 MiB | 1024 | 0 / 0 |
+| Token loop 128 token, scheduled | 289.90 ms | 2 MiB | 1024 | 1024 / 1024 |
+
+Snapshot ini menunjukkan scheduler memenuhi correctness/backpressure tetapi bukan speedup pada warm-cache synthetic workload Windows: token loop naik dari 1.61 menjadi 2.26 ms/token. Sinkronisasi worker lebih mahal daripada page fault yang berhasil disembunyikan. Karena itu prefetch tetap opt-in dan tidak dijadikan default executor policy.
+
+Phase 7 completion notes:
+
+- scheduler memakai fixed worker count dan bounded queue; cancellation per-task belum tersedia karena shutdown sengaja menguras semua task yang sudah diterima;
+- executor dan KV cache tetap single-owner walaupun manager aman dipakai multi-thread;
+- satu tensor tetap hanya memiliki satu active mapped window, sehingga double-buffer current/next-window pada tensor yang sama belum tersedia;
+- LRU/largest-first masih melakukan scan registry `O(n)`; CLOCK/2Q memerlukan struktur intrusive tambahan;
+- prompt prefill masih token-by-token secara internal; optimized batched kernel dipindahkan ke fase throughput berikutnya;
+- benchmark panjang saat ini synthetic 128-token weight traversal, bukan full 1B-model generation benchmark.
+
+Phase 7 ditandai selesai karena acceptance correctness, bounded queue, adaptive policy, replacement selection, dan long-loop measurement terpenuhi. Hasil benchmark negatif dipertahankan untuk mencegah prefetch diaktifkan secara default tanpa bukti per-platform.
+
+current RSS adalah pembanding yang relevan pada tool ini.
+
+Validator sekarang juga menjalankan weight-bearing subgraph layer 0:
+
+```text
+layer-0 SwiGLU FFN: baseline=56.36 ms, bounded=55.45 ms, max-error=0,
+checksum=9.233231, weight-map=4.00/4.00 MiB peak/budget,
+scratch=32.00 KiB, activations=64.00 KiB, faults=10, evictions=9,
+baseline-rss=18.90 MiB, bounded-rss=7.08 MiB
+```
+
+Subgraph memakai tensor `blk.0.ffn_gate.weight`, `blk.0.ffn_up.weight`, dan `blk.0.ffn_down.weight` dari GGUF nyata. Angka ini snapshot lokal dan bukan benchmark throughput stabil; acceptance criterion-nya adalah output identik, lifetime pin terbatas per tile, dan accounting memory terpisah.
+
+Full-model single-token snapshot pada model yang sama, token id 1:
+
+```text
+full single-token logits: token=1, layers=16, vocab=128256,
+baseline=1826.78 ms, bounded=1262.08 ms, max-error=0,
+checksum=-17647.454345, argmax=16309,
+weight-map=4.00/4.00 MiB peak/budget,
+scratch=32.00 KiB, executor-activations=64.00 KiB,
+attention-workspace=16.00 KiB, all-layer-kv=64.06 KiB,
+faults=303, evictions=302,
+baseline-rss=204.79 MiB, bounded-rss=7.82 MiB
+```
+
+Perbandingan resident-vs-bounded memakai executor Zig yang sama dan bit-identik. Reference llama.cpp CPU/non-mmap juga dijalankan terhadap token yang sama. Karena orchestration/reduction scalar adapter tidak bit-identik dengan graph GGML, acceptance reference memakai batas `max-error <= 0.5`, `mean-error <= 0.1`, seluruh nilai finite, dan top-1/argmax yang sama; toleransi ini diverifikasi pada single-token dan sequence dua token.
+
+Snapshot Phase 6 final pada model yang sama dengan budget 4 MiB:
+
+```text
+single token [1]: resident-vs-bounded max-error=0, peak-map=4.00 MiB,
+llama.cpp max-error=0.198390, mean-error=0.038467, argmax=11/11, status=close
+
+prefill [1,2]: resident-vs-bounded max-error=0, peak-map=4.00 MiB,
+llama.cpp max-error=0.303819, mean-error=0.051097, argmax=62/62, status=close
+
+incremental append [1] lalu [2]: max-error-vs-prefill=0,
+argmax=62, KV=128.13 KiB, peak-map=4.00 MiB
+```
+
+Reference sengaja memakai `use_mmap=false`, `n_gpu_layers=0`, satu thread, serta K/Q/V offload dan flash attention nonaktif. RSS reference (~829 MiB pada snapshot) berada di luar bounded manager; RSS bounded executor setelah full single-token run ~8.39 MiB.
+
+Validator juga menjalankan satu decoder layer lengkap untuk satu token memakai metadata head/RMS/RoPE dan sembilan tensor layer 0 dari model yang sama:
+
+```text
+layer-0 single-token decoder: baseline=71.48 ms, bounded=70.45 ms,
+max-error=0, checksum=-4.557518, weight-map=4.00/4.00 MiB peak/budget,
+scratch=32.00 KiB, executor-activations=64.00 KiB,
+attention-workspace=16.00 KiB, kv-cache=4.00 KiB,
+faults=16, evictions=15, baseline-rss=17.93 MiB, bounded-rss=6.11 MiB
+```
+
+Ini adalah perbandingan resident-vs-bounded untuk adapter Zig yang sama; belum merupakan validasi numerik terhadap intermediate llama.cpp.
+
+### Benchmark snapshot
+
+Command:
+
+```text
+zig build bench-residency -Doptimize=ReleaseFast -Dsimd-backend=false
+```
+
+Snapshot Windows lokal (angka waktu dapat berubah antar run):
+
+| Workload | Time | Peak active mapping | Faults | Evictions |
+|---|---:|---:|---:|---:|
+| 8 tensor resident (baseline) | 2.49 ms | 8 MiB | 8 | 0 |
+| 8 tensor, budget 2 MiB | 33.19 ms | 2 MiB | 128 | 126 |
+| 1 tensor 8 MiB, chunk 1 MiB, budget 1 MiB | 29.04 ms | 1 MiB | 128 | 127 |
+
+Sequential scan ini sengaja merupakan worst case untuk LRU. Target fase ini bukan speedup, tetapi bukti batas mapping eksplisit dan recovery transparan dari backing file. Chunked path berhasil memproses logical tensor 8 MiB dengan peak active mapping 1 MiB.
+
+## Current limitations
+
+- Full Llama token path, prompt-style sequence execution, incremental KV reuse, dan llama.cpp reference sudah divalidasi pada model produksi nyata. Adapter tetap merupakan executor proof MLz, bukan tensor loader/backend resmi llama.cpp/GGML; reference logits dekat dan top-1 sama tetapi tidak bit-identik karena urutan reduksi/orchestration berbeda.
+- Implementasi attention mendukung Llama causal decoding dan layer-major prompt prefill, even head dimension, Llama normal adjacent-pair RoPE, dan metadata Llama dasar. RoPE scaling variants, sliding-window attention, attention bias, multimodal architectures, dan batch paralel antar sequence belum didukung.
+- Budget bukan batas total RSS; page cache OS, allocator, GPU memory, dan buffer llama.cpp berada di luar accounting. Executor kini memisahkan mapped weights, dequant scratch, activation buffers, attention workspace, dan KV cache miliknya.
+- Manager registry/fault/pin/release/metrics thread-safe; executor dan KV cache tetap single-owner. Beberapa executor dapat berbagi manager saat mereka memakai resident window yang sama, tetapi divergent tiles pada tensor sama dapat menerima `TensorBusy`; serving-grade multi-sequence scheduling belum selesai.
+- Read-only mapping saja.
+- Satu entry hanya memiliki satu mapped window; range lain pada tensor yang sama memerlukan release lalu remap.
+- Prefetch scheduler bounded dan fixed-worker, tetapi belum mendukung cancellation atau same-tensor double buffering. Prefetch opt-in karena warm-cache benchmark lokal menunjukkan overhead.
+- Replacement tersedia sebagai LRU dan largest-first, keduanya masih melakukan scan registry `O(n)`.
+
+## Next implementation step
+
+Phase 9 berfokus pada serving-grade execution dan architecture coverage:
+
+1. Tambahkan prompt chunking agar workspace 128/512 tidak harus tumbuh sampai seluruh context.
+2. Integrasikan layer-major prefill ke request path MLz, bukan hanya validator proof executor.
+3. Tambahkan sequence scheduler dengan executor/KV cache terpisah dan shared manager; same-tensor multi-window membutuhkan entry/window redesign.
+4. Optimalkan attention serta matrix kernels (SIMD/thread pool); Phase 8 scalar proof jauh lebih lambat dari llama.cpp.
+5. Implementasikan Qwen3-Next hybrid schedule, DeltaNet recurrent state, Q/K norm/gating, dan shared+routed MoE sebelum mengaktifkan full-model Qwen validator.
+6. Pertahankan exact resident/bounded dan prefill/incremental gates, serta short-prompt llama.cpp tolerance tanpa dilonggarkan.

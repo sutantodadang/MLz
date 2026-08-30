@@ -63,6 +63,8 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    const llama_cpp_dep = b.dependency("llama_cpp", .{});
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -81,6 +83,13 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = actual_target,
+        .link_libc = true,
+    });
+    mod.addIncludePath(b.path("src"));
+    mod.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    mod.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -99,8 +108,6 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
-    const llama_cpp_dep = b.dependency("llama_cpp", .{});
-
     var c_flags: std.ArrayList([]const u8) = .empty;
     var cpp_flags: std.ArrayList([]const u8) = .empty;
 
@@ -1915,6 +1922,54 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run SIMD benchmarks");
     bench_step.dependOn(&bench_run.step);
 
+    // Bounded tensor-residency benchmark. This is intentionally standalone:
+    // it exercises the real mmap/fault/LRU path without requiring a GGUF model.
+    const residency_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_residency.zig"),
+        .target = actual_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    residency_module.addIncludePath(b.path("src"));
+    residency_module.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const bench_residency_exe = b.addExecutable(.{
+        .name = "bench_residency",
+        .root_module = residency_module,
+    });
+    const bench_residency_run = b.addRunArtifact(bench_residency_exe);
+    if (b.args) |args| bench_residency_run.addArgs(args);
+    const bench_residency_step = b.step("bench-residency", "Benchmark bounded mmap tensor residency");
+    bench_residency_step.dependOn(&bench_residency_run.step);
+
+    // Opt-in validator for real GGUF model files. Example:
+    // zig build validate-residency -- models/model.gguf 16 4
+    const validate_residency_module = b.createModule(.{
+        .root_source_file = b.path("src/validate_residency.zig"),
+        .target = actual_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    validate_residency_module.addIncludePath(b.path("src"));
+    validate_residency_module.addIncludePath(llama_cpp_dep.path("include"));
+    validate_residency_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    validate_residency_module.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const validate_residency_exe = b.addExecutable(.{
+        .name = "validate_residency",
+        .root_module = validate_residency_module,
+    });
+    validate_residency_exe.linkLibrary(ggml_lib);
+    validate_residency_exe.linkLibrary(llama_lib);
+    const validate_residency_run = b.addRunArtifact(validate_residency_exe);
+    if (b.args) |args| validate_residency_run.addArgs(args);
+    const validate_residency_step = b.step("validate-residency", "Validate bounded compute against a real GGUF model");
+    validate_residency_step.dependOn(&validate_residency_run.step);
+
     // U1 — Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
     // Generates random F32 vectors, quantizes via ggml's reference, calls every
     // built kernel, and asserts the result matches a scalar dequantize-then-dot
@@ -1948,13 +2003,22 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run tests");
-    const mod_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = actual_target,
-            .optimize = optimize,
-        }),
+    const mod_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = actual_target,
+        .optimize = optimize,
+        .link_libc = true,
     });
+    mod_test_module.addIncludePath(b.path("src"));
+    mod_test_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    mod_test_module.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const mod_tests = b.addTest(.{
+        .root_module = mod_test_module,
+    });
+    mod_tests.linkLibrary(ggml_lib);
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
 }
 
