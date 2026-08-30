@@ -1628,6 +1628,220 @@ test "chunked prefill matches full prefill and incremental append exactly" {
     for (full_logits, incremental_logits) |expected, actual| try std.testing.expectEqual(expected, actual);
 }
 
+const GenerationContext = struct {
+    manager: *residency.Manager,
+    embedding: *const gguf.TensorDescriptor,
+    layers: []const DecoderLayerWeights,
+    output_norm: *const gguf.TensorDescriptor,
+    head: *const gguf.TensorDescriptor,
+    config: AttentionConfig,
+    tokens: []const usize,
+    logits: [][3]f32,
+    failed: bool = false,
+
+    fn run(self: *GenerationContext) void {
+        const allocator = std.heap.page_allocator;
+        var executor = CpuExecutor.init(allocator, self.manager, 6, 6, 6) catch {
+            self.failed = true;
+            return;
+        };
+        defer executor.deinit();
+        var cache = KvCache.init(allocator, 8, 2) catch {
+            self.failed = true;
+            return;
+        };
+        defer cache.deinit();
+        var workspace = AttentionWorkspace.init(allocator, 4) catch {
+            self.failed = true;
+            return;
+        };
+        defer workspace.deinit();
+        var state: [4]f32 = undefined;
+        for (self.tokens, 0..) |token, step| {
+            const single = [1]usize{token};
+            self.runStep(&executor, &single, &state, &self.logits[step], &cache, &workspace) catch {
+                self.failed = true;
+                return;
+            };
+        }
+    }
+
+    fn runStep(
+        self: *GenerationContext,
+        executor: *CpuExecutor,
+        single: *const [1]usize,
+        state: *[4]f32,
+        out: *[3]f32,
+        cache: *KvCache,
+        workspace: *AttentionWorkspace,
+    ) !void {
+        try executor.modelTokens(self.embedding, self.layers, self.output_norm, self.head, single, self.config, @as(*[1]KvCache, @ptrCast(cache)), workspace, state, out);
+    }
+};
+
+test "concurrent multi-sequence generation matches sequential baseline through one manager" {
+    const allocator = std.testing.allocator;
+    const granularity = try residency.mappingGranularity();
+    const hidden: usize = 4;
+    const vocab: usize = 3;
+    const intermediate: usize = 6;
+    const tokens = [_]usize{ 0, 2, 1 };
+    const config = AttentionConfig{ .head_count = 2, .kv_head_count = 1, .head_dim = 2 };
+
+    var prng = std.Random.DefaultPrng.init(0xfa11);
+    const random = prng.random();
+    const norm = [_]f32{ 1.0, 0.8, 1.2, 0.9 };
+    const ffn_norm = [_]f32{ 0.9, 1.1, 0.8, 1.0 };
+    const embedding_values = try allocator.alloc(f32, hidden * vocab);
+    defer allocator.free(embedding_values);
+    for (embedding_values) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+    const head_values = try allocator.alloc(f32, hidden * vocab);
+    defer allocator.free(head_values);
+    for (head_values) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+    const query_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(query_values);
+    for (query_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const key_values = try allocator.alloc(f32, 2 * hidden);
+    defer allocator.free(key_values);
+    for (key_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const value_values = try allocator.alloc(f32, 2 * hidden);
+    defer allocator.free(value_values);
+    for (value_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const output_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(output_values);
+    for (output_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const gate_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(gate_values);
+    for (gate_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const up_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(up_values);
+    for (up_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const down_values = try allocator.alloc(f32, intermediate * hidden);
+    defer allocator.free(down_values);
+    for (down_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+
+    const tensors = [_][]const f32{
+        embedding_values, head_values,   &norm,     query_values, key_values,
+        value_values,     output_values, &ffn_norm, gate_values,  up_values,
+        down_values,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const backing = try allocator.alloc(u8, granularity * tensors.len);
+    defer allocator.free(backing);
+    @memset(backing, 0);
+    for (tensors, 0..) |tensor, i| @memcpy(backing[i * granularity ..][0 .. tensor.len * @sizeOf(f32)], std.mem.sliceAsBytes(tensor));
+    var file = try tmp.dir.createFile("multi-seq.bin", .{});
+    try file.writeAll(backing);
+    file.close();
+    const path = try tmp.dir.realpathAlloc(allocator, "multi-seq.bin");
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var embedding_dims = [_]u64{0} ** gguf.max_dimensions;
+    embedding_dims[0] = hidden;
+    embedding_dims[1] = vocab;
+    const embedding = gguf.TensorDescriptor{
+        .handle = .{ .id = 1 },
+        .name = "token_embd",
+        .file_offset = 0,
+        .byte_len = embedding_values.len * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = embedding_dims,
+    };
+    var head_dims = [_]u64{0} ** gguf.max_dimensions;
+    head_dims[0] = hidden;
+    head_dims[1] = vocab;
+    const head = gguf.TensorDescriptor{
+        .handle = .{ .id = 2 },
+        .name = "output.weight",
+        .file_offset = granularity,
+        .byte_len = head_values.len * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = head_dims,
+    };
+    const attn_norm = testVectorDescriptor(3, "attn_norm", granularity * 2, hidden);
+    const query = testDescriptor(4, "query", granularity * 3, hidden, hidden);
+    const key = testDescriptor(5, "key", granularity * 4, hidden, 2);
+    const value = testDescriptor(6, "value", granularity * 5, hidden, 2);
+    const attention_output = testDescriptor(7, "output", granularity * 6, hidden, hidden);
+    const ffn_norm_descriptor = testVectorDescriptor(8, "ffn_norm", granularity * 7, hidden);
+    const gate = testDescriptor(9, "gate", granularity * 8, hidden, intermediate);
+    const up = testDescriptor(10, "up", granularity * 9, hidden, intermediate);
+    const down = testDescriptor(11, "down", granularity * 10, intermediate, hidden);
+    const layer = DecoderLayerWeights{
+        .attention_norm = &attn_norm,
+        .query = &query,
+        .key = &key,
+        .value = &value,
+        .attention_output = &attention_output,
+        .ffn_norm = &ffn_norm_descriptor,
+        .ffn_gate = &gate,
+        .ffn_up = &up,
+        .ffn_down = &down,
+    };
+    const layers = [_]DecoderLayerWeights{layer};
+    const descriptors = [_]gguf.TensorDescriptor{
+        embedding, head,             attn_norm,           query, key,
+        value,     attention_output, ffn_norm_descriptor, gate,  up,
+        down,
+    };
+
+    var store = try residency.BackingStore.open(path_z);
+    defer store.close();
+    var manager = try residency.Manager.init(allocator, &store, granularity * 16);
+    defer manager.deinit();
+    try registerDescriptors(&manager, &descriptors);
+
+    var baseline: [tokens.len][vocab]f32 = undefined;
+    {
+        var executor = try CpuExecutor.init(allocator, &manager, intermediate, intermediate, intermediate);
+        defer executor.deinit();
+        var cache = try KvCache.init(allocator, 8, 2);
+        defer cache.deinit();
+        var workspace = try AttentionWorkspace.init(allocator, hidden);
+        defer workspace.deinit();
+        var state: [hidden]f32 = undefined;
+        for (tokens, 0..) |token, step| {
+            const single = [1]usize{token};
+            try executor.modelTokens(&embedding, &layers, &attn_norm, &head, &single, config, @as(*[1]KvCache, @ptrCast(&cache)), &workspace, &state, &baseline[step]);
+        }
+        try std.testing.expectEqual(@as(usize, tokens.len), cache.len);
+    }
+
+    var contexts: [2]GenerationContext = undefined;
+    for (&contexts) |*context| {
+        context.* = .{
+            .manager = &manager,
+            .embedding = &embedding,
+            .layers = &layers,
+            .output_norm = &attn_norm,
+            .head = &head,
+            .config = config,
+            .tokens = &tokens,
+            .logits = try allocator.alloc([vocab]f32, tokens.len),
+        };
+    }
+    defer {
+        for (&contexts) |*context| allocator.free(context.logits);
+    }
+    var threads: [contexts.len]std.Thread = undefined;
+    for (&threads, &contexts) |*thread, *context| thread.* = try std.Thread.spawn(.{}, GenerationContext.run, .{context});
+    for (&threads) |*thread| thread.join();
+
+    for (&contexts) |*context| {
+        try std.testing.expect(!context.failed);
+        for (context.logits, baseline) |actual, expected| {
+            for (actual, expected) |a, e| try std.testing.expectEqual(e, a);
+        }
+    }
+    const metrics = manager.metrics();
+    try std.testing.expect(metrics.peak_resident_bytes <= granularity * 16);
+}
+
 test "CPU execution boundary rejects mismatched FFN shapes" {
     var dimensions = [_]u64{0} ** gguf.max_dimensions;
     dimensions[0] = 4;

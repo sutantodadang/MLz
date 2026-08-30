@@ -377,3 +377,22 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
 - Verifikasi: `zig build test` PASS (14/14 residency, 58/58 total), real-model
   Llama validator PASS semua gate (hasil identik dengan sebelum redesain),
   benchmark PASS, `zig fmt` + `git diff --check` bersih.
+
+### Status Phase 9: multi-sequence generation scheduler (item 3) — selesai
+
+- `GenerationContext` pada unit test executor: dua sequence berjalan pada
+  thread terpisah, masing-masing dengan executor, KV cache, attention
+  workspace, dan hidden state sendiri, tetapi berbagi satu `residency.Manager`
+  thread-safe.
+- Autoregressive generation tiga token per sequence; output logits tiap
+  sequence dibandingkan bit-identik dengan baseline sekuensial single-thread
+  melalui manager yang sama.
+- Invariant budget diverifikasi: `peak_resident_bytes <= budget` meskipun dua
+  generation sequence mengakses weight tensor secara bersamaan.
+- Regression guard: kegagalan alokasi per-sequence (executor/cache/workspace)
+  dan kegagalan step inference dilaporkan melalui flag `failed`, bukan panic
+  pada worker thread.
+- Verifikasi: `zig build test -Dsimd-backend=false` PASS, real-model Llama
+  validator PASS semua gate exact (single-token, layer-0 decoder, full logits
+  resident-vs-bounded max-error=0, prefill, incremental, chunked),
+  `zig fmt` + `git diff --check` bersih.
