@@ -317,3 +317,27 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
 4. Optimalkan attention serta matrix kernels (SIMD/thread pool); Phase 8 scalar proof jauh lebih lambat dari llama.cpp.
 5. Implementasikan Qwen3-Next hybrid schedule, DeltaNet recurrent state, Q/K norm/gating, dan shared+routed MoE sebelum mengaktifkan full-model Qwen validator.
 6. Pertahankan exact resident/bounded dan prefill/incremental gates, serta short-prompt llama.cpp tolerance tanpa dilonggarkan.
+
+### Status Phase 9: chunked prefill (item 1) — selesai
+
+- `CpuExecutor.modelPrefillChunked()`: prompt diproses per chunk; workspace
+  caller-owned dibatasi ukuran chunk (`chunk_states` berkapasitas
+  `chunk_size * hidden`), KV cache per layer dipertahankan lintas chunk dan
+  mengikuti seluruh posisi sebelumnya; logits hanya dihitung pada chunk
+  terakhir melalui flag `want_logits` pada `modelPrefillInner`.
+- Validasi seluruh request (shape, token, cache capacity, output head, norm,
+  per-layer weight shapes) dilakukan sebelum KV cache dimutasi.
+- Unit test baru: `chunked prefill matches full prefill and incremental append
+  exactly` — full prefill, chunked (chunk=3 dari 4 token), dan incremental
+  append menghasilkan logits bit-identik serta panjang KV cache yang sama.
+- Mode `.chunked` ditambahkan ke validator GGUF nyata; hasil dilaporkan
+  dibandingkan terhadap full prefill dan ditolak bila tidak bit-identik atau
+  argmax berbeda.
+- Hasil Llama-3.2-1B-Instruct-Q4_K_M, budget 4 MiB:
+  - 2 token: chunked `max-error-vs-prefill=0`, argmax=62, 378 ms.
+  - 128 token (chunk=32): `max-error-vs-prefill=0`, argmax=226,
+    5917 ms / 21.63 token-s, workspace 32 token (bukan 128).
+  - Prompt 128 full prefill: 5164 ms / 24.79 token-s, faults=430; chunked:
+    5917 ms / 21.63 token-s, fault delta kecil karena LM head sekali di akhir.
+  - Long-prompt llama.cpp reference tetap informational; strict gate tidak
+    berubah.

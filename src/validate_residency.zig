@@ -7,6 +7,7 @@ const llama_reference = @import("residency_llama_reference.zig");
 
 const default_budget_mib: usize = 16;
 const default_max_tensors: usize = 4;
+const default_prefill_chunk: usize = 32;
 
 const QwenBatchProbe = struct {
     descriptor: *const gguf.TensorDescriptor,
@@ -625,7 +626,7 @@ fn layerWeights(
     };
 }
 
-const ModelRunMode = enum { prefill, incremental };
+const ModelRunMode = enum { prefill, incremental, chunked };
 
 fn runModel(
     allocator: std.mem.Allocator,
@@ -654,7 +655,10 @@ fn runModel(
     defer workspace.deinit();
     var prefill_workspace: ?executor_mod.PrefillWorkspace = null;
     defer if (prefill_workspace) |*owned| owned.deinit();
-    if (mode == .prefill) prefill_workspace = try executor_mod.PrefillWorkspace.init(allocator, tokens.len, hidden, intermediate);
+    const prefill_chunk = if (mode == .prefill) tokens.len else default_prefill_chunk;
+    if (mode == .prefill or mode == .chunked) {
+        prefill_workspace = try executor_mod.PrefillWorkspace.init(allocator, prefill_chunk, hidden, intermediate);
+    }
 
     const kv_width = config.kv_head_count * config.head_dim;
     const caches = try allocator.alloc(executor_mod.KvCache, layers.len);
@@ -668,9 +672,11 @@ fn runModel(
 
     const prompt_states: []f32 = if (mode == .prefill)
         try allocator.alloc(f32, tokens.len * hidden)
+    else if (mode == .chunked)
+        try allocator.alloc(f32, prefill_chunk * hidden)
     else
         @constCast((&[_]f32{})[0..]);
-    defer if (mode == .prefill) allocator.free(prompt_states);
+    defer if (mode == .prefill or mode == .chunked) allocator.free(prompt_states);
     var timer = try std.time.Timer.start();
     switch (mode) {
         .prefill => {
@@ -703,6 +709,19 @@ fn runModel(
                 logits,
             );
         },
+        .chunked => try executor.modelPrefillChunked(
+            embedding,
+            layers,
+            output_norm,
+            output_weight,
+            tokens,
+            prefill_chunk,
+            config,
+            caches,
+            &prefill_workspace.?,
+            prompt_states,
+            logits,
+        ),
     }
     const elapsed_ns = timer.read();
     var kv_cache_bytes: usize = 0;
@@ -1160,6 +1179,35 @@ pub fn main() !void {
             }
         } else {
             return error.IncrementalValidationUnavailable;
+        }
+
+        if (try validateFullModel(allocator, &store, &index, budget, sequence_tokens, .chunked)) |chunked| {
+            defer chunked.deinit(allocator);
+            const chunked_memory = chunked.accounting;
+            var chunked_max_error: f32 = 0;
+            for (model.bounded_logits, chunked.bounded_logits) |prefill_logit, chunked_logit| {
+                chunked_max_error = @max(chunked_max_error, @abs(prefill_logit - chunked_logit));
+            }
+            try out.print(
+                "bounded chunked prefill: chunk={d}, tokens={d}, elapsed={d:.2} ms, tokens/s={d:.2}, max-error-vs-prefill={d}, " ++
+                    "argmax={d}, weight-map={d:.2}/{d:.2} MiB peak/budget, all-layer-kv={d:.2} KiB\n",
+                .{
+                    default_prefill_chunk,
+                    chunked.token_count,
+                    chunked.elapsed_bounded_ms,
+                    @as(f64, @floatFromInt(chunked.token_count)) / @max(chunked.elapsed_bounded_ms / 1000.0, 0.000001),
+                    chunked_max_error,
+                    chunked.argmax_token,
+                    @as(f64, @floatFromInt(chunked_memory.executor.peak_mapped_weight_bytes)) / (1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(chunked_memory.executor.weight_budget_bytes)) / (1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(chunked_memory.kv_cache_bytes)) / 1024.0,
+                },
+            );
+            if (chunked_max_error != 0 or chunked.argmax_token != model.argmax_token) {
+                return error.ChunkedPrefillMismatch;
+            }
+        } else {
+            return error.ChunkedValidationUnavailable;
         }
     } else {
         reference_failed = true;

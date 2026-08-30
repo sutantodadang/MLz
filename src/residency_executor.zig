@@ -774,6 +774,23 @@ pub const CpuExecutor = struct {
         states: []f32,
         logits: []f32,
     ) Error!void {
+        return self.modelPrefillInner(embedding, layers, output_norm, output_weight, tokens, config, caches, workspace, states, logits, true);
+    }
+
+    fn modelPrefillInner(
+        self: *CpuExecutor,
+        embedding: *const gguf.TensorDescriptor,
+        layers: []const DecoderLayerWeights,
+        output_norm: *const gguf.TensorDescriptor,
+        output_weight: *const gguf.TensorDescriptor,
+        tokens: []const usize,
+        config: AttentionConfig,
+        caches: []KvCache,
+        workspace: *PrefillWorkspace,
+        states: []f32,
+        logits: []f32,
+        want_logits: bool,
+    ) Error!void {
         if (tokens.len == 0 or layers.len == 0 or caches.len != layers.len or workspace.capacity < tokens.len) {
             return Error.InvalidExecutionShape;
         }
@@ -810,10 +827,86 @@ pub const CpuExecutor = struct {
         for (layers, caches) |layer, *cache| {
             try self.decoderLayerPrefill(layer, states, tokens.len, config, cache, workspace);
         }
+        if (!want_logits) return;
         const final_state = states[(tokens.len - 1) * hidden ..][0..hidden];
         const normalized = workspace.normalized[0..hidden];
         try self.rmsNorm(output_norm, final_state, normalized, config.rms_epsilon);
         try self.matVec(output_weight, normalized, logits);
+    }
+
+    /// Chunked layer-major prompt prefill. The prompt is executed in chunks of
+    /// at most `chunk_size` tokens so the caller-owned prompt state and the
+    /// prefill workspace stay bounded by the chunk size rather than the full
+    /// prompt length. Per-layer KV caches persist across chunks; each chunk
+    /// attends to all previous positions. Logits are produced for the final
+    /// prompt token only. The complete request is validated before any cache
+    /// mutation.
+    pub fn modelPrefillChunked(
+        self: *CpuExecutor,
+        embedding: *const gguf.TensorDescriptor,
+        layers: []const DecoderLayerWeights,
+        output_norm: *const gguf.TensorDescriptor,
+        output_weight: *const gguf.TensorDescriptor,
+        tokens: []const usize,
+        chunk_size: usize,
+        config: AttentionConfig,
+        caches: []KvCache,
+        workspace: *PrefillWorkspace,
+        chunk_states: []f32,
+        logits: []f32,
+    ) Error!void {
+        if (chunk_size == 0 or workspace.capacity < chunk_size) return Error.InvalidExecutionShape;
+        const hidden = std.math.mul(usize, config.head_count, config.head_dim) catch return Error.InvalidExecutionShape;
+        const chunk_state_elements = std.math.mul(usize, chunk_size, hidden) catch return Error.InvalidExecutionShape;
+        if (chunk_states.len != chunk_state_elements) return Error.InvalidExecutionShape;
+
+        // Validate the complete request before mutating writable KV state.
+        if (tokens.len == 0 or layers.len == 0 or caches.len != layers.len) {
+            return Error.InvalidExecutionShape;
+        }
+        const start_position = caches[0].len;
+        const end_position = std.math.add(usize, start_position, tokens.len) catch return Error.KvCacheFull;
+        try validateMatrix(output_weight, hidden, logits.len);
+        try validateNorm(output_norm, hidden);
+        for (tokens) |token| if (token >= embedding.dimensions[1]) return Error.InvalidToken;
+        const kv_width = std.math.mul(usize, config.kv_head_count, config.head_dim) catch return Error.InvalidExecutionShape;
+        for (layers) |layer| {
+            const gate_shape = try matrixShape(layer.ffn_gate);
+            try validateNorm(layer.attention_norm, hidden);
+            try validateNorm(layer.ffn_norm, hidden);
+            try validateMatrix(layer.query, hidden, hidden);
+            try validateMatrix(layer.key, hidden, kv_width);
+            try validateMatrix(layer.value, hidden, kv_width);
+            try validateMatrix(layer.attention_output, hidden, hidden);
+            try validateMatrix(layer.ffn_gate, hidden, gate_shape.rows);
+            try validateMatrix(layer.ffn_up, hidden, gate_shape.rows);
+            try validateMatrix(layer.ffn_down, gate_shape.rows, hidden);
+        }
+        for (caches) |cache| {
+            if (cache.len != start_position) return Error.InvalidPosition;
+            if (end_position > cache.capacity) return Error.KvCacheFull;
+        }
+
+        var processed: usize = 0;
+        while (processed < tokens.len) {
+            const count = @min(chunk_size, tokens.len - processed);
+            const chunk = tokens[processed..][0..count];
+            const last_chunk = processed + count == tokens.len;
+            try self.modelPrefillInner(
+                embedding,
+                layers,
+                output_norm,
+                output_weight,
+                chunk,
+                config,
+                caches,
+                workspace,
+                chunk_states[0 .. count * hidden],
+                logits,
+                last_chunk,
+            );
+            processed += count;
+        }
     }
 
     /// Compatibility token-major path used for incremental append. New prompt
@@ -1358,6 +1451,178 @@ test "position greater than zero uses Llama normal adjacent-pair RoPE" {
     try std.testing.expectApproxEqAbs(1 * s0 + 2 * c0, values[1], 1e-6);
     try std.testing.expectApproxEqAbs(3 * c1 - 4 * s1, values[2], 1e-6);
     try std.testing.expectApproxEqAbs(3 * s1 + 4 * c1, values[3], 1e-6);
+}
+
+test "chunked prefill matches full prefill and incremental append exactly" {
+    const allocator = std.testing.allocator;
+    const granularity = try residency.mappingGranularity();
+    const hidden: usize = 4;
+    const vocab: usize = 3;
+    const tokens = [_]usize{ 0, 2, 1, 2 };
+    const chunk_size: usize = 3;
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    const norm = [_]f32{ 1.0, 0.8, 1.2, 0.9 };
+    const ffn_norm = [_]f32{ 0.9, 1.1, 0.8, 1.0 };
+    const intermediate: usize = 6;
+    const embedding_values = try allocator.alloc(f32, hidden * vocab);
+    defer allocator.free(embedding_values);
+    for (embedding_values) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+    const head_values = try allocator.alloc(f32, hidden * vocab);
+    defer allocator.free(head_values);
+    for (head_values) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+    const query_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(query_values);
+    for (query_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const key_values = try allocator.alloc(f32, 2 * hidden);
+    defer allocator.free(key_values);
+    for (key_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const value_values = try allocator.alloc(f32, 2 * hidden);
+    defer allocator.free(value_values);
+    for (value_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const output_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(output_values);
+    for (output_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const gate_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(gate_values);
+    for (gate_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const up_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(up_values);
+    for (up_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+    const down_values = try allocator.alloc(f32, intermediate * hidden);
+    defer allocator.free(down_values);
+    for (down_values) |*value| value.* = random.float(f32) * 0.5 - 0.25;
+
+    const tensors = [_][]const f32{
+        embedding_values, head_values,   &norm,     query_values, key_values,
+        value_values,     output_values, &ffn_norm, gate_values,  up_values,
+        down_values,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const backing = try allocator.alloc(u8, granularity * tensors.len);
+    defer allocator.free(backing);
+    @memset(backing, 0);
+    for (tensors, 0..) |tensor, i| @memcpy(backing[i * granularity ..][0 .. tensor.len * @sizeOf(f32)], std.mem.sliceAsBytes(tensor));
+    var file = try tmp.dir.createFile("chunked.bin", .{});
+    try file.writeAll(backing);
+    file.close();
+    const path = try tmp.dir.realpathAlloc(allocator, "chunked.bin");
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var embedding_dims = [_]u64{0} ** gguf.max_dimensions;
+    embedding_dims[0] = hidden;
+    embedding_dims[1] = vocab;
+    const embedding = gguf.TensorDescriptor{
+        .handle = .{ .id = 1 },
+        .name = "token_embd",
+        .file_offset = 0,
+        .byte_len = embedding_values.len * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = embedding_dims,
+    };
+    var head_dims = [_]u64{0} ** gguf.max_dimensions;
+    head_dims[0] = hidden;
+    head_dims[1] = vocab;
+    const head = gguf.TensorDescriptor{
+        .handle = .{ .id = 2 },
+        .name = "output.weight",
+        .file_offset = granularity,
+        .byte_len = head_values.len * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = head_dims,
+    };
+    const attn_norm = testVectorDescriptor(3, "attn_norm", granularity * 2, hidden);
+    const query = testDescriptor(4, "query", granularity * 3, hidden, hidden);
+    const key = testDescriptor(5, "key", granularity * 4, hidden, 2);
+    const value = testDescriptor(6, "value", granularity * 5, hidden, 2);
+    const attention_output = testDescriptor(7, "output", granularity * 6, hidden, hidden);
+    const ffn_norm_descriptor = testVectorDescriptor(8, "ffn_norm", granularity * 7, hidden);
+    const gate = testDescriptor(9, "gate", granularity * 8, hidden, intermediate);
+    const up = testDescriptor(10, "up", granularity * 9, hidden, intermediate);
+    const down = testDescriptor(11, "down", granularity * 10, intermediate, hidden);
+    const layer = DecoderLayerWeights{
+        .attention_norm = &attn_norm,
+        .query = &query,
+        .key = &key,
+        .value = &value,
+        .attention_output = &attention_output,
+        .ffn_norm = &ffn_norm_descriptor,
+        .ffn_gate = &gate,
+        .ffn_up = &up,
+        .ffn_down = &down,
+    };
+    const layers = [_]DecoderLayerWeights{layer};
+    const config = AttentionConfig{ .head_count = 2, .kv_head_count = 1, .head_dim = 2 };
+
+    const descriptors = [_]gguf.TensorDescriptor{
+        embedding, head,             attn_norm,           query, key,
+        value,     attention_output, ffn_norm_descriptor, gate,  up,
+        down,
+    };
+    const logits_len: usize = vocab;
+
+    var store = try residency.BackingStore.open(path_z);
+    defer store.close();
+    var full_logits: [logits_len]f32 = undefined;
+    var chunked_logits: [logits_len]f32 = undefined;
+    var incremental_logits: [logits_len]f32 = undefined;
+
+    {
+        var manager = try residency.Manager.init(allocator, &store, granularity * 16);
+        defer manager.deinit();
+        try registerDescriptors(&manager, &descriptors);
+        var executor = try CpuExecutor.init(allocator, &manager, intermediate, intermediate, intermediate);
+        defer executor.deinit();
+        var caches = [_]KvCache{try KvCache.init(allocator, 8, 2)};
+        defer caches[0].deinit();
+        var workspace = try PrefillWorkspace.init(allocator, tokens.len, hidden, intermediate);
+        defer workspace.deinit();
+        const states = try allocator.alloc(f32, tokens.len * hidden);
+        defer allocator.free(states);
+        try executor.modelPrefill(&embedding, &layers, &attn_norm, &head, &tokens, config, &caches, &workspace, states, &full_logits);
+        try std.testing.expectEqual(@as(usize, tokens.len), caches[0].len);
+    }
+    {
+        var manager = try residency.Manager.init(allocator, &store, granularity * 16);
+        defer manager.deinit();
+        try registerDescriptors(&manager, &descriptors);
+        var executor = try CpuExecutor.init(allocator, &manager, intermediate, intermediate, intermediate);
+        defer executor.deinit();
+        var caches = [_]KvCache{try KvCache.init(allocator, 8, 2)};
+        defer caches[0].deinit();
+        var workspace = try PrefillWorkspace.init(allocator, chunk_size, hidden, intermediate);
+        defer workspace.deinit();
+        const chunk_states = try allocator.alloc(f32, chunk_size * hidden);
+        defer allocator.free(chunk_states);
+        try executor.modelPrefillChunked(&embedding, &layers, &attn_norm, &head, &tokens, chunk_size, config, &caches, &workspace, chunk_states, &chunked_logits);
+        try std.testing.expectEqual(@as(usize, tokens.len), caches[0].len);
+    }
+    {
+        var manager = try residency.Manager.init(allocator, &store, granularity * 16);
+        defer manager.deinit();
+        try registerDescriptors(&manager, &descriptors);
+        var executor = try CpuExecutor.init(allocator, &manager, intermediate, intermediate, intermediate);
+        defer executor.deinit();
+        var caches = [_]KvCache{try KvCache.init(allocator, 8, 2)};
+        defer caches[0].deinit();
+        var workspace = try AttentionWorkspace.init(allocator, hidden);
+        defer workspace.deinit();
+        var state: [hidden]f32 = undefined;
+        for (tokens) |token| {
+            const single = [1]usize{token};
+            try executor.modelTokens(&embedding, &layers, &attn_norm, &head, &single, config, &caches, &workspace, &state, &incremental_logits);
+        }
+        try std.testing.expectEqual(@as(usize, tokens.len), caches[0].len);
+    }
+
+    for (full_logits, chunked_logits) |expected, actual| try std.testing.expectEqual(expected, actual);
+    for (full_logits, incremental_logits) |expected, actual| try std.testing.expectEqual(expected, actual);
 }
 
 test "CPU execution boundary rejects mismatched FFN shapes" {
