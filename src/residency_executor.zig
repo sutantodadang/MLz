@@ -1293,7 +1293,10 @@ test "CPU execution boundary runs bounded SwiGLU FFN and accounts non-weight mem
     try std.testing.expectEqual(hidden * @sizeOf(f32), accounting.dequant_scratch_bytes);
     try std.testing.expectEqual(intermediate * 2 * @sizeOf(f32), accounting.activation_bytes);
     try std.testing.expect(accounting.faults >= 3);
-    try std.testing.expect(accounting.evictions >= 2);
+    // Multi-window residency: small weight windows may coexist within the
+    // budget, so evictions are no longer guaranteed. The invariant that must
+    // hold is the budget itself, across the manager and the executor view.
+    try std.testing.expect(manager.metrics().resident_bytes <= granularity);
 }
 
 fn testVectorDescriptor(handle_id: u64, name: []const u8, offset: u64, elements: usize) gguf.TensorDescriptor {

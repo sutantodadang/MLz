@@ -82,15 +82,24 @@ const Entry = struct {
     /// Complete logical tensor range in the backing store.
     offset: u64,
     len: usize,
-    /// The currently mapped logical subrange. These fields are meaningful only
-    /// while `mapping` is non-null.
-    mapped_offset: u64 = 0,
-    mapped_len: usize = 0,
-    mapping_bytes: usize = 0,
-    residency: Residency = .non_resident,
-    mapping: ?MappedRegion = null,
+};
+
+/// One active mapped window. A tensor may have several windows at once, as
+/// long as the union of their mapped bytes stays within the budget.
+const Window = struct {
+    tensor: TensorHandle,
+    /// Mapped logical subrange within the tensor.
+    mapped_offset: u64,
+    mapped_len: usize,
+    mapping_bytes: usize,
+    mapping: MappedRegion,
     last_used: u64 = 0,
     pin_count: usize = 0,
+
+    fn covers(self: *const Window, absolute_offset: u64, requested_end: u64) bool {
+        const window_end = self.mapped_offset + @as(u64, @intCast(self.mapped_len));
+        return absolute_offset >= self.mapped_offset and requested_end <= window_end;
+    }
 };
 
 pub const ReplacementPolicy = enum {
@@ -133,7 +142,6 @@ pub const Manager = struct {
     budget_bytes: usize,
     resident_bytes: usize = 0,
     peak_resident_bytes: usize = 0,
-    resident_tensors: usize = 0,
     faults: u64 = 0,
     hits: u64 = 0,
     evictions: u64 = 0,
@@ -145,6 +153,9 @@ pub const Manager = struct {
     replacement_policy: ReplacementPolicy = .lru,
     mutex: std.Thread.Mutex = .{},
     entries: std.AutoHashMap(TensorHandle, Entry),
+    /// Active mapped windows across all tensors, keyed by global slot index.
+    windows: std.AutoHashMap(u32, Window),
+    next_window_slot: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, store: *BackingStore, budget_bytes: usize) Error!Manager {
         if (budget_bytes == 0) return Error.InvalidBudget;
@@ -156,16 +167,18 @@ pub const Manager = struct {
             .store = store,
             .budget_bytes = budget_bytes,
             .entries = std.AutoHashMap(TensorHandle, Entry).init(allocator),
+            .windows = std.AutoHashMap(u32, Window).init(allocator),
         };
     }
 
     pub fn deinit(self: *Manager) void {
         self.mutex.lock();
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry| {
-            std.debug.assert(entry.pin_count == 0);
-            if (entry.mapping) |*mapping| mapping.unmap();
+        var it = self.windows.valueIterator();
+        while (it.next()) |window| {
+            std.debug.assert(window.pin_count == 0);
+            window.mapping.unmap();
         }
+        self.windows.deinit();
         self.entries.deinit();
         self.mutex.unlock();
         self.* = undefined;
@@ -195,21 +208,34 @@ pub const Manager = struct {
             .len = len,
         }) catch return Error.OutOfMemory;
     }
-
     pub fn unregister(self: *Manager, handle: TensorHandle) Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const entry = self.entries.getPtr(handle) orelse return Error.UnknownTensor;
-        if (entry.pin_count != 0) return Error.TensorBusy;
-        self.evictEntry(entry);
+        if (!self.entries.contains(handle)) return Error.UnknownTensor;
+        // Reject while any window of this tensor is pinned.
+        var pinned = false;
+        var wit = self.windows.iterator();
+        while (wit.next()) |w| {
+            if (!w.value_ptr.tensor.eql(handle)) continue;
+            if (w.value_ptr.pin_count != 0) {
+                pinned = true;
+                break;
+            }
+        }
+        if (pinned) return Error.TensorBusy;
+        self.evictTensorLocked(handle);
         _ = self.entries.remove(handle);
     }
 
     pub fn state(self: *Manager, handle: TensorHandle) Error!Residency {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const entry = self.entries.get(handle) orelse return Error.UnknownTensor;
-        return entry.residency;
+        if (!self.entries.contains(handle)) return Error.UnknownTensor;
+        var wit = self.windows.iterator();
+        while (wit.next()) |w| {
+            if (w.value_ptr.tensor.eql(handle)) return .resident;
+        }
+        return .non_resident;
     }
 
     pub fn acquire(self: *Manager, handle: TensorHandle) Error!TensorView {
@@ -248,51 +274,68 @@ pub const Manager = struct {
     }
 
     fn acquireRangeLocked(self: *Manager, handle: TensorHandle, tensor_offset: usize, len: usize) Error!TensorView {
-        var entry = self.entries.getPtr(handle) orelse return Error.UnknownTensor;
+        const entry = self.entries.getPtr(handle) orelse return Error.UnknownTensor;
         if (len == 0 or tensor_offset > entry.len or len > entry.len - tensor_offset) {
             return Error.InvalidRange;
         }
         const absolute_offset = entry.offset + @as(u64, @intCast(tensor_offset));
         const requested_end = absolute_offset + @as(u64, @intCast(len));
-        const mapped_end = entry.mapped_offset + @as(u64, @intCast(entry.mapped_len));
-        const is_hit = entry.mapping != null and
-            absolute_offset >= entry.mapped_offset and requested_end <= mapped_end;
 
-        if (!is_hit) {
+        // Multi-window hit: any existing window of this tensor that covers the
+        // requested range satisfies the acquire.
+        var hit_slot: ?u32 = null;
+        var wit = self.windows.iterator();
+        while (wit.next()) |w| {
+            if (!w.value_ptr.tensor.eql(handle)) continue;
+            if (w.value_ptr.covers(absolute_offset, requested_end)) {
+                hit_slot = w.key_ptr.*;
+                break;
+            }
+        }
+
+        var slot: u32 = undefined;
+        if (hit_slot) |found| {
+            self.hits += 1;
+            slot = found;
+        } else {
             const mapping_bytes = try mappedSize(absolute_offset, len);
             if (mapping_bytes > self.budget_bytes) return Error.BudgetExceeded;
-            if (entry.mapping != null) {
-                // A view into the old window would become dangling after remap.
-                if (entry.pin_count != 0) return Error.TensorBusy;
-                self.evictEntry(entry);
-            }
             try self.evictUntilFits(mapping_bytes);
 
             // Map only after enough budget is available. If mmap fails, all
-            // counters and the target entry remain internally consistent.
-            entry = self.entries.getPtr(handle) orelse unreachable;
-            entry.mapping = try self.store.map(absolute_offset, len);
-            std.debug.assert(entry.mapping.?.native.mapped_len == mapping_bytes);
-            entry.mapped_offset = absolute_offset;
-            entry.mapped_len = len;
-            entry.mapping_bytes = mapping_bytes;
-            entry.residency = .resident;
+            // counters and the registry remain internally consistent.
+            const window = Window{
+                .tensor = handle,
+                .mapped_offset = absolute_offset,
+                .mapped_len = len,
+                .mapping_bytes = mapping_bytes,
+                .mapping = try self.store.map(absolute_offset, len),
+            };
+            // Insertion can only fail before the mapping is registered in the
+            // accounting; release it explicitly on OOM.
+            slot = self.next_window_slot;
+            self.windows.put(slot, window) catch {
+                var failed = window;
+                failed.mapping.unmap();
+                return Error.OutOfMemory;
+            };
+            self.next_window_slot += 1;
             self.resident_bytes += mapping_bytes;
-            self.resident_tensors += 1;
             self.peak_resident_bytes = @max(self.peak_resident_bytes, self.resident_bytes);
             self.faults += 1;
             self.bytes_mapped += mapping_bytes;
-        } else {
-            self.hits += 1;
         }
 
         self.clock +%= 1;
-        entry.last_used = self.clock;
-        entry.pin_count += 1;
+        const wptr = self.windows.getPtr(slot) orelse unreachable;
+        wptr.last_used = self.clock;
+        wptr.pin_count += 1;
+
         return .{
             .manager = self,
             .handle = handle,
-            .data = self.viewBytesLocked(handle, tensor_offset, len),
+            .window_slot = slot,
+            .data = self.windowBytesLocked(slot, tensor_offset, len),
         };
     }
 
@@ -307,8 +350,8 @@ pub const Manager = struct {
         // page touches run. Do not retain the manager mutex during this I/O so
         // unrelated resident hits/releases can proceed concurrently.
         self.mutex.lock();
-        const entry = self.entries.getPtr(handle) orelse unreachable;
-        var native = (entry.mapping orelse unreachable).native;
+        const window = self.windows.getPtr(view.window_slot) orelse unreachable;
+        var native = window.mapping.native;
         native.data = view.data.ptr;
         self.mutex.unlock();
 
@@ -357,12 +400,24 @@ pub const Manager = struct {
     pub fn metrics(self: *Manager) Metrics {
         self.mutex.lock();
         defer self.mutex.unlock();
+        // Count distinct tensors that have at least one active window.
+        var resident_tensors: usize = 0;
+        var eit = self.entries.keyIterator();
+        while (eit.next()) |key| {
+            var wit = self.windows.valueIterator();
+            while (wit.next()) |w| {
+                if (w.tensor.eql(key.*)) {
+                    resident_tensors += 1;
+                    break;
+                }
+            }
+        }
         return .{
             .budget_bytes = self.budget_bytes,
             .resident_bytes = self.resident_bytes,
             .peak_resident_bytes = self.peak_resident_bytes,
             .registered_tensors = self.entries.count(),
-            .resident_tensors = self.resident_tensors,
+            .resident_tensors = resident_tensors,
             .faults = self.faults,
             .hits = self.hits,
             .evictions = self.evictions,
@@ -373,7 +428,7 @@ pub const Manager = struct {
         };
     }
 
-    fn shouldReplaceVictim(self: *Manager, candidate: *const Entry, current: *const Entry) bool {
+    fn shouldReplaceVictim(self: *Manager, candidate: *const Window, current: *const Window) bool {
         return switch (self.replacement_policy) {
             .lru => candidate.last_used < current.last_used,
             .largest_first => candidate.mapping_bytes > current.mapping_bytes or
@@ -383,60 +438,68 @@ pub const Manager = struct {
 
     fn evictUntilFits(self: *Manager, incoming: usize) Error!void {
         while (incoming > self.budget_bytes - self.resident_bytes) {
-            var victim: ?TensorHandle = null;
-            var it = self.entries.iterator();
+            var victim: ?u32 = null;
+            var it = self.windows.iterator();
             while (it.next()) |item| {
                 const candidate = item.value_ptr;
-                if (candidate.mapping == null or candidate.pin_count != 0) continue;
-                if (victim) |current_handle| {
-                    const current = self.entries.getPtr(current_handle) orelse unreachable;
+                if (candidate.pin_count != 0) continue;
+                if (victim) |current_slot| {
+                    const current = self.windows.getPtr(current_slot) orelse unreachable;
                     if (self.shouldReplaceVictim(candidate, current)) victim = item.key_ptr.*;
                 } else {
                     victim = item.key_ptr.*;
                 }
             }
-            const handle = victim orelse return Error.BudgetExceeded;
-            const entry = self.entries.getPtr(handle) orelse unreachable;
-            self.evictEntry(entry);
+            const slot = victim orelse return Error.BudgetExceeded;
+            self.evictWindowLocked(slot);
         }
     }
 
-    fn evictEntry(self: *Manager, entry: *Entry) void {
-        if (entry.mapping) |*mapping| {
-            mapping.unmap();
-            entry.mapping = null;
-            entry.residency = .non_resident;
-            self.resident_bytes -= entry.mapping_bytes;
-            self.resident_tensors -= 1;
-            self.evictions += 1;
-            self.bytes_evicted += entry.mapping_bytes;
-            entry.mapped_offset = 0;
-            entry.mapped_len = 0;
-            entry.mapping_bytes = 0;
-        }
+    fn evictWindowLocked(self: *Manager, slot: u32) void {
+        const window = self.windows.getPtr(slot) orelse unreachable;
+        std.debug.assert(window.pin_count == 0);
+        window.mapping.unmap();
+        self.resident_bytes -= window.mapping_bytes;
+        self.evictions += 1;
+        self.bytes_evicted += window.mapping_bytes;
+        _ = self.windows.remove(slot);
     }
 
-    fn viewBytesLocked(self: *Manager, handle: TensorHandle, tensor_offset: usize, len: usize) []const u8 {
-        const entry = self.entries.getPtr(handle) orelse unreachable;
-        const mapping = &(entry.mapping orelse unreachable);
+    fn evictTensorLocked(self: *Manager, handle: TensorHandle) void {
+        var slots: [64]u32 = undefined;
+        var count: usize = 0;
+        var it = self.windows.iterator();
+        while (it.next()) |item| {
+            if (!item.value_ptr.tensor.eql(handle)) continue;
+            if (count == slots.len) break; // defensive: never expected
+            slots[count] = item.key_ptr.*;
+            count += 1;
+        }
+        for (slots[0..count]) |slot| self.evictWindowLocked(slot);
+    }
+
+    fn windowBytesLocked(self: *Manager, slot: u32, tensor_offset: usize, len: usize) []const u8 {
+        const window = self.windows.getPtr(slot) orelse unreachable;
+        const entry = self.entries.getPtr(window.tensor) orelse unreachable;
         const absolute_offset = entry.offset + @as(u64, @intCast(tensor_offset));
-        std.debug.assert(absolute_offset >= entry.mapped_offset);
-        const mapping_offset: usize = @intCast(absolute_offset - entry.mapped_offset);
-        return mapping.bytes(entry.mapped_len)[mapping_offset..][0..len];
+        std.debug.assert(absolute_offset >= window.mapped_offset);
+        const mapping_offset: usize = @intCast(absolute_offset - window.mapped_offset);
+        return window.mapping.bytes(window.mapped_len)[mapping_offset..][0..len];
     }
 
-    fn release(self: *Manager, handle: TensorHandle) void {
+    fn release(self: *Manager, slot: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const entry = self.entries.getPtr(handle) orelse unreachable;
-        std.debug.assert(entry.pin_count > 0);
-        entry.pin_count -= 1;
+        const window = self.windows.getPtr(slot) orelse unreachable;
+        std.debug.assert(window.pin_count > 0);
+        window.pin_count -= 1;
     }
 };
 
 pub const TensorView = struct {
     manager: *Manager,
     handle: TensorHandle,
+    window_slot: u32,
     data: []const u8,
     released: bool = false,
 
@@ -447,7 +510,7 @@ pub const TensorView = struct {
 
     pub fn release(self: *TensorView) void {
         if (!self.released) {
-            self.manager.release(self.handle);
+            self.manager.release(self.window_slot);
             self.released = true;
         }
     }
@@ -937,7 +1000,9 @@ test "range hits reuse a containing mapping and pinned views prevent remap" {
     var outer = try manager.acquireRange(tensor, 0, granularity);
     var inner = try manager.acquireRange(tensor, 32, 64);
     try std.testing.expectEqualSlices(u8, outer.bytes()[32..96], inner.bytes());
-    try std.testing.expectError(Error.TensorBusy, manager.acquireRange(tensor, granularity, granularity));
+    // A disjoint second window would exceed the budget, and the only resident
+    // window is pinned, so eviction is impossible.
+    try std.testing.expectError(Error.BudgetExceeded, manager.acquireRange(tensor, granularity, granularity));
     inner.release();
     outer.release();
 
@@ -946,6 +1011,68 @@ test "range hits reuse a containing mapping and pinned views prevent remap" {
     const metrics = manager.metrics();
     try std.testing.expectEqual(@as(u64, 2), metrics.faults);
     try std.testing.expectEqual(@as(u64, 1), metrics.hits);
+}
+
+test "multiple concurrent windows of one tensor coexist within budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const granularity = try mappingGranularity();
+    const path_z = try createTestBacking(&tmp, granularity * 3);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try BackingStore.open(path_z);
+    defer store.close();
+    // Budget fits two page-sized windows simultaneously.
+    var manager = try Manager.init(std.testing.allocator, &store, granularity * 2);
+    defer manager.deinit();
+    const tensor = TensorHandle{ .id = 7 };
+    try manager.register(tensor, 0, granularity * 3);
+
+    // Two disjoint windows of the SAME tensor stay resident at once.
+    var first = try manager.acquireRange(tensor, 0, granularity);
+    var second = try manager.acquireRange(tensor, granularity, granularity);
+    defer first.release();
+    defer second.release();
+
+    try std.testing.expectEqual(@as(usize, granularity * 2), manager.metrics().resident_bytes);
+    try std.testing.expectEqual(@as(usize, 1), manager.metrics().resident_tensors);
+    try std.testing.expectEqual(Residency.resident, try manager.state(tensor));
+
+    // Each window reads its own logical bytes.
+    try std.testing.expectEqual(@as(u8, 0), first.bytes()[0]);
+    try std.testing.expectEqual(@as(u8, @truncate(granularity)), second.bytes()[0]);
+
+    // A third disjoint window does not fit: both resident windows are pinned.
+    try std.testing.expectError(Error.BudgetExceeded, manager.acquireRange(tensor, granularity * 2, granularity));
+
+    // After releasing the first window its budget is free again, so a window
+    // over the third page faults in without evicting the pinned second one.
+    first.release();
+    var third = try manager.acquireRange(tensor, granularity * 2, granularity);
+    defer third.release();
+    try std.testing.expectEqual(@as(u8, @truncate(granularity * 2)), third.bytes()[0]);
+    try std.testing.expectEqual(@as(usize, granularity * 2), manager.metrics().resident_bytes);
+}
+
+test "unregister rejects while any window is pinned and succeeds after release" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const granularity = try mappingGranularity();
+    const path_z = try createTestBacking(&tmp, granularity * 2);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try BackingStore.open(path_z);
+    defer store.close();
+    var manager = try Manager.init(std.testing.allocator, &store, granularity * 2);
+    defer manager.deinit();
+    const tensor = TensorHandle{ .id = 9 };
+    try manager.register(tensor, 0, granularity * 2);
+
+    var view = try manager.acquireRange(tensor, granularity, granularity);
+    try std.testing.expectError(Error.TensorBusy, manager.unregister(tensor));
+    view.release();
+    try manager.unregister(tensor);
+    try std.testing.expectError(Error.UnknownTensor, manager.state(tensor));
 }
 
 test "synchronous and asynchronous prefetch become later acquire hits" {
@@ -1068,6 +1195,60 @@ const ConcurrentAcquireContext = struct {
         }
     }
 };
+
+/// Concurrent workers hold disjoint windows of the SAME tensor at the same
+/// time. This is only possible with multi-window residency; the single-window
+/// design rejected overlapping access with error.TensorBusy.
+const ConcurrentWindowContext = struct {
+    manager: *Manager,
+    handle: TensorHandle,
+    tensor_offset: usize,
+    expected: u8,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *ConcurrentWindowContext) void {
+        for (0..200) |_| {
+            var view = self.manager.acquireRange(self.handle, self.tensor_offset, 32) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            if (view.bytes()[0] != self.expected) self.failed.store(true, .release);
+            view.release();
+        }
+    }
+};
+
+test "concurrent executors hold disjoint windows of the same tensor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const granularity = try mappingGranularity();
+    const path_z = try createTestBacking(&tmp, granularity * 2);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try BackingStore.open(path_z);
+    defer store.close();
+    var manager = try Manager.init(std.testing.allocator, &store, granularity * 2);
+    defer manager.deinit();
+    const tensor = TensorHandle{ .id = 5 };
+    try manager.register(tensor, 0, granularity * 2);
+
+    var contexts = [_]ConcurrentWindowContext{
+        .{ .manager = &manager, .handle = tensor, .tensor_offset = 0, .expected = 0 },
+        .{ .manager = &manager, .handle = tensor, .tensor_offset = 32, .expected = 32 },
+        .{ .manager = &manager, .handle = tensor, .tensor_offset = 64, .expected = 64 },
+        .{ .manager = &manager, .handle = tensor, .tensor_offset = 96, .expected = 96 },
+    };
+    var threads: [contexts.len]std.Thread = undefined;
+    for (&threads, &contexts) |*thread, *context| {
+        thread.* = try std.Thread.spawn(.{}, ConcurrentWindowContext.run, .{context});
+    }
+    for (&threads) |*thread| thread.join();
+    for (&contexts) |*context| try std.testing.expect(!context.failed.load(.acquire));
+
+    const metrics = manager.metrics();
+    try std.testing.expectEqual(@as(u64, 0), metrics.evictions);
+    try std.testing.expect(metrics.peak_resident_bytes <= metrics.budget_bytes);
+}
 
 test "manager serializes concurrent faults hits and releases" {
     var tmp = std.testing.tmpDir(.{});

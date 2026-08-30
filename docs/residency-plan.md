@@ -54,6 +54,25 @@ consume(chunk.bytes());
 
 `acquireRange()` menggunakan mapping resident yang sudah mencakup requested range sebagai hit. Jika range baru memerlukan remap pada tensor yang sama sementara view lama masih dipin, operasi mengembalikan `error.TensorBusy` agar pointer lama tidak menjadi dangling.
 
+## Multi-window residency (Phase 9)
+
+Satu tensor kini dapat memiliki beberapa mapped window aktif sekaligus, selama
+total bytes mapping tetap dalam budget:
+
+- `Manager` menyimpan window aktif di hash map global keyed slot; `Entry`
+  tensor hanya menyimpan range logis di backing store.
+- Hit dicek terhadap seluruh window tensor, jadi acquire range yang termuat
+  dalam window manapun adalah hit.
+- Eviction beroperasi per window; window pinned tidak pernah dipilih sebagai
+  victim. Bila semua window pinned dan budget tidak cukup, pemanggil menerima
+  `error.BudgetExceeded`.
+- `error.TensorBusy` kini hanya berlaku pada `unregister()` saat masih ada
+  window tensor yang dipin; acquire disjoint pada tensor yang sama tidak lagi
+  ditolak selama budget memadai.
+- Dua executor atau lebih dapat memegang window berbeda dari tensor yang sama
+  secara bersamaan, yang sebelumnya mustahil dengan desain satu window per
+  tensor (`same-tensor multi-window` acceptance item Phase 9).
+
 ## Phase 7 API
 
 Seluruh operasi registry, fault, pin/release, LRU, metrics, dan prefetch pada `Manager` sekarang diserialisasi oleh mutex internal. `TensorView` menyimpan slice dari mapping yang telah dipin, sehingga `bytes()` tidak perlu mengakses hash map manager di luar lock.
@@ -341,3 +360,20 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
     5917 ms / 21.63 token-s, fault delta kecil karena LM head sekali di akhir.
   - Long-prompt llama.cpp reference tetap informational; strict gate tidak
     berubah.
+
+### Status Phase 9: same-tensor multi-window residency (item 3 foundation) — selesai
+
+- Redesain internal `Manager`: window aktif dipindah dari `Entry` ke hash map
+  global `windows` keyed slot; satu tensor dapat memiliki beberapa window.
+- Multi-window hit, eviction per window, accounting budget per bytes mapping
+  aktual (termasuk alignment prefix OS), dan pin tetap per window.
+- `TensorBusy` dipindah ke `unregister()`; acquire disjoint pada tensor sama
+  kini valid selama budget memadai.
+- Dua test baru: coexistence dua window disjoint satu tensor dalam budget, dan
+  stress concurrent empat worker memegang window berbeda tensor yang sama
+  (0 eviction, budget invariant terjaga).
+- Test FFN executor disesuaikan: eviction tidak lagi dijamin untuk mapping
+  kecil yang co-resident; invariant yang diuji adalah budget itu sendiri.
+- Verifikasi: `zig build test` PASS (14/14 residency, 58/58 total), real-model
+  Llama validator PASS semua gate (hasil identik dengan sebelum redesain),
+  benchmark PASS, `zig fmt` + `git diff --check` bersih.
