@@ -432,3 +432,38 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
   validator PASS semua gate exact (single-token max-error=0 argmax=11
   status=close, prefill/incremental/chunked max-error=0), benchmark PASS,
   `git diff --check` bersih.
+
+### Status Phase 9: bounded-residency completion service (item 2) — selesai
+
+- Modul `src/residency_service.zig`: `ResidencyService` — serving boundary
+  completion di atas bounded-residency executor pada model GGUF nyata.
+  Handle llama.cpp dibuka **hanya** sebagai penyedia vocab/tokenizer
+  (tokenize via `llama_tokenize`, detokenize via `llama_token_to_piece`,
+  EOS/BOS dari vocab API); seluruh compute weight berjalan melalui
+  `CpuExecutor` dengan budget mmap eksplisit — compute tidak pernah melewati
+  graph GGML.
+- `complete()`: tokenize (atau prompt tokens eksplisit) → chunked prefill
+  (`modelPrefillChunked`, workspace dibatasi `prefill_chunk`) → decode loop
+  greedy autoregressive via `modelTokens` → detokenize incremental → stop
+  pada EOS atau `context_capacity`. Residency manager dibuat per request;
+  semua weight window ter-unmap saat request selesai.
+- Accounting per request dilaporkan lengkap: peak/budget mapped weights,
+  dequant scratch, activations, attention workspace, KV cache, faults/hits/
+  evictions, dan current RSS.
+- Validasi sebelum mutasi KV tetap diwarisi dari executor; token di luar
+  vocab dan `prompt + max_tokens > context_capacity` ditolak lebih awal.
+- CLI smoke run: `zig build residency-serve -- <model.gguf> "<prompt>"
+  [budget-mib] [max-tokens]` (exe `residency_service` di `build.zig`,
+  men-link ggml + llama lib dan `residency_mmap.c`).
+- Hasil Llama-3.2-1B-Instruct-Q4_K_M nyata, prompt "The capital of France is":
+  - budget 16 MiB, 16 token: output koheren
+    `" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."`,
+    peak-map 15.99/16.00 MiB, faults=2758.
+  - budget 4 MiB, 8 token: output koheren
+    `" Paris. The capital of Germany is Berlin"`,
+    peak-map 4.00/4.00 MiB (budget invariant terjaga), faults=2731.
+- Scope yang tidak diklaim: ini execution path MLz opt-in, bukan penggantian
+  jalur llama.cpp di server; sampler masih greedy; belum ada streaming,
+  chat template, atau batching server-level.
+- Verifikasi: `zig build test -Dsimd-backend=false` PASS (62/62), smoke run
+  budget 16 MiB dan 4 MiB PASS, `zig fmt` + `git diff --check` bersih.

@@ -1972,6 +1972,32 @@ pub fn build(b: *std.Build) void {
     const validate_residency_step = b.step("validate-residency", "Validate bounded compute against a real GGUF model");
     validate_residency_step.dependOn(&validate_residency_run.step);
 
+    // Opt-in bounded-residency completion service smoke run. Example:
+    // zig build residency-serve -- models/model.gguf "Prompt" [budget-mib] [max-tokens]
+    const residency_service_module = b.createModule(.{
+        .root_source_file = b.path("src/residency_service_main.zig"),
+        .target = actual_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    residency_service_module.addIncludePath(b.path("src"));
+    residency_service_module.addIncludePath(llama_cpp_dep.path("include"));
+    residency_service_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    residency_service_module.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const residency_service_exe = b.addExecutable(.{
+        .name = "residency_service",
+        .root_module = residency_service_module,
+    });
+    residency_service_exe.linkLibrary(ggml_lib);
+    residency_service_exe.linkLibrary(llama_lib);
+    const residency_service_run = b.addRunArtifact(residency_service_exe);
+    if (b.args) |args| residency_service_run.addArgs(args);
+    const residency_service_step = b.step("residency-serve", "Run one bounded-residency completion against a real GGUF model");
+    residency_service_step.dependOn(&residency_service_run.step);
+
     // U1 — Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
     // Generates random F32 vectors, quantizes via ggml's reference, calls every
     // built kernel, and asserts the result matches a scalar dequantize-then-dot
