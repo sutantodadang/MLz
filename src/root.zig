@@ -17,6 +17,7 @@ pub const residency = @import("residency.zig");
 pub const gguf_residency = @import("gguf_residency.zig");
 pub const residency_compute = @import("residency_compute.zig");
 pub const residency_executor = @import("residency_executor.zig");
+pub const residency_parallel = @import("residency_parallel.zig");
 
 test {
     // Run tests in all imported modules

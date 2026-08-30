@@ -396,3 +396,39 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
   validator PASS semua gate exact (single-token, layer-0 decoder, full logits
   resident-vs-bounded max-error=0, prefill, incremental, chunked),
   `zig fmt` + `git diff --check` bersih.
+
+### Status Phase 9: parallel matmul kernel (item 4) — selesai
+
+- Refactor `residency_compute.zig`: per-tile computation diekstrak menjadi
+  `matMulF32Tile` dan `matMulQuantizedTile` (publik), dipakai bersama oleh
+  jalur sekuensial dan driver paralel — satu sumber kebenaran kernel GGML
+  (`vec_dot`), tanpa duplikasi dispatch.
+- Driver paralel `parallelMatMul` (via wrapper tipis `residency_parallel.zig`,
+  diekspor dari `root.zig`): worker pool dengan tile cursor atomik.
+- **Bug race ditemukan dan diperbaiki**: desain awal cursor `load` +
+  `cmpxchg` advance-setelah-proses memungkinkan dua worker memproses `row_start`
+  yang sama; worker yang kalah CAS meng-advance melewati baris yang belum
+  dihitung siapa pun → output `identical=false` pada benchmark. Perbaikan:
+  klaim tile via `fetchAdd(rows_per_tile)` **sebelum** diproses (tiap baris
+  dijamin milik tepat satu worker), lalu rentang klaim diproses dalam
+  sub-chunk yang dibatasi `rangeCapacity` (alignment prefix mmap ikut
+  diperhitungkan) sehingga budget tidak pernah terlampaui.
+- Budget-aware concurrency: jumlah thread efektif dibatasi
+  `budget / (tile_bytes + granularity)` agar worker tidak saling menggusur
+  window; aktivasi dikuantisasi sekali di depan dan dibaca-only selama fase
+  paralel.
+- Unit test: parallel Q4_K 4096 kolom vs sekuensial bit-identik pada beberapa
+  konfigurasi thread; worker failure diteruskan ke caller.
+- Benchmark `bench-residency` baru: Q4_K 4096x4096, batch 8, budget 2 MiB —
+  hasil Windows lokal:
+  `sequential=9.27 ms (faults=147), parallel 4T=3.74 ms (faults=147),
+  speedup=2.48x, identical=true`.
+  Fault count identik sequential vs parallel — driver mempertahankan
+  invariant residency; speedup berasal dari paralelisme, bukan dari
+  mengubah access pattern.
+- Wrapper `residency_parallel.zig` dan include path ggml di `build.zig` untuk
+  benchmark exe (`linkLibrary(ggml_lib)`).
+- Verifikasi: `zig build test -Dsimd-backend=false` PASS, real-model Llama
+  validator PASS semua gate exact (single-token max-error=0 argmax=11
+  status=close, prefill/incremental/chunked max-error=0), benchmark PASS,
+  `git diff --check` bersih.

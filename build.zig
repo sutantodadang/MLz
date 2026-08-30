@@ -1931,6 +1931,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     residency_module.addIncludePath(b.path("src"));
+    residency_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
     residency_module.addCSourceFile(.{
         .file = b.path("src/residency_mmap.c"),
         .flags = &.{"-std=c11"},
@@ -1939,6 +1940,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench_residency",
         .root_module = residency_module,
     });
+    bench_residency_exe.linkLibrary(ggml_lib);
     const bench_residency_run = b.addRunArtifact(bench_residency_exe);
     if (b.args) |args| bench_residency_run.addArgs(args);
     const bench_residency_step = b.step("bench-residency", "Benchmark bounded mmap tensor residency");

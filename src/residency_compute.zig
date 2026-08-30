@@ -167,18 +167,33 @@ pub fn matMulF32WithPolicy(
         const byte_len = std.math.mul(usize, tile_rows, row_bytes) catch return Error.InvalidTensorShape;
         var view = try acquireTile(manager, descriptor, byte_offset, byte_len, policy);
         defer view.release();
-
-        const values: []align(1) const f32 = std.mem.bytesAsSlice(f32, view.bytes());
-        for (0..tile_rows) |tile_row| {
-            const weights = values[tile_row * columns ..][0..columns];
-            for (0..batch_count) |batch| {
-                const input = inputs[batch * columns ..][0..columns];
-                var sum: f32 = 0;
-                for (weights, input) |weight, value| sum += weight * value;
-                outputs[batch * rows + row_start + tile_row] = sum;
-            }
-        }
+        try matMulF32Tile(&view, inputs, outputs, batch_count, columns, rows, row_start, tile_rows);
         row_start += tile_rows;
+    }
+}
+
+/// Computes one pinned weight tile of an F32 matmul. Exposed so the parallel
+/// driver can reuse the exact same per-row reduction as the sequential path.
+/// `view` must cover rows `[row_start, row_start + tile_rows)`.
+pub fn matMulF32Tile(
+    view: *residency.TensorView,
+    inputs: []const f32,
+    outputs: []f32,
+    batch_count: usize,
+    columns: usize,
+    rows: usize,
+    row_start: usize,
+    tile_rows: usize,
+) Error!void {
+    const values: []align(1) const f32 = std.mem.bytesAsSlice(f32, view.bytes());
+    for (0..tile_rows) |tile_row| {
+        const weights = values[tile_row * columns ..][0..columns];
+        for (0..batch_count) |batch| {
+            const input = inputs[batch * columns ..][0..columns];
+            var sum: f32 = 0;
+            for (weights, input) |weight, value| sum += weight * value;
+            outputs[batch * rows + row_start + tile_row] = sum;
+        }
     }
 }
 
@@ -191,7 +206,7 @@ const QuantizedFormat = struct {
     dequantize: DequantizeFn,
 };
 
-fn quantizedFormat(ggml_type: u32) ?QuantizedFormat {
+pub fn quantizedFormat(ggml_type: u32) ?QuantizedFormat {
     return if (ggml_type == gguf.type_q2_k)
         .{ .block_elements = 256, .block_bytes = 84, .dequantize = &dequantize_row_q2_K }
     else if (ggml_type == gguf.type_q3_k)
@@ -223,6 +238,269 @@ pub fn quantizedDotBatchScratchBytes(ggml_type: u32, columns: usize, batch_count
     if (batch_count == 0) return Error.InvalidInput;
     const row_bytes = try quantizedDotScratchBytes(ggml_type, columns);
     return std.math.mul(usize, row_bytes, batch_count) catch return Error.InvalidInput;
+}
+
+/// Compact format info for the parallel driver (no function pointers).
+pub const QuantizedFormatInfo = struct {
+    block_elements: usize,
+    block_bytes: usize,
+};
+
+pub fn quantizedFormatFor(ggml_type: u32) ?QuantizedFormatInfo {
+    const format = quantizedFormat(ggml_type) orelse return null;
+    return .{ .block_elements = format.block_elements, .block_bytes = format.block_bytes };
+}
+
+pub fn quantWeightTraits(ggml_type: u32) Error!*const c.ggml_type_traits_cpu {
+    ensureGgmlCpuInitialized();
+    const weight_traits = c.ggml_get_type_traits_cpu(ggml_type);
+    if (weight_traits == null or weight_traits.*.vec_dot == null) return Error.InvalidTensorType;
+    return weight_traits.?;
+}
+
+/// Quantizes `batch_count` float activation rows into the GGML vec_dot input
+/// type for `ggml_type` (e.g. Q8_0/Q8_K). `scratch` must be at least
+/// `quantizedDotBatchScratchBytes(ggml_type, columns, batch_count)` bytes.
+pub fn quantizeActivations(
+    ggml_type: u32,
+    inputs: []const f32,
+    scratch: []u8,
+    batch_count: usize,
+    columns: usize,
+) Error!void {
+    ensureGgmlCpuInitialized();
+    const weight_traits = c.ggml_get_type_traits_cpu(ggml_type);
+    if (weight_traits == null or weight_traits.*.vec_dot == null) return Error.InvalidTensorType;
+    const activation_traits = c.ggml_get_type_traits_cpu(weight_traits.*.vec_dot_type);
+    if (activation_traits == null or activation_traits.*.from_float == null) return Error.InvalidTensorType;
+    const input_bytes = c.ggml_row_size(weight_traits.*.vec_dot_type, @intCast(columns));
+    const required = std.math.mul(usize, input_bytes, batch_count) catch return Error.InvalidInput;
+    if (scratch.len < required) return Error.QuantizedScratchTooSmall;
+    for (0..batch_count) |batch| {
+        const input = inputs[batch * columns ..][0..columns];
+        activation_traits.*.from_float.?(
+            input.ptr,
+            scratch[batch * input_bytes ..].ptr,
+            @intCast(columns),
+        );
+    }
+}
+
+pub const quantScratchAlignment = std.mem.Alignment.fromByteUnits(64);
+
+/// Parallel bounded matmul driver (Phase 9, item 4). Workers pull fixed row
+/// tiles from an atomic cursor; every output element is computed by exactly
+/// one thread with the same per-row reduction as the sequential kernel, so
+/// output is bit-identical to the sequential path. Each worker maps at most
+/// one tile at a time, preserving the manager budget invariant.
+pub const ParallelOptions = struct {
+    /// Total worker threads. The calling thread participates as worker zero,
+    /// so no extra thread is spawned for the single-thread case.
+    threads: usize = 4,
+    /// Maximum rows per mapped tile per worker.
+    rows_per_tile: usize,
+};
+
+const ParallelJob = struct {
+    manager: *residency.Manager,
+    descriptor: *const gguf.TensorDescriptor,
+    inputs: []const f32,
+    outputs: []f32,
+    batch_count: usize,
+    columns: usize,
+    rows: usize,
+    row_bytes: usize,
+    rows_per_tile: usize,
+    quant: ?Quant,
+    next_row: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    failed_error: ?[]const u8 = null,
+
+    const Quant = struct {
+        weight_traits: *const c.ggml_type_traits_cpu,
+        input_bytes: usize,
+        /// [batch][input_bytes] quantized activation rows. Written once before
+        /// the parallel phase and only read afterwards.
+        scratch: []u8,
+    };
+
+    fn totalTiles(self: *const ParallelJob) usize {
+        return (self.rows + self.rows_per_tile - 1) / self.rows_per_tile;
+    }
+};
+
+/// Claims tiles via `fetchAdd(rows_per_tile)` BEFORE processing, so every
+/// row belongs to exactly one worker. The claimed range is then processed in
+/// capacity-bounded sub-chunks (mmap alignment prefix included), so the
+/// budget is never exceeded and no row is ever skipped.
+fn parallelConsumeTiles(job: *ParallelJob) Error!void {
+    while (true) {
+        const row_start = job.next_row.fetchAdd(job.rows_per_tile, .acq_rel);
+        if (row_start >= job.rows) return;
+        const claimed_rows = @min(job.rows_per_tile, job.rows - row_start);
+        try parallelConsumeClaimed(job, row_start, claimed_rows);
+    }
+}
+
+fn parallelConsumeClaimed(
+    job: *ParallelJob,
+    row_start: usize,
+    claimed_rows: usize,
+) Error!void {
+    var processed: usize = 0;
+    while (processed < claimed_rows) {
+        const remaining_rows = claimed_rows - processed;
+        const offset_row = row_start + processed;
+        const byte_offset = std.math.mul(usize, offset_row, job.row_bytes) catch return Error.InvalidTensorShape;
+        // Clamp each sub-chunk to what the budget can actually map at this
+        // offset (includes mmap alignment-prefix overhead). The claimed range
+        // is exclusive to this worker, so looping over capacity-sized
+        // sub-chunks covers it completely.
+        const capacity = try job.manager.rangeCapacity(job.descriptor.handle, byte_offset);
+        const chunk_rows = @min(remaining_rows, capacity / job.row_bytes);
+        if (chunk_rows == 0) return Error.BudgetExceeded;
+        const byte_len = std.math.mul(usize, chunk_rows, job.row_bytes) catch return Error.InvalidTensorShape;
+        var view = try job.manager.acquireRange(job.descriptor.handle, byte_offset, byte_len);
+        defer view.release();
+
+        if (job.quant) |*quant| {
+            try matMulQuantizedTile(
+                &view,
+                quant.weight_traits,
+                quant.scratch,
+                job.outputs,
+                job.batch_count,
+                job.columns,
+                job.rows,
+                job.row_bytes,
+                quant.input_bytes,
+                offset_row,
+                chunk_rows,
+            );
+        } else {
+            try matMulF32Tile(
+                &view,
+                job.inputs,
+                job.outputs,
+                job.batch_count,
+                job.columns,
+                job.rows,
+                offset_row,
+                chunk_rows,
+            );
+        }
+        processed += chunk_rows;
+    }
+}
+
+fn parallelWorkerMain(job: *ParallelJob) void {
+    parallelConsumeTiles(job) catch |err| {
+        job.failed_error = @errorName(err);
+        job.failed.store(true, .release);
+    };
+}
+
+pub fn parallelMatMul(
+    manager: *residency.Manager,
+    descriptor: *const gguf.TensorDescriptor,
+    inputs: []const f32,
+    outputs: []f32,
+    batch_count: usize,
+    options: ParallelOptions,
+) Error!void {
+    if (descriptor.n_dimensions != 2 or batch_count == 0) return Error.InvalidInput;
+    if (options.threads == 0 or options.rows_per_tile == 0) return Error.InvalidInput;
+
+    const columns = std.math.cast(usize, descriptor.dimensions[0]) orelse return Error.InvalidTensorShape;
+    const rows = std.math.cast(usize, descriptor.dimensions[1]) orelse return Error.InvalidTensorShape;
+    if (columns == 0 or rows == 0) return Error.InvalidInput;
+    const input_elements = std.math.mul(usize, batch_count, columns) catch return Error.InvalidInput;
+    const output_elements = std.math.mul(usize, batch_count, rows) catch return Error.InvalidInput;
+    if (inputs.len != input_elements or outputs.len != output_elements) return Error.InvalidInput;
+
+    const is_f32 = descriptor.ggml_type == gguf.type_f32;
+    var row_bytes: usize = undefined;
+
+    if (is_f32) {
+        row_bytes = std.math.mul(usize, columns, @sizeOf(f32)) catch return Error.InvalidTensorShape;
+        const elements = std.math.mul(usize, columns, rows) catch return Error.InvalidTensorShape;
+        const expected = std.math.mul(usize, elements, @sizeOf(f32)) catch return Error.InvalidTensorShape;
+        if (descriptor.byte_len != expected) return Error.InvalidTensorShape;
+    } else {
+        const format = quantizedFormatFor(descriptor.ggml_type) orelse return Error.InvalidTensorType;
+        if (columns % format.block_elements != 0) return Error.InvalidTensorShape;
+        row_bytes = std.math.mul(usize, columns / format.block_elements, format.block_bytes) catch return Error.InvalidTensorShape;
+        const expected = std.math.mul(usize, row_bytes, rows) catch return Error.InvalidTensorShape;
+        if (descriptor.byte_len != expected) return Error.InvalidTensorShape;
+    }
+
+    var job = ParallelJob{
+        .manager = manager,
+        .descriptor = descriptor,
+        .inputs = inputs,
+        .outputs = outputs,
+        .batch_count = batch_count,
+        .columns = columns,
+        .rows = rows,
+        .row_bytes = row_bytes,
+        .rows_per_tile = options.rows_per_tile,
+        .quant = null,
+    };
+
+    var quant_scratch: []u8 = &.{};
+    defer if (job.quant != null) std.heap.page_allocator.free(quant_scratch);
+
+    if (!is_f32) {
+        // Quantized path: quantize all activations up front (identical to the
+        // sequential kernel), then share the scratch read-only during the
+        // parallel phase.
+        const scratch_bytes = try quantizedDotBatchScratchBytes(descriptor.ggml_type, columns, batch_count);
+        quant_scratch = std.heap.page_allocator.alignedAlloc(u8, quantScratchAlignment, scratch_bytes) catch return Error.OutOfMemory;
+        try quantizeActivations(descriptor.ggml_type, inputs, quant_scratch, batch_count, columns);
+        job.quant = .{
+            .weight_traits = try quantWeightTraits(descriptor.ggml_type),
+            .input_bytes = try quantizedDotScratchBytes(descriptor.ggml_type, columns),
+            .scratch = quant_scratch,
+        };
+    }
+
+    if (options.threads == 1 or job.totalTiles() == 1) {
+        try parallelConsumeTiles(&job);
+        return;
+    }
+
+    // Budget-aware concurrency: each active worker can hold one chunk plus a
+    // possible mmap alignment prefix, so cap concurrency so that the worst
+    // case stays within the manager budget. Otherwise concurrent workers can
+    // evict each other's pinned windows or fail with BudgetExceeded.
+    const alignment = try residency.mappingGranularity();
+    const tile_bytes = job.rows_per_tile * job.row_bytes;
+    const worst_case_per_worker = tile_bytes + alignment;
+    const budget_snapshot = manager.metrics().budget_bytes;
+    const max_threads = @max(@as(usize, 1), budget_snapshot / @max(worst_case_per_worker, 1));
+    const effective_threads = @max(@as(usize, 1), @min(options.threads, max_threads));
+    if (effective_threads == 1) {
+        try parallelConsumeTiles(&job);
+        return;
+    }
+
+    const worker_count = effective_threads - 1;
+    const workers = std.heap.page_allocator.alloc(std.Thread, worker_count) catch return Error.OutOfMemory;
+    defer std.heap.page_allocator.free(workers);
+
+    var spawned: usize = 0;
+    for (0..worker_count) |i| {
+        workers[i] = std.Thread.spawn(.{}, parallelWorkerMain, .{&job}) catch break;
+        spawned += 1;
+    }
+    parallelConsumeTiles(&job) catch {
+        job.failed.store(true, .release);
+    };
+    for (workers[0..spawned]) |worker| worker.join();
+    if (job.failed.load(.acquire)) {
+        std.debug.print("parallel matmul worker error: {s}\n", .{job.failed_error orelse "unknown"});
+        return Error.InvalidInput;
+    }
 }
 
 /// Bounded matrix-vector multiply using the canonical GGML CPU quantized-dot
@@ -338,24 +616,54 @@ pub fn matMulQuantizedGgmlWithPolicy(
         const byte_len = std.math.mul(usize, tile_rows, row_bytes) catch return Error.InvalidTensorShape;
         var view = try acquireTile(manager, descriptor, byte_offset, byte_len, policy);
         defer view.release();
-        for (0..tile_rows) |tile_row| {
-            const quantized_row = view.bytes()[tile_row * row_bytes ..][0..row_bytes];
-            for (0..batch_count) |batch| {
-                var sum: f32 = 0;
-                weight_traits.*.vec_dot.?(
-                    @intCast(columns),
-                    &sum,
-                    0,
-                    quantized_row.ptr,
-                    0,
-                    quantized_input_scratch[batch * input_bytes ..].ptr,
-                    0,
-                    1,
-                );
-                outputs[batch * rows + row_start + tile_row] = sum;
-            }
-        }
+        try matMulQuantizedTile(
+            &view,
+            weight_traits,
+            quantized_input_scratch,
+            outputs,
+            batch_count,
+            columns,
+            rows,
+            row_bytes,
+            input_bytes,
+            row_start,
+            tile_rows,
+        );
         row_start += tile_rows;
+    }
+}
+
+/// Computes one pinned quantized weight tile. Exposed so the parallel driver
+/// reuses the exact same GGML vec_dot reduction as the sequential path.
+pub fn matMulQuantizedTile(
+    view: *residency.TensorView,
+    weight_traits: *const c.ggml_type_traits_cpu,
+    quantized_input_scratch: []u8,
+    outputs: []f32,
+    batch_count: usize,
+    columns: usize,
+    rows: usize,
+    row_bytes: usize,
+    input_bytes: usize,
+    row_start: usize,
+    tile_rows: usize,
+) Error!void {
+    for (0..tile_rows) |tile_row| {
+        const quantized_row = view.bytes()[tile_row * row_bytes ..][0..row_bytes];
+        for (0..batch_count) |batch| {
+            var sum: f32 = 0;
+            weight_traits.*.vec_dot.?(
+                @intCast(columns),
+                &sum,
+                0,
+                quantized_row.ptr,
+                0,
+                quantized_input_scratch[batch * input_bytes ..].ptr,
+                0,
+                1,
+            );
+            outputs[batch * rows + row_start + tile_row] = sum;
+        }
     }
 }
 
@@ -1098,4 +1406,154 @@ test "matvec validates GGUF type shape and tile size" {
     try std.testing.expectError(Error.InvalidTensorShape, matVecF32(&manager, &descriptor, &.{1}, &output, 1));
     descriptor.n_dimensions = 2;
     try std.testing.expectError(Error.ChunkTooSmall, matVecF32(&manager, &descriptor, &.{1}, &output, 0));
+}
+
+test "parallel F32 matmul matches sequential output exactly" {
+    const allocator = std.testing.allocator;
+    const columns: usize = 128;
+    const rows: usize = 512;
+    const batch_count: usize = 4;
+    const granularity = try residency.mappingGranularity();
+
+    const weights = try allocator.alloc(f32, columns * rows);
+    defer allocator.free(weights);
+    for (weights, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 37)) / 11.0 - 1.4;
+    const inputs = try allocator.alloc(f32, batch_count * columns);
+    defer allocator.free(inputs);
+    for (inputs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 19)) / 7.0 - 1.1;
+
+    const sequential = try allocator.alloc(f32, batch_count * rows);
+    defer allocator.free(sequential);
+    const parallel = try allocator.alloc(f32, batch_count * rows);
+    defer allocator.free(parallel);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile("parallel-f32.bin", .{});
+    try file.writeAll(std.mem.sliceAsBytes(weights));
+    file.close();
+    const path = try tmp.dir.realpathAlloc(allocator, "parallel-f32.bin");
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var store = try residency.BackingStore.open(path_z);
+    defer store.close();
+
+    const descriptor = gguf.TensorDescriptor{
+        .handle = .{ .id = 77 },
+        .name = "parallel_f32.weight",
+        .file_offset = 0,
+        .byte_len = weights.len * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = .{ columns, rows, 1, 1 },
+    };
+
+    const budget = granularity * 4;
+    const rows_per_tile = @max(@as(usize, 1), granularity / (columns * @sizeOf(f32)));
+
+    var sequential_manager = try residency.Manager.init(allocator, &store, budget);
+    defer sequential_manager.deinit();
+    try sequential_manager.register(descriptor.handle, 0, descriptor.byte_len);
+    try matMulF32(&sequential_manager, &descriptor, inputs, sequential, batch_count, rows_per_tile);
+
+    var parallel_manager = try residency.Manager.init(allocator, &store, budget);
+    defer parallel_manager.deinit();
+    try parallel_manager.register(descriptor.handle, 0, descriptor.byte_len);
+    try parallelMatMul(
+        &parallel_manager,
+        &descriptor,
+        inputs,
+        parallel,
+        batch_count,
+        .{ .threads = 4, .rows_per_tile = rows_per_tile },
+    );
+    const metrics = parallel_manager.metrics();
+
+    try std.testing.expectEqualSlices(f32, sequential, parallel);
+    try std.testing.expect(metrics.peak_resident_bytes <= budget);
+    try std.testing.expect(metrics.faults > 0);
+}
+
+test "parallel Q4_K matmul matches sequential output exactly" {
+    const allocator = std.testing.allocator;
+    const columns: usize = 256;
+    const row_bytes: usize = 144;
+    const rows: usize = 384;
+    const batch_count: usize = 3;
+    const granularity = try residency.mappingGranularity();
+
+    const weights = try allocator.alloc(f32, columns * rows);
+    defer allocator.free(weights);
+    for (weights, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 29)) / 9.0 - 1.3;
+    const quantized = try allocator.alloc(u8, row_bytes * rows);
+    defer allocator.free(quantized);
+    for (0..rows) |row| {
+        quantize_row_q4_K_ref(weights[row * columns ..][0..columns].ptr, quantized[row * row_bytes ..].ptr, columns);
+    }
+    const inputs = try allocator.alloc(f32, batch_count * columns);
+    defer allocator.free(inputs);
+    for (inputs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 17)) / 6.0 - 0.9;
+
+    const sequential = try allocator.alloc(f32, batch_count * rows);
+    defer allocator.free(sequential);
+    const parallel = try allocator.alloc(f32, batch_count * rows);
+    defer allocator.free(parallel);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile("parallel-q4-k.bin", .{});
+    try file.writeAll(quantized);
+    file.close();
+    const path = try tmp.dir.realpathAlloc(allocator, "parallel-q4-k.bin");
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var store = try residency.BackingStore.open(path_z);
+    defer store.close();
+
+    const descriptor = gguf.TensorDescriptor{
+        .handle = .{ .id = 78 },
+        .name = "parallel_q4_k.weight",
+        .file_offset = 0,
+        .byte_len = quantized.len,
+        .ggml_type = gguf.type_q4_k,
+        .n_dimensions = 2,
+        .dimensions = .{ columns, rows, 1, 1 },
+    };
+
+    const budget = granularity * 4;
+    const rows_per_tile = @max(@as(usize, 1), granularity / row_bytes);
+
+    var sequential_manager = try residency.Manager.init(allocator, &store, budget);
+    defer sequential_manager.deinit();
+    try sequential_manager.register(descriptor.handle, 0, descriptor.byte_len);
+    const seq_scratch_len = try quantizedDotBatchScratchBytes(gguf.type_q4_k, columns, batch_count);
+    const seq_scratch = try allocator.alignedAlloc(u8, quantScratchAlignment, seq_scratch_len);
+    defer allocator.free(seq_scratch);
+    try matMulQuantizedGgml(
+        &sequential_manager,
+        &descriptor,
+        inputs,
+        sequential,
+        batch_count,
+        rows_per_tile,
+        seq_scratch,
+    );
+
+    var parallel_manager = try residency.Manager.init(allocator, &store, budget);
+    defer parallel_manager.deinit();
+    try parallel_manager.register(descriptor.handle, 0, descriptor.byte_len);
+    try parallelMatMul(
+        &parallel_manager,
+        &descriptor,
+        inputs,
+        parallel,
+        batch_count,
+        .{ .threads = 4, .rows_per_tile = rows_per_tile },
+    );
+    const metrics = parallel_manager.metrics();
+
+    try std.testing.expectEqualSlices(f32, sequential, parallel);
+    try std.testing.expect(metrics.peak_resident_bytes <= budget);
 }
