@@ -630,3 +630,25 @@ Sisa kerja lanjutan (di luar Phase 10): streaming SSE/sampling non-greedy pada s
   - streaming SSE tetap PASS.
 - Verifikasi: `zig build` + `zig build test -Dsimd-backend=false` PASS;
   smoke script diperluas dengan kasus chat (`PASS chat messages`).
+
+### Status lanjutan: per-request budget override + concurrency > 1 - selesai
+
+- Audit menyimpulkan `ResidencyService.complete()` sudah mengalokasikan semua
+  state eksekusi per request (manager, executor, workspace, KV caches), dan
+  `BackingStore`/`TensorIndex` bersifat read-only terhadap mapping
+  (`MapViewOfFile`/`mmap` per window, tanpa cursor bersama) sehingga beberapa
+  service instance dapat mengeksekusi paralel tanpa refactor.
+- `ResidencyEndpoint` kini pool dari `slots` service independen, masing-masing
+  mutex sendiri; request mengambil slot bebas (try-lock semua slot, fallback
+  round-robin). `--residency-slots N` (default 1 = perilaku serialized lama).
+- Per-request budget override: field request `residency_budget_mib`
+  (1..1048576; di luar rentang -> 400). Override hanya berlaku untuk request
+  tersebut karena manager dibuat per request.
+- Unit test: akuisisi slot multi-slot, penolakan slot_count=0.
+- Smoke end-to-end (Llama-3.2-1B, budget 8 MiB, slots=2): non-streaming,
+  streaming SSE, chat messages, override 4 MiB (echo budget 4 MiB, invariant
+  terjaga), override 0 -> 400, dan dua request concurrent keduanya sukses
+  dengan budget invariant terjaga.
+- Verifikasi: `zig build` + `zig build test` PASS; `zig fmt`; smoke script
+  diperluas (`PASS per-request budget override`, `PASS invalid budget override
+  rejected`, `PASS concurrent requests (2 slots)`).

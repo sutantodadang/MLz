@@ -80,6 +80,8 @@ pub const Config = struct {
     /// Bounded-residency endpoint weight budget in MiB. 0 disables the
     /// `/v1/residency/completions` endpoint entirely.
     residency_budget_mib: usize = 0,
+    /// Independent bounded-residency execution slots (concurrent completions).
+    residency_slots: usize = 1,
 
     // Custom SIMD backend runtime controls (consumed before model load to set
     // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
@@ -256,6 +258,10 @@ pub const Config = struct {
                 const v = try parseNextInt(usize, &i, args);
                 if (v == 0) return ParseError.InvalidInt;
                 self.residency_budget_mib = v;
+            } else if (std.mem.eql(u8, arg, "--residency-slots")) {
+                const v = try parseNextInt(usize, &i, args);
+                if (v == 0) return ParseError.InvalidInt;
+                self.residency_slots = v;
             } else if (std.mem.eql(u8, arg, "--no-prefix-cache")) {
                 self.prefix_cache = false;
             } else if (std.mem.eql(u8, arg, "--no-simd")) {

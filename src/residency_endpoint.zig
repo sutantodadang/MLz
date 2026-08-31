@@ -23,44 +23,68 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Shared, lazily-initialized residency service bound to the server's startup
-/// model path. Guarded by `mutex`; `service` stays `null` until the first
-/// request arrives, so a server that never receives a residency request never
-/// pays for the service. The mutex serializes requests because the service
-/// uses a single-owner executor.
+/// Shared residency services bound to the server's startup model path.
+///
+/// The endpoint owns `slots` independent `ResidencyService` instances, each
+/// guarded by its own mutex. A request acquires any free slot (try-locking
+/// each in turn, falling back to the next slot in round-robin order), so up
+/// to `slots.len` completions execute concurrently. Each completion builds
+/// its own residency manager and executor, so resident weight memory stays
+/// bounded per request regardless of model size. With a single slot this
+/// degrades to the original fully-serialized behavior.
+///
+/// Services open lazily on first use: a server that never receives a
+/// residency request never pays for a model load.
 pub const ResidencyEndpoint = struct {
     allocator: std.mem.Allocator,
     model_path: []const u8,
-    /// Mapped-weight budget in bytes.
+    /// Default mapped-weight budget in bytes; overridable per request via
+    /// `residency_budget_mib`.
     budget_bytes: usize,
     /// Optional non-weight state budget in bytes (0 = unlimited).
     state_cache_bytes: usize = 0,
     state_workspace_bytes: usize = 0,
 
-    mutex: std.Thread.Mutex = .{},
-    service: ?*ResidencyService = null,
+    /// One mutex-guarded service slot; slots execute independently.
+    slots: []Slot,
+    /// Round-robin cursor used only when every slot is busy.
+    next_slot: usize = 0,
 
-    /// Initializes the endpoint. `model_path` is duplicated.
+    pub const Slot = struct {
+        mutex: std.Thread.Mutex = .{},
+        service: ?*ResidencyService = null,
+    };
+
+    /// Initializes the endpoint. `model_path` is duplicated. `slot_count`
+    /// must be at least 1.
     pub fn init(
         allocator: std.mem.Allocator,
         model_path: []const u8,
         budget_bytes: usize,
+        slot_count: usize,
     ) !ResidencyEndpoint {
+        if (slot_count == 0) return error.InvalidSlotCount;
+        const slots = try allocator.alloc(Slot, slot_count);
+        errdefer allocator.free(slots);
+        for (slots) |*slot| slot.* = .{};
         return .{
             .allocator = allocator,
             .model_path = try allocator.dupe(u8, model_path),
             .budget_bytes = budget_bytes,
+            .slots = slots,
         };
     }
 
     pub fn deinit(self: *ResidencyEndpoint) void {
         self.reset();
         self.allocator.free(self.model_path);
+        self.allocator.free(self.slots);
     }
 
-    /// Opens the service on first use. Caller must hold `mutex`.
-    fn ensureService(self: *ResidencyEndpoint) Error!*ResidencyService {
-        if (self.service) |s| return s;
+    /// Opens the slot's service on first use. Caller must hold the slot's
+    /// mutex.
+    fn ensureService(self: *ResidencyEndpoint, slot: *Slot) Error!*ResidencyService {
+        if (slot.service) |s| return s;
         const s = try self.allocator.create(ResidencyService);
         errdefer self.allocator.destroy(s);
         s.* = ResidencyService.open(self.allocator, self.model_path, .{
@@ -69,16 +93,33 @@ pub const ResidencyEndpoint = struct {
             error.OutOfMemory => |e| return e,
             else => return Error.Internal,
         };
-        self.service = s;
+        slot.service = s;
         return s;
     }
 
-    /// Closes the service (if open) so the next request reopens it.
+    /// Acquires a free slot, try-locking each in turn before falling back to
+    /// the round-robin cursor. Caller must release the returned slot's mutex.
+    fn acquireSlot(self: *ResidencyEndpoint) *Slot {
+        for (self.slots) |*slot| {
+            if (slot.mutex.tryLock()) return slot;
+        }
+        // Every slot is busy: wait on the next one in round-robin order.
+        const slot = &self.slots[self.next_slot % self.slots.len];
+        self.next_slot = (self.next_slot + 1) % self.slots.len;
+        slot.mutex.lock();
+        return slot;
+    }
+
+    /// Closes every open service so the next request reopens it.
     pub fn reset(self: *ResidencyEndpoint) void {
-        if (self.service) |s| {
-            s.close();
-            self.allocator.destroy(s);
-            self.service = null;
+        for (self.slots) |*slot| {
+            slot.mutex.lock();
+            defer slot.mutex.unlock();
+            if (slot.service) |s| {
+                s.close();
+                self.allocator.destroy(s);
+                slot.service = null;
+            }
         }
     }
 };
@@ -215,9 +256,6 @@ pub fn handle(
     endpoint: *ResidencyEndpoint,
     body: []const u8,
 ) anyerror!void {
-    endpoint.mutex.lock();
-    defer endpoint.mutex.unlock();
-
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
@@ -234,6 +272,23 @@ pub fn handle(
             return;
         },
     };
+
+    // Optional per-request mapped-weight budget override, in MiB. Each
+    // completion builds its own residency manager, so the override only
+    // affects this request.
+    var budget_bytes = endpoint.budget_bytes;
+    if (getInt(obj, "residency_budget_mib")) |mib| {
+        if (mib < 1 or mib > 1024 * 1024) {
+            writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "residency_budget_mib out of range") catch {};
+            return;
+        }
+        budget_bytes = @as(usize, @intCast(mib)) * 1024 * 1024;
+    }
+
+    // Acquire an execution slot: independent services run concurrently, and
+    // with a single slot this degrades to fully-serialized handling.
+    const slot = endpoint.acquireSlot();
+    defer slot.mutex.unlock();
 
     // Input modes: `messages` (chat, rendered via the model's jinja template)
     // or `prompt` (raw completion text). Exactly one is required.
@@ -266,7 +321,7 @@ pub fn handle(
                     };
                     messages.append(allocator, .{ .role = role, .content = content }) catch |e| return e;
                 }
-                const service = endpoint.ensureService() catch |err| switch (err) {
+                const service = endpoint.ensureService(slot) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => {
                         writeJsonError(stream, 503, "Service Unavailable", "server_error", "failed to open the residency service") catch {};
@@ -299,7 +354,7 @@ pub fn handle(
             writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "prompt must not be empty") catch {};
             return;
         }
-        const service = endpoint.ensureService() catch |err| switch (err) {
+        const service = endpoint.ensureService(slot) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             else => {
                 writeJsonError(stream, 503, "Service Unavailable", "server_error", "failed to open the residency service") catch {};
@@ -352,7 +407,7 @@ pub fn handle(
         top_k = @intCast(k);
     }
 
-    const service = endpoint.ensureService() catch |err| switch (err) {
+    const service = endpoint.ensureService(slot) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
             writeJsonError(stream, 503, "Service Unavailable", "server_error", "failed to open the residency service") catch {};
@@ -391,7 +446,7 @@ pub fn handle(
         try stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
     }
 
-    const result = service.complete(.{ .budget_bytes = endpoint.budget_bytes }, options) catch |err| switch (err) {
+    const result = service.complete(.{ .budget_bytes = budget_bytes }, options) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
             if (streaming) {
@@ -469,4 +524,28 @@ test "writeJsonString passes through printable utf-8" {
     var fbs = std.io.fixedBufferStream(&buf);
     try writeJsonString(fbs.writer(), "héllo — ok");
     try std.testing.expectEqualStrings("\"héllo — ok\"", fbs.getWritten());
+}
+
+test "endpoint pool acquires and releases distinct slots" {
+    const allocator = std.testing.allocator;
+    var ep = try ResidencyEndpoint.init(allocator, "unused.gguf", 1024, 3);
+    defer ep.deinit();
+
+    const first = ep.acquireSlot();
+    // With one slot held, the other slots must still be acquirable.
+    const second = ep.acquireSlot();
+    try std.testing.expect(first != second);
+    second.mutex.unlock();
+    first.mutex.unlock();
+
+    // After release every slot is free again.
+    const again = ep.acquireSlot();
+    again.mutex.unlock();
+}
+
+test "endpoint slot count must be positive" {
+    try std.testing.expectError(
+        error.InvalidSlotCount,
+        ResidencyEndpoint.init(std.testing.allocator, "unused.gguf", 1024, 0),
+    );
 }

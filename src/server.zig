@@ -51,6 +51,11 @@ pub const ServerConfig = struct {
     /// Bounded-residency endpoint weight budget in MiB. 0 disables the
     /// `POST /v1/residency/completions` endpoint entirely.
     residency_budget_mib: usize = 0,
+
+    /// Number of independent bounded-residency service slots. Each slot
+    /// executes one completion at a time; requests beyond this capacity wait
+    /// on a busy slot. 1 = fully serialized (default).
+    residency_slots: usize = 1,
 };
 
 /// Wraps the always-resident startup engine plus an LRU pool of extra engines
@@ -194,11 +199,14 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
     defer embed_service.deinit();
 
     // Bounded-residency endpoint: opt-in, lazily opened on first request.
+    // `residency_slots` service instances execute independently so up to that
+    // many completions run concurrently.
     var residency_ep: ?residency_endpoint.ResidencyEndpoint = if (cfg.residency_budget_mib > 0)
         try residency_endpoint.ResidencyEndpoint.init(
             allocator,
             model_path,
             cfg.residency_budget_mib * 1024 * 1024,
+            @max(@as(usize, 1), cfg.residency_slots),
         )
     else
         null;
