@@ -16,6 +16,18 @@ pub const Error = executor_mod.Error || llama.LlamaError || gguf.Error || error{
 /// The llama.cpp model handle provides the vocabulary/detokenizer only (mmap);
 /// it is never used for compute. All weight compute runs through the
 /// bounded-residency CPU executor with an explicit weight-mapping budget.
+fn chunkStatesLen(chunk: usize, hidden: usize) usize {
+    return chunk * hidden * @sizeOf(f32);
+}
+
+fn stateLen(hidden: usize) usize {
+    return hidden * @sizeOf(f32);
+}
+
+fn logitsLen(vocab_size: usize) usize {
+    return vocab_size * @sizeOf(f32);
+}
+
 pub const ResidencyService = struct {
     allocator: std.mem.Allocator,
     store: residency.BackingStore,
@@ -167,6 +179,9 @@ pub const ResidencyService = struct {
         add_bos: bool = false,
         /// Pre-tokenized prompt; skips `tokenize()` when provided.
         prompt_tokens: ?[]const usize = null,
+        /// Explicit non-weight memory policy. `null` keeps legacy unlimited
+        /// allocation for KV caches and execution workspaces.
+        state_budget: ?executor_mod.StateBudget = null,
     };
 
     /// Runs a greedy completion through the bounded-residency executor. The
@@ -229,6 +244,20 @@ pub const ResidencyService = struct {
         const generation_capacity = std.math.add(usize, prompt_tokens.len, options.max_tokens) catch return Error.KvCacheFull;
         if (generation_capacity > config.context_capacity) return Error.KvCacheFull;
 
+        // Non-weight state budget policy: validated BEFORE any workspace,
+        // cache, or manager allocation so rejection is transactional.
+        const state_budget = options.state_budget orelse executor_mod.StateBudget{};
+        {
+            const attention_bytes = try executor_mod.attentionWorkspaceBytes(hidden);
+            const prefill_bytes = try executor_mod.prefillWorkspaceBytes(config.prefill_chunk, hidden, intermediate);
+            const workspace_bytes = attention_bytes + prefill_bytes +
+                chunkStatesLen(config.prefill_chunk, hidden) + stateLen(hidden) +
+                logitsLen(self.vocab_size);
+            try state_budget.checkWorkspace(workspace_bytes);
+            const cache_total = (try executor_mod.kvCacheBytes(config.context_capacity, kv_width)) * block_count;
+            try state_budget.checkCache(cache_total);
+        }
+
         var manager = try residency.Manager.init(self.allocator, &self.store, config.budget_bytes);
         defer manager.deinit();
         try self.index.registerAll(&manager);
@@ -253,13 +282,18 @@ pub const ResidencyService = struct {
         );
         defer prefill_workspace.deinit();
 
-        const caches = try self.allocator.alloc(executor_mod.KvCache, block_count);
-        defer self.allocator.free(caches);
-        var initialized: usize = 0;
-        defer for (caches[0..initialized]) |*cache| cache.deinit();
-        for (caches) |*cache| {
-            cache.* = try executor_mod.KvCache.init(self.allocator, config.context_capacity, kv_width);
-            initialized += 1;
+        // Non-weight state budget policy: pre-validated above; the cache
+        // allocation path re-checks the policy before touching memory.
+        const caches = try executor_mod.initKvCachesBudgeted(
+            self.allocator,
+            block_count,
+            config.context_capacity,
+            kv_width,
+            state_budget,
+        );
+        defer {
+            for (caches) |*cache| cache.deinit();
+            self.allocator.free(caches);
         }
 
         const chunk_states = try self.allocator.alloc(f32, config.prefill_chunk * hidden);

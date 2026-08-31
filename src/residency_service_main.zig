@@ -1,5 +1,9 @@
 const std = @import("std");
 const service_mod = @import("residency_service.zig");
+const executor_mod = @import("residency_executor.zig");
+const llama = @import("llama_cpp.zig");
+
+fn silentLog(_: llama.c.ggml_log_level, _: [*c]const u8, _: ?*anyopaque) callconv(.c) void {}
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -8,9 +12,9 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    if (args.len < 3 or args.len > 5) {
+    if (args.len < 3 or args.len > 7) {
         std.debug.print(
-            "usage: residency_service <model.gguf> <prompt> [budget-mib] [max-tokens]\n",
+            "usage: residency_service <model.gguf> <prompt> [budget-mib] [max-tokens] [state-cache-mib] [state-workspace-mib]\n",
             .{},
         );
         return error.InvalidArguments;
@@ -26,9 +30,24 @@ pub fn main() !void {
     if (budget_mib == 0 or max_tokens == 0 or budget_mib > std.math.maxInt(usize) / (1024 * 1024)) {
         return error.InvalidArguments;
     }
+    var state_budget: ?executor_mod.StateBudget = null;
+    if (args.len >= 6) {
+        const cache_mib = try std.fmt.parseInt(usize, args[5], 10);
+        const workspace_mib = if (args.len >= 7)
+            try std.fmt.parseInt(usize, args[6], 10)
+        else
+            256;
+        state_budget = .{
+            .cache_bytes = cache_mib * 1024 * 1024,
+            .workspace_bytes = workspace_mib * 1024 * 1024,
+        };
+    }
 
     const path = args[1];
     const prompt = args[2];
+
+    // Silence llama.cpp logging so the smoke-run summary is readable.
+    llama.c.llama_log_set(silentLog, null);
 
     var service = try service_mod.ResidencyService.open(allocator, path, .{
         .budget_bytes = budget_mib * 1024 * 1024,
@@ -43,6 +62,7 @@ pub fn main() !void {
     }, .{
         .max_tokens = max_tokens,
         .prompt_tokens = tokenized.tokens,
+        .state_budget = state_budget,
     });
     defer allocator.free(result.text);
     defer allocator.free(result.tokens);

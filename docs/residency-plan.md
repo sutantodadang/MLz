@@ -564,6 +564,32 @@ Acceptance terbukti:
 Verifikasi: `zig build test -Dsimd-backend=false` PASS (66/66); validator
 Qwen dan Llama PASS.
 
+### Status Phase 10: StateBudget di serving path (item 2) — selesai
+
+`StateBudget` kini terintegrasi ke `ResidencyService.complete()`:
+
+- `CompletionOptions.state_budget: ?StateBudget` (null = legacy unlimited).
+- Policy divalidasi **sebelum** alokasi manager/workspace/cache apa pun
+  (transactional rejection): workspace gabungan (attention + prefill +
+  chunk states + state + logits) via `checkWorkspace`, dan total KV cache
+  semua layer via `checkCache`.
+- Estimator statis executor baru: `kvCacheBytes()`,
+  `attentionWorkspaceBytes()`, `prefillWorkspaceBytes()`, plus
+  `initKvCachesBudgeted()` yang mengalokasikan semua layer cache di bawah
+  policy dengan errdefer transaksional.
+- CLI `residency-serve` menerima argumen opsional
+  `[state-cache-mib] [state-workspace-mib]`.
+
+Bukti model nyata (Llama-3.2-1B, weight budget 4 MiB):
+
+- cache limit 2 MiB / 64 MiB → ditolak `StateBudgetExceeded` sebelum alokasi
+  (kebutuhan aktual ~65,5 MiB untuk 16 layer × 1024 token × kv_width 1024).
+- cache 128 MiB, workspace 8 MiB → completion koheren
+  (`Paris. The capital of Germany is Berlin. ...`), weight-map 4,00/4,00 MiB,
+  kv 4100 KiB ter-enforce, log llama.cpp di-silence untuk output yang bersih.
+
+Verifikasi: `zig build test -Dsimd-backend=false` PASS; smoke run budget
+positif dan negatif PASS; `zig fmt` bersih.
+
 Sisa Phase 10: batched/chunked Qwen prompt kernel, streaming/sampling pada
-service, SIMD/thread-pool DeltaNet/MoE orchestration, dan integrasi
-`StateBudget` ke `ResidencyService`/serving path.
+service, SIMD/thread-pool DeltaNet/MoE orchestration.

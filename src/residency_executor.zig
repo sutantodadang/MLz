@@ -11,6 +11,7 @@ pub const Error = compute.Error || error{
     InvalidPosition,
     InvalidToken,
     TooManyExperts,
+    StateBudgetExceeded,
     OutOfMemory,
 };
 
@@ -146,6 +147,84 @@ pub const PrefillWorkspace = struct {
         return (self.normalized.len + self.query.len + self.context.len + self.gate.len + self.up.len) * @sizeOf(f32);
     }
 };
+
+/// Static byte estimate for one KV cache instance. Must stay byte-identical
+/// to `KvCache.init` allocations: keys + values (capacity * kv_width f32
+/// each) plus score scratch (capacity f32).
+pub fn kvCacheBytes(capacity: usize, kv_width: usize) Error!usize {
+    const elements = std.math.mul(usize, capacity, kv_width) catch return Error.InvalidExecutionShape;
+    const kv = std.math.mul(usize, elements, 2 * @sizeOf(f32)) catch return Error.InvalidExecutionShape;
+    const scores = std.math.mul(usize, capacity, @sizeOf(f32)) catch return Error.InvalidExecutionShape;
+    return std.math.add(usize, kv, scores) catch return Error.InvalidExecutionShape;
+}
+
+/// Static byte estimate for one attention workspace (query + context
+/// buffers, each hidden f32).
+pub fn attentionWorkspaceBytes(hidden_size: usize) Error!usize {
+    if (hidden_size == 0) return Error.InvalidExecutionShape;
+    return std.math.mul(usize, hidden_size, 2 * @sizeOf(f32)) catch return Error.InvalidExecutionShape;
+}
+
+/// Static byte estimate for one prefill workspace (normalized, query,
+/// context: capacity*hidden; gate, up: capacity*intermediate).
+pub fn prefillWorkspaceBytes(capacity: usize, hidden: usize, intermediate: usize) Error!usize {
+    if (capacity == 0 or hidden == 0 or intermediate == 0) return Error.InvalidExecutionShape;
+    const hidden_bytes = std.math.mul(usize, std.math.mul(usize, capacity, hidden) catch return Error.InvalidExecutionShape, 3 * @sizeOf(f32)) catch return Error.InvalidExecutionShape;
+    const intermediate_bytes = std.math.mul(usize, std.math.mul(usize, capacity, intermediate) catch return Error.InvalidExecutionShape, 2 * @sizeOf(f32)) catch return Error.InvalidExecutionShape;
+    return std.math.add(usize, hidden_bytes, intermediate_bytes) catch return Error.InvalidExecutionShape;
+}
+
+/// Explicit policy for non-weight resident memory: all-layer KV caches and
+/// execution workspaces. `null` fields keep the legacy unlimited behavior.
+pub const StateBudget = struct {
+    /// Maximum combined bytes across ALL layer KV caches.
+    cache_bytes: ?usize = null,
+    /// Maximum combined bytes for execution workspaces (attention +
+    /// prefill workspaces and service-level activation buffers).
+    workspace_bytes: ?usize = null,
+
+    /// Reject `needed` cache bytes if the policy is set and exceeded.
+    pub fn checkCache(self: StateBudget, needed: usize) Error!void {
+        const limit = self.cache_bytes orelse return;
+        if (needed > limit) return Error.StateBudgetExceeded;
+    }
+
+    /// Reject `needed` workspace bytes if the policy is set and exceeded.
+    pub fn checkWorkspace(self: StateBudget, needed: usize) Error!void {
+        const limit = self.workspace_bytes orelse return;
+        if (needed > limit) return Error.StateBudgetExceeded;
+    }
+
+    /// Combined requirement for planning: cache + workspace bytes.
+    pub fn stateBytes(self: StateBudget, cache_needed: usize, workspace_needed: usize) usize {
+        const cache = self.cache_bytes orelse cache_needed;
+        const workspace = self.workspace_bytes orelse workspace_needed;
+        return cache + workspace;
+    }
+};
+
+/// Allocate `count` KV caches under an explicit state budget policy.
+/// The policy is validated BEFORE any allocation so rejection is
+/// transactional (no partial cache allocation leaks).
+pub fn initKvCachesBudgeted(
+    allocator: std.mem.Allocator,
+    count: usize,
+    capacity: usize,
+    kv_width: usize,
+    budget: StateBudget,
+) Error![]KvCache {
+    const per_cache = try kvCacheBytes(capacity, kv_width);
+    const total = std.math.mul(usize, per_cache, count) catch return Error.InvalidExecutionShape;
+    try budget.checkCache(total);
+    const caches = allocator.alloc(KvCache, count) catch return Error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer for (caches[0..initialized]) |*cache| cache.deinit();
+    for (caches) |*cache| {
+        cache.* = try KvCache.init(allocator, capacity, kv_width);
+        initialized += 1;
+    }
+    return caches;
+}
 
 pub const DecoderLayerWeights = struct {
     attention_norm: *const gguf.TensorDescriptor,
