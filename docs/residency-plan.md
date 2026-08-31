@@ -598,3 +598,17 @@ Sisa Phase 10 (selesai):
 4. Bit-exact parallel DeltaNet pool (opt-in, value-head partition, MLZ_QWEN_PARALLEL) — checksum identik scalar pada full 48-layer model nyata; tetap opt-in karena MoE dominan, bukan recurrence.
 
 Sisa kerja lanjutan (di luar Phase 10): streaming SSE/sampling non-greedy pada service, endpoint HTTP, SIMD per-op, dan integrasi backend GGML resmi.
+
+### Status lanjutan: HTTP endpoint untuk bounded-residency completion - selesai
+
+- `src/residency_endpoint.zig`: handler `POST /v1/residency/completions` (OpenAI-compatible subset).
+  - Service dibuka lazily pada request pertama; serialized via mutex (executor single-owner).
+  - Streaming `stream:true` -> OpenAI-style SSE + `data: [DONE]`; non-streaming -> satu JSON completion.
+  - Respons memuat blok `residency` (budget, peak mapped, faults, evictions, kv bytes) untuk observability.
+- Wire ke server: `--residency-budget-mib` (0 = endpoint disabled, 404), init/deinit lifecycle, route di `handleConnection`.
+- Perbaikan bug yang ditemukan smoke test: handler lupa men-tokenisasi prompt teks (`PromptEmpty`) — kini endpoint men-tokenisasi via vocab service sebelum `complete()`.
+- Smoke test end-to-end (Llama-3.2-1B, budget 8 MiB, Windows):
+  - non-streaming: `" Paris. The capital of Germany is Berlin. The capital of"`, prompt 5 tok + 12 gen, peak map 8.388.592/8.388.608 byte, faults 2864.
+  - streaming: 7 SSE chunks + `data: [DONE]` diterima.
+- Skrip smoke: `smoke_residency_endpoint.ps1` (lokal, tidak dibutuhkan CI).
+- Sisa (di luar scope ini): chat template/messages input, per-request budget override, multi-request concurrency >1, SIMD per-op pada orchestration, integrasi backend GGML resmi.

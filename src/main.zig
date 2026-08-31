@@ -90,7 +90,6 @@ pub fn main() !void {
                     \\
                     \\Server endpoints: /v1/chat/completions, /v1/completions, /v1/models, /health
                     \\
-
                 , .{args[0]});
                 return;
             },
@@ -131,6 +130,7 @@ pub fn main() !void {
             .host = cfg.server_host,
             .port = cfg.server_port,
             .api_key = cfg.server_api_key,
+            .residency_budget_mib = cfg.residency_budget_mib,
         }, .{
             .n_ctx = cfg.n_ctx,
             .n_gpu_layers = cfg.n_gpu_layers,

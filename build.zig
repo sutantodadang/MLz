@@ -1745,6 +1745,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addIncludePath(b.path("src"));
 
     // Link GGML
     exe.linkLibrary(ggml_lib);
