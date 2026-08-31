@@ -521,3 +521,49 @@ menjadi Phase 10: batched/chunked Qwen prompt kernel (saat ini token-by-token),
 server streaming/sampling integration untuk Qwen path, SIMD/thread-pool pada
 DeltaNet/MoE orchestration, dan budget policy gabungan weights + recurrent
 state + KV cache.
+
+## Phase 10 — Combined budget & execution hardening
+
+### Status Phase 10: combined non-weight state budget (item 1) — selesai
+
+Sebelum item ini, hanya mapped weights yang dibatasi budget. Recurrent
+DeltaNet state, full-attention KV cache, score scratch, dan execution
+workspace dialokasikan tanpa kebijakan eksplisit (75,42 MiB state pada Qwen
+48 layer dengan konteks 1 token).
+
+Implementasi:
+
+- `Config.deltaNetCacheBytes()`, `Config.fullAttentionCacheBytes(capacity)`,
+  dan `Config.workspaceBytes()` — estimator statis byte yang harus cocok
+  dengan alokasi aktual `DeltaNetCache.init`, `FullAttentionCache.init`, dan
+  `Workspace.init`.
+- `StateBudget` policy: `cache_bytes` (semua layer cache) dan
+  `workspace_bytes`, keduanya opsional; `null` berarti perilaku legacy tanpa
+  batas.
+- `initLayerCachesBudgeted()` memvalidasi policy **sebelum** alokasi pertama;
+  penolakan bersifat transactional sehingga tidak ada alokasi parsial yang
+  bocor. Error baru: `StateBudgetExceeded`.
+- `StateBudget.stateBytes()` menghitung kebutuhan gabungan cache + workspace.
+- Validator Qwen full-model kini mengalokasikan melalui jalur budgeted dengan
+  kebutuhan tepat, memverifikasi estimator cocok dengan byte aktual, dan
+  membuktikan policy satu byte lebih ketat ditolak sebelum alokasi
+  (`StateBudgetNotEnforced` tidak boleh terjadi pada jalur valid).
+
+Acceptance terbukti:
+
+- Unit test estimator: byte aktual cache/workspace == estimator statis untuk
+  recurrent, full-attention, dan workspace.
+- Unit test policy: kebutuhan tepat diterima; satu byte lebih ketat pada
+  cache atau workspace ditolak sebelum alokasi; legacy unlimited tetap jalan.
+- Qwen3-Next 27,2 GiB nyata, budget weights 4 MiB: full 48-layer logits
+  argmax=220, peak-map=4,00/4,00 MiB, all-layer-state=75,42 MiB (kini
+  ter-enforce, bukan sekadar dilaporkan), resident-vs-bounded max-error=0.
+- Llama 3.2 1B regression: seluruh gate exact tetap PASS, llama.cpp reference
+  `status=close`, top-1 sama.
+
+Verifikasi: `zig build test -Dsimd-backend=false` PASS (66/66); validator
+Qwen dan Llama PASS.
+
+Sisa Phase 10: batched/chunked Qwen prompt kernel, streaming/sampling pada
+service, SIMD/thread-pool DeltaNet/MoE orchestration, dan integrasi
+`StateBudget` ke `ResidencyService`/serving path.

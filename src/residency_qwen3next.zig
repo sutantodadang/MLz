@@ -5,6 +5,7 @@ const executor_mod = @import("residency_executor.zig");
 
 pub const Error = executor_mod.Error || error{
     InvalidQwenConfig,
+    StateBudgetExceeded,
 };
 
 pub const Config = struct {
@@ -71,6 +72,38 @@ pub const Config = struct {
 
     pub fn convHistory(self: Config) usize {
         return self.conv_kernel - 1;
+    }
+
+    /// Static byte estimate matching `DeltaNetCache.init` allocations.
+    pub fn deltaNetCacheBytes(self: Config) Error!usize {
+        const conv_elements = std.math.mul(usize, self.convHistory(), self.convChannels()) catch return Error.OutOfMemory;
+        const state_matrix = std.math.mul(usize, self.state_size, self.state_size) catch return Error.OutOfMemory;
+        const recurrent_elements = std.math.mul(usize, state_matrix, self.value_head_count) catch return Error.OutOfMemory;
+        const total_elements = std.math.add(usize, conv_elements, recurrent_elements) catch return Error.OutOfMemory;
+        return std.math.mul(usize, total_elements, @sizeOf(f32)) catch return Error.OutOfMemory;
+    }
+
+    /// Static byte estimate matching `FullAttentionCache.init` allocations.
+    pub fn fullAttentionCacheBytes(self: Config, capacity: usize) Error!usize {
+        const kv_width = std.math.mul(usize, self.attention_kv_head_count, self.attention_head_dim) catch return Error.OutOfMemory;
+        const kv_elements = std.math.mul(usize, capacity, kv_width) catch return Error.OutOfMemory;
+        // keys + values + attention score scratch.
+        const total_elements = std.math.add(usize, std.math.mul(usize, 2, kv_elements) catch return Error.OutOfMemory, capacity) catch return Error.OutOfMemory;
+        return std.math.mul(usize, total_elements, @sizeOf(f32)) catch return Error.OutOfMemory;
+    }
+
+    /// Static byte estimate matching `Workspace.init` allocations.
+    pub fn workspaceBytes(self: Config) Error!usize {
+        const query_gate_len = std.math.mul(usize, 2, std.math.mul(usize, self.attention_head_count, self.attention_head_dim) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        const elements = std.math.add(usize, query_gate_len, self.hidden_size) catch return Error.OutOfMemory;
+        const with_qkv = std.math.add(usize, elements, self.convChannels()) catch return Error.OutOfMemory;
+        const with_z = std.math.add(usize, with_qkv, self.inner_size) catch return Error.OutOfMemory;
+        const with_beta = std.math.add(usize, with_z, 2 * self.value_head_count) catch return Error.OutOfMemory;
+        const with_delta = std.math.add(usize, with_beta, self.inner_size) catch return Error.OutOfMemory;
+        // projected + routed + shared + attention_context.
+        const with_three_hidden = std.math.add(usize, with_delta, std.math.mul(usize, 3, self.hidden_size) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        const with_context = std.math.add(usize, with_three_hidden, std.math.mul(usize, self.attention_head_count, self.attention_head_dim) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        return std.math.mul(usize, with_context, @sizeOf(f32)) catch return Error.OutOfMemory;
     }
 };
 
@@ -566,7 +599,21 @@ pub fn initLayerCaches(
     full_attention_interval: usize,
     context_capacity: usize,
 ) Error![]LayerCache {
+    return initLayerCachesBudgeted(allocator, config, layer_count, full_attention_interval, context_capacity, .unlimited);
+}
+
+/// Same as `initLayerCaches`, but enforces a `StateBudget` policy before any
+/// allocation is performed. Allocation remains transactional on failure.
+pub fn initLayerCachesBudgeted(
+    allocator: std.mem.Allocator,
+    config: Config,
+    layer_count: usize,
+    full_attention_interval: usize,
+    context_capacity: usize,
+    budget: StateBudget,
+) Error![]LayerCache {
     if (layer_count == 0 or full_attention_interval == 0 or context_capacity == 0) return Error.InvalidQwenConfig;
+    try budget.validate(config, layer_count, full_attention_interval, context_capacity);
     const caches = allocator.alloc(LayerCache, layer_count) catch return Error.OutOfMemory;
     var initialized: usize = 0;
     errdefer {
@@ -588,6 +635,43 @@ pub fn deinitLayerCaches(allocator: std.mem.Allocator, caches: []LayerCache) voi
     for (caches) |*cache| cache.deinit();
     allocator.free(caches);
 }
+
+/// Combined non-weight memory budget policy. `weights` are bounded by the
+/// residency `Manager` budget; this policy bounds everything the execution
+/// path allocates on top of mapped weights.
+pub const StateBudget = struct {
+    /// Maximum bytes for all-layer recurrent/attention caches. `null` means
+    /// unbounded (legacy behavior).
+    cache_bytes: ?usize = null,
+    /// Maximum bytes for one execution workspace. `null` means unbounded.
+    workspace_bytes: ?usize = null,
+
+    pub const unlimited: StateBudget = .{};
+
+    pub fn validate(self: StateBudget, config: Config, layer_count: usize, full_attention_interval: usize, context_capacity: usize) Error!void {
+        if (self.cache_bytes) |limit| {
+            const per_recurrent = try config.deltaNetCacheBytes();
+            const per_full = try config.fullAttentionCacheBytes(context_capacity);
+            const full_layers = layer_count / full_attention_interval;
+            const recurrent_layers = layer_count - full_layers;
+            const total = std.math.add(usize, std.math.mul(usize, recurrent_layers, per_recurrent) catch return Error.OutOfMemory, std.math.mul(usize, full_layers, per_full) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+            if (total > limit) return Error.StateBudgetExceeded;
+        }
+        if (self.workspace_bytes) |limit| {
+            if (try config.workspaceBytes() > limit) return Error.StateBudgetExceeded;
+        }
+    }
+
+    /// Sum of per-layer cache bytes plus workspace bytes for accounting.
+    pub fn stateBytes(config: Config, layer_count: usize, full_attention_interval: usize, context_capacity: usize) Error!usize {
+        const per_recurrent = try config.deltaNetCacheBytes();
+        const per_full = try config.fullAttentionCacheBytes(context_capacity);
+        const full_layers = layer_count / full_attention_interval;
+        const recurrent_layers = layer_count - full_layers;
+        const caches = std.math.add(usize, std.math.mul(usize, recurrent_layers, per_recurrent) catch return Error.OutOfMemory, std.math.mul(usize, full_layers, per_full) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        return std.math.add(usize, caches, try config.workspaceBytes()) catch return Error.OutOfMemory;
+    }
+};
 
 pub fn modelSingleToken(
     executor: *executor_mod.CpuExecutor,
@@ -695,4 +779,79 @@ test "Qwen3-Next metadata config validates hybrid dimensions" {
     try std.testing.expectEqual(@as(usize, 8192), config.convChannels());
     try std.testing.expectEqual(@as(usize, 3), config.convHistory());
     try std.testing.expectEqual(@as(usize, 4096), config.attention_head_count * config.attention_head_dim);
+}
+
+test "state budget estimators match actual cache and workspace allocations" {
+    const allocator = std.testing.allocator;
+    const config = try Config.fromMetadata(.{
+        .architecture = .qwen3next,
+        .attention_head_count = 16,
+        .attention_kv_head_count = 2,
+        .attention_key_length = 256,
+        .attention_value_length = 256,
+        .embedding_length = 2048,
+        .rms_epsilon = 1e-6,
+        .rope_theta = 1_000_000,
+        .rope_dimension_count = 64,
+        .expert_count = 4,
+        .expert_used_count = 2,
+        .ssm_conv_kernel = 4,
+        .ssm_state_size = 128,
+        .ssm_group_count = 16,
+        .ssm_time_step_rank = 32,
+        .ssm_inner_size = 4096,
+    });
+    var cache = try DeltaNetCache.init(allocator, config);
+    defer cache.deinit();
+    try std.testing.expectEqual(cache.byteLen(), try config.deltaNetCacheBytes());
+
+    var workspace = try Workspace.init(allocator, config);
+    defer workspace.deinit();
+    try std.testing.expectEqual(workspace.byteLen(), try config.workspaceBytes());
+
+    const capacity: usize = 37;
+    var full = try FullAttentionCache.init(allocator, capacity, config);
+    defer full.deinit();
+    try std.testing.expectEqual(full.byteLen(), try config.fullAttentionCacheBytes(capacity));
+}
+
+test "initLayerCachesBudgeted enforces combined state budget before allocating" {
+    const allocator = std.testing.allocator;
+    const config = try Config.fromMetadata(.{
+        .architecture = .qwen3next,
+        .attention_head_count = 16,
+        .attention_kv_head_count = 2,
+        .attention_key_length = 256,
+        .attention_value_length = 256,
+        .embedding_length = 2048,
+        .rms_epsilon = 1e-6,
+        .rope_theta = 1_000_000,
+        .rope_dimension_count = 64,
+        .expert_count = 4,
+        .expert_used_count = 2,
+        .ssm_conv_kernel = 4,
+        .ssm_state_size = 128,
+        .ssm_group_count = 16,
+        .ssm_time_step_rank = 32,
+        .ssm_inner_size = 4096,
+    });
+    const layer_count: usize = 8;
+    const interval: usize = 4;
+    const capacity: usize = 16;
+
+    // Actual need: 6 recurrent caches + 2 full-attention caches + workspace.
+    const needed = try StateBudget.stateBytes(config, layer_count, interval, capacity);
+    const cache_only = 6 * try config.deltaNetCacheBytes() + 2 * try config.fullAttentionCacheBytes(capacity);
+
+    // Exactly enough must succeed.
+    const exact = try initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .cache_bytes = needed, .workspace_bytes = needed });
+    defer deinitLayerCaches(allocator, exact);
+
+    // One byte short must be rejected before any allocation.
+    try std.testing.expectError(Error.StateBudgetExceeded, initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .cache_bytes = cache_only - 1 }));
+    try std.testing.expectError(Error.StateBudgetExceeded, initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .workspace_bytes = try config.workspaceBytes() - 1 }));
+
+    // Unlimited legacy policy still works.
+    const legacy = try initLayerCaches(allocator, config, layer_count, interval, capacity);
+    defer deinitLayerCaches(allocator, legacy);
 }

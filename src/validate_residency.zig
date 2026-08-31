@@ -1027,8 +1027,24 @@ fn runQwenFullModel(
     var executor = try executor_mod.CpuExecutor.init(allocator, &manager, config.convChannels(), config.convChannels(), 64);
     defer executor.deinit();
     const context_capacity = @max(tokens.len, 1);
-    const caches = try qwen.initLayerCaches(allocator, config, layers.len, interval, context_capacity);
+    // Phase 10 combined non-weight budget: the run allocates through the
+    // budgeted path with the exact computed need, then verifies the estimator
+    // matched reality and that a tighter policy is rejected before allocation.
+    const cache_need = blk: {
+        const full_layers = layers.len / interval;
+        const recurrent_layers = layers.len - full_layers;
+        break :blk recurrent_layers * try config.deltaNetCacheBytes() + full_layers * try config.fullAttentionCacheBytes(context_capacity);
+    };
+    const workspace_need = try config.workspaceBytes();
+    const caches = try qwen.initLayerCachesBudgeted(allocator, config, layers.len, interval, context_capacity, .{
+        .cache_bytes = cache_need,
+        .workspace_bytes = workspace_need,
+    });
     defer qwen.deinitLayerCaches(allocator, caches);
+    // A policy one byte tighter must fail before any allocation happens.
+    if (qwen.initLayerCachesBudgeted(allocator, config, layers.len, interval, context_capacity, .{ .cache_bytes = cache_need - 1 })) |_| {
+        return error.StateBudgetNotEnforced;
+    } else |_| {}
     var workspace = try qwen.Workspace.init(allocator, config);
     defer workspace.deinit();
     const state = try allocator.alloc(f32, config.hidden_size);
