@@ -5,6 +5,7 @@ const compute = @import("residency_compute.zig");
 const executor_mod = @import("residency_executor.zig");
 const llama_reference = @import("residency_llama_reference.zig");
 const qwen = @import("residency_qwen3next.zig");
+const qwen_parallel = @import("residency_qwen3next_parallel.zig");
 
 const default_budget_mib: usize = 16;
 const default_max_tensors: usize = 4;
@@ -1009,6 +1010,7 @@ fn runQwenFullModel(
     index: *const gguf.TensorIndex,
     budget: usize,
     tokens: []const usize,
+    prefill_chunk: ?usize,
 ) !?QwenModelRun {
     const config = qwen.Config.fromMetadata(index.execution) catch return null;
     const interval: usize = index.execution.full_attention_interval orelse return null;
@@ -1026,6 +1028,16 @@ fn runQwenFullModel(
     _ = try index.registerAll(&manager);
     var executor = try executor_mod.CpuExecutor.init(allocator, &manager, config.convChannels(), config.convChannels(), 64);
     defer executor.deinit();
+
+    // Opt-in bit-exact parallel DeltaNet pool (env MLZ_QWEN_PARALLEL=<workers>).
+    var pool: ?*qwen_parallel.Pool = null;
+    defer if (pool) |value| value.deinit();
+    if (std.process.getEnvVarOwned(allocator, "MLZ_QWEN_PARALLEL")) |workers_text| {
+        defer allocator.free(workers_text);
+        const workers = std.fmt.parseInt(usize, workers_text, 10) catch 0;
+        if (workers > 0) pool = try qwen_parallel.Pool.init(allocator, workers);
+    } else |_| {}
+
     const context_capacity = @max(tokens.len, 1);
     // Phase 10 combined non-weight budget: the run allocates through the
     // budgeted path with the exact computed need, then verifies the estimator
@@ -1052,7 +1064,18 @@ fn runQwenFullModel(
     const logits = try allocator.alloc(f32, vocab);
     errdefer allocator.free(logits);
     var timer = try std.time.Timer.start();
-    for (tokens) |token| try qwen.modelSingleToken(&executor, config, embedding, layers, output_norm, output_weight, token, caches, &workspace, state, logits);
+    var reported_workspace_bytes = workspace.byteLen();
+    if (prefill_chunk) |chunk_size| {
+        var prefill_workspace = try qwen.PrefillWorkspace.initBudgeted(allocator, config, @min(chunk_size, tokens.len), .{
+            .cache_bytes = cache_need,
+            .workspace_bytes = try config.prefillWorkspaceBytes(@min(chunk_size, tokens.len)),
+        });
+        defer prefill_workspace.deinit();
+        try qwen.modelPrefillChunked(&executor, config, embedding, layers, output_norm, output_weight, tokens, caches, &prefill_workspace, logits);
+        reported_workspace_bytes = prefill_workspace.byteLen();
+    } else {
+        for (tokens) |token| try qwen.modelSingleToken(&executor, config, embedding, layers, output_norm, output_weight, token, caches, &workspace, state, logits);
+    }
     var checksum: f64 = 0;
     var argmax: usize = 0;
     for (logits, 0..) |value, i| {
@@ -1067,7 +1090,7 @@ fn runQwenFullModel(
         .argmax = argmax,
         .accounting = executor.accounting(),
         .cache_bytes = cache_bytes,
-        .workspace_bytes = workspace.byteLen(),
+        .workspace_bytes = reported_workspace_bytes,
         .logits = logits,
     };
 }
@@ -1254,7 +1277,7 @@ pub fn main() !void {
         );
         if (full_attention.accounting.peak_mapped_weight_bytes > budget) return error.BudgetInvariantViolated;
         const qwen_tokens = [_]usize{token};
-        const full_model = (try runQwenFullModel(allocator, &store, &index, budget, &qwen_tokens)) orelse return error.NoSupportedTensor;
+        const full_model = (try runQwenFullModel(allocator, &store, &index, budget, &qwen_tokens, null)) orelse return error.NoSupportedTensor;
         defer full_model.deinit(allocator);
         try out.print(
             "Qwen3-Next full single-token logits: layers={d}, vocab={d}, elapsed={d:.2} ms, checksum={d:.6}, argmax={d}, " ++
@@ -1275,7 +1298,7 @@ pub fn main() !void {
         );
         if (full_model.accounting.peak_mapped_weight_bytes > budget) return error.BudgetInvariantViolated;
         const resident_budget = @max(budget, @as(usize, 64 * 1024 * 1024));
-        const resident_model = (try runQwenFullModel(allocator, &store, &index, resident_budget, &qwen_tokens)) orelse return error.NoSupportedTensor;
+        const resident_model = (try runQwenFullModel(allocator, &store, &index, resident_budget, &qwen_tokens, null)) orelse return error.NoSupportedTensor;
         defer resident_model.deinit(allocator);
         var resident_max_error: f32 = 0;
         for (resident_model.logits, full_model.logits) |resident_value, bounded_value| resident_max_error = @max(resident_max_error, @abs(resident_value - bounded_value));
@@ -1284,6 +1307,38 @@ pub fn main() !void {
             .{ @as(f64, @floatFromInt(resident_budget)) / (1024.0 * 1024.0), resident_max_error, resident_model.argmax, full_model.argmax },
         );
         if (resident_max_error != 0 or resident_model.argmax != full_model.argmax) return error.ReferenceMismatch;
+
+        // Phase 10 Qwen chunked-prefill gate. Use a two-token prompt even when
+        // the optional llama.cpp reference is disabled so cache continuity and
+        // batched projection arithmetic remain continuously validated.
+        const chunk_sequence = [_]usize{ token, (token + 1) % @as(usize, @intCast(index.get("token_embd.weight").?.dimensions[1])) };
+        const incremental_chunk_reference = (try runQwenFullModel(allocator, &store, &index, budget, &chunk_sequence, null)) orelse return error.NoSupportedTensor;
+        defer incremental_chunk_reference.deinit(allocator);
+        const chunked_model = (try runQwenFullModel(allocator, &store, &index, budget, &chunk_sequence, 2)) orelse return error.NoSupportedTensor;
+        defer chunked_model.deinit(allocator);
+        var chunked_max_error: f32 = 0;
+        for (incremental_chunk_reference.logits, chunked_model.logits) |reference_value, chunked_value| {
+            chunked_max_error = @max(chunked_max_error, @abs(reference_value - chunked_value));
+        }
+        try out.print(
+            "Qwen3-Next chunked prefill: tokens=2, chunk=2, incremental={d:.2} ms, chunked={d:.2} ms, max-error={d}, " ++
+                "argmax={d}/{d}, faults={d}/{d}, workspace={d:.2} MiB\n",
+            .{
+                incremental_chunk_reference.elapsed_ms,
+                chunked_model.elapsed_ms,
+                chunked_max_error,
+                incremental_chunk_reference.argmax,
+                chunked_model.argmax,
+                incremental_chunk_reference.accounting.faults,
+                chunked_model.accounting.faults,
+                @as(f64, @floatFromInt(chunked_model.workspace_bytes)) / (1024.0 * 1024.0),
+            },
+        );
+        if (chunked_max_error != 0 or incremental_chunk_reference.argmax != chunked_model.argmax or
+            chunked_model.accounting.peak_mapped_weight_bytes > budget)
+        {
+            return error.ReferenceMismatch;
+        }
 
         if (qwen_reference) {
             const reference_logits = try allocator.alloc(f32, full_model.logits.len);
@@ -1309,7 +1364,7 @@ pub fn main() !void {
             if (!finite or reference_argmax != full_model.argmax or max_error > 1.0 or mean_error > 0.2) return error.ReferenceMismatch;
 
             const sequence = [_]usize{ token, (token + 1) % @as(usize, @intCast(index.get("token_embd.weight").?.dimensions[1])) };
-            const sequence_model = (try runQwenFullModel(allocator, &store, &index, budget, &sequence)) orelse return error.NoSupportedTensor;
+            const sequence_model = (try runQwenFullModel(allocator, &store, &index, budget, &sequence, null)) orelse return error.NoSupportedTensor;
             defer sequence_model.deinit(allocator);
             const sequence_reference = try llama_reference.sequenceLogitsMmap(path_z, &sequence, reference_logits, residency.currentRss);
             reference_argmax = 0;

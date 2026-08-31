@@ -8,6 +8,22 @@ pub const Error = executor_mod.Error || error{
     StateBudgetExceeded,
 };
 
+/// Optional opt-in hook for bit-exact parallel DeltaNet execution. When null,
+/// the scalar implementation runs (default). `qwen3next_parallel.Pool`
+/// installs itself here on init and restores null on deinit.
+pub var parallel_step_hook: ?*const fn (
+    config: Config,
+    cache: *DeltaNetCache,
+    qkv: []f32,
+    z: []const f32,
+    beta_alpha: []const f32,
+    conv_weights: []align(1) const f32,
+    dt_bias: []align(1) const f32,
+    decay: []align(1) const f32,
+    norm_weights: []align(1) const f32,
+    output: []f32,
+) Error!void = null;
+
 pub const Config = struct {
     hidden_size: usize,
     rms_epsilon: f32,
@@ -104,6 +120,22 @@ pub const Config = struct {
         const with_three_hidden = std.math.add(usize, with_delta, std.math.mul(usize, 3, self.hidden_size) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
         const with_context = std.math.add(usize, with_three_hidden, std.math.mul(usize, self.attention_head_count, self.attention_head_dim) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
         return std.math.mul(usize, with_context, @sizeOf(f32)) catch return Error.OutOfMemory;
+    }
+
+    /// Static byte estimate matching `PrefillWorkspace.init`. The allocation is
+    /// bounded by chunk capacity and does not grow with prompt/context length.
+    pub fn prefillWorkspaceBytes(self: Config, capacity: usize) Error!usize {
+        if (capacity == 0) return Error.InvalidQwenConfig;
+        const query_gate_len = std.math.mul(usize, 2, self.inner_size) catch return Error.OutOfMemory;
+        const projection_width = @max(self.convChannels(), query_gate_len);
+        var per_token = std.math.mul(usize, 3, self.hidden_size) catch return Error.OutOfMemory; // states, normalized, projected
+        per_token = std.math.add(usize, per_token, projection_width) catch return Error.OutOfMemory;
+        per_token = std.math.add(usize, per_token, std.math.mul(usize, 2, self.inner_size) catch return Error.OutOfMemory) catch return Error.OutOfMemory; // z + recurrence/context
+        const beta_width = std.math.mul(usize, 2, self.value_head_count) catch return Error.OutOfMemory;
+        per_token = std.math.add(usize, per_token, beta_width) catch return Error.OutOfMemory;
+        const chunk_elements = std.math.mul(usize, capacity, per_token) catch return Error.OutOfMemory;
+        const chunk_bytes = std.math.mul(usize, chunk_elements, @sizeOf(f32)) catch return Error.OutOfMemory;
+        return std.math.add(usize, chunk_bytes, try self.workspaceBytes()) catch return Error.OutOfMemory;
     }
 };
 
@@ -297,6 +329,95 @@ pub const Workspace = struct {
     }
 };
 
+/// Bounded scratch for layer-major Qwen prompt execution. Every slice is sized
+/// from `capacity`; prompt length only controls how often the workspace is
+/// reused. `token` is the existing single-token scratch used by sequential MoE
+/// and by the scalar recurrence/causal-attention portions of each layer.
+pub const PrefillWorkspace = struct {
+    allocator: std.mem.Allocator,
+    capacity: usize,
+    hidden: usize,
+    projection_width: usize,
+    inner: usize,
+    beta_width: usize,
+    states: []f32,
+    normalized: []f32,
+    qkv: []f32,
+    z: []f32,
+    beta_alpha: []f32,
+    recurrence: []f32,
+    projected: []f32,
+    token: Workspace,
+
+    pub fn init(allocator: std.mem.Allocator, config: Config, capacity: usize) Error!PrefillWorkspace {
+        return initBudgeted(allocator, config, capacity, .unlimited);
+    }
+
+    /// Enforce the workspace portion of `StateBudget` before allocating.
+    pub fn initBudgeted(allocator: std.mem.Allocator, config: Config, capacity: usize, budget: StateBudget) Error!PrefillWorkspace {
+        if (capacity == 0) return Error.InvalidQwenConfig;
+        if (budget.workspace_bytes) |limit| {
+            if (try config.prefillWorkspaceBytes(capacity) > limit) return Error.StateBudgetExceeded;
+        }
+        const hidden_elements = std.math.mul(usize, capacity, config.hidden_size) catch return Error.OutOfMemory;
+        const query_gate_len = std.math.mul(usize, 2, config.inner_size) catch return Error.OutOfMemory;
+        const beta_width = std.math.mul(usize, 2, config.value_head_count) catch return Error.OutOfMemory;
+        const projection_width = @max(config.convChannels(), query_gate_len);
+        const projection_elements = std.math.mul(usize, capacity, projection_width) catch return Error.OutOfMemory;
+        const inner_elements = std.math.mul(usize, capacity, config.inner_size) catch return Error.OutOfMemory;
+        const beta_elements = std.math.mul(usize, capacity, beta_width) catch return Error.OutOfMemory;
+
+        const states = allocator.alloc(f32, hidden_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(states);
+        const normalized = allocator.alloc(f32, hidden_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(normalized);
+        const qkv = allocator.alloc(f32, projection_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(qkv);
+        const z = allocator.alloc(f32, inner_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(z);
+        const beta_alpha = allocator.alloc(f32, beta_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(beta_alpha);
+        const recurrence = allocator.alloc(f32, inner_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(recurrence);
+        const projected = allocator.alloc(f32, hidden_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(projected);
+        const token = try Workspace.init(allocator, config);
+        return .{
+            .allocator = allocator,
+            .capacity = capacity,
+            .hidden = config.hidden_size,
+            .projection_width = projection_width,
+            .inner = config.inner_size,
+            .beta_width = beta_width,
+            .states = states,
+            .normalized = normalized,
+            .qkv = qkv,
+            .z = z,
+            .beta_alpha = beta_alpha,
+            .recurrence = recurrence,
+            .projected = projected,
+            .token = token,
+        };
+    }
+
+    pub fn deinit(self: *PrefillWorkspace) void {
+        self.token.deinit();
+        self.allocator.free(self.projected);
+        self.allocator.free(self.recurrence);
+        self.allocator.free(self.beta_alpha);
+        self.allocator.free(self.z);
+        self.allocator.free(self.qkv);
+        self.allocator.free(self.normalized);
+        self.allocator.free(self.states);
+        self.* = undefined;
+    }
+
+    pub fn byteLen(self: *const PrefillWorkspace) usize {
+        return (self.states.len + self.normalized.len + self.qkv.len + self.z.len +
+            self.beta_alpha.len + self.recurrence.len + self.projected.len) * @sizeOf(f32) + self.token.byteLen();
+    }
+};
+
 fn sigmoid(value: f32) f32 {
     return 1.0 / (1.0 + @exp(-value));
 }
@@ -335,7 +456,24 @@ fn dotF32Vector(manager: *residency.Manager, descriptor: *const gguf.TensorDescr
     return result;
 }
 
-pub fn deltaNetStep(
+pub const DeltaNetHeadContext = struct {
+    config: Config,
+    cache: *DeltaNetCache,
+    q_all: []f32,
+    k_all: []f32,
+    v_all: []f32,
+    z: []const f32,
+    beta_alpha: []const f32,
+    dt_bias: []align(1) const f32,
+    decay: []align(1) const f32,
+    norm_weights: []align(1) const f32,
+    output: []f32,
+};
+
+/// Validate a step and perform its convolution and Q/K normalization prefix.
+/// Exposed for the opt-in parallel driver; callers must subsequently process
+/// every value head exactly once and call `deltaNetFinish`.
+pub fn deltaNetPrepare(
     config: Config,
     cache: *DeltaNetCache,
     qkv: []f32,
@@ -346,10 +484,9 @@ pub fn deltaNetStep(
     decay: []align(1) const f32,
     norm_weights: []align(1) const f32,
     output: []f32,
-) Error!void {
+) Error!DeltaNetHeadContext {
     const channels = config.convChannels();
     const dim = config.state_size;
-    const ratio = config.value_head_count / config.key_head_count;
     if (qkv.len != channels or z.len != config.inner_size or beta_alpha.len != 2 * config.value_head_count or
         conv_weights.len != channels * config.conv_kernel or dt_bias.len != config.value_head_count or
         decay.len != config.value_head_count or norm_weights.len != dim or output.len != config.inner_size or
@@ -382,19 +519,41 @@ pub fn deltaNetStep(
         l2Normalize(k_all[head * dim ..][0..dim], config.rms_epsilon);
     }
 
+    return .{
+        .config = config,
+        .cache = cache,
+        .q_all = q_all,
+        .k_all = k_all,
+        .v_all = v_all,
+        .z = z,
+        .beta_alpha = beta_alpha,
+        .dt_bias = dt_bias,
+        .decay = decay,
+        .norm_weights = norm_weights,
+        .output = output,
+    };
+}
+
+/// Process a disjoint contiguous range of value heads. Arithmetic and loop
+/// order within each head intentionally match the original scalar recurrence.
+pub fn deltaNetHeadRange(context: DeltaNetHeadContext, start: usize, end: usize) void {
+    std.debug.assert(start <= end and end <= context.config.value_head_count);
+    const config = context.config;
+    const dim = config.state_size;
+    const ratio = config.value_head_count / config.key_head_count;
     const query_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
-    for (0..config.value_head_count) |value_head| {
+    for (start..end) |value_head| {
         const key_head = value_head / ratio;
-        const q = q_all[key_head * dim ..][0..dim];
-        const k = k_all[key_head * dim ..][0..dim];
-        const v = v_all[value_head * dim ..][0..dim];
+        const q = context.q_all[key_head * dim ..][0..dim];
+        const k = context.k_all[key_head * dim ..][0..dim];
+        const v = context.v_all[value_head * dim ..][0..dim];
         const group = key_head * ratio;
         const within_group = value_head - group;
         const ba_base = key_head * 2 * ratio;
-        const beta = sigmoid(beta_alpha[ba_base + within_group]);
-        const gate = decay[value_head] * softplus(beta_alpha[ba_base + ratio + within_group] + dt_bias[value_head]);
+        const beta = sigmoid(context.beta_alpha[ba_base + within_group]);
+        const gate = context.decay[value_head] * softplus(context.beta_alpha[ba_base + ratio + within_group] + context.dt_bias[value_head]);
         const gate_exp = @exp(gate);
-        const state = cache.recurrent[value_head * dim * dim ..][0 .. dim * dim];
+        const state = context.cache.recurrent[value_head * dim * dim ..][0 .. dim * dim];
 
         // S is laid out [value, key] with key contiguous, matching GGML's
         // physical [D_key, D_value, H_value] state tensor.
@@ -406,7 +565,7 @@ pub fn deltaNetStep(
             for (row, k) |*state_value, key_value| state_value.* = state_value.* * gate_exp + delta * key_value;
         }
 
-        const head_output = output[value_head * dim ..][0..dim];
+        const head_output = context.output[value_head * dim ..][0..dim];
         for (head_output, 0..) |*result, value_index| {
             const row = state[value_index * dim ..][0..dim];
             var sum: f32 = 0;
@@ -418,10 +577,30 @@ pub fn deltaNetStep(
         for (head_output) |value| sum_squares += @as(f64, value * value);
         const mean: f32 = @floatCast(sum_squares / @as(f64, @floatFromInt(dim)));
         const norm_scale = 1.0 / @sqrt(mean + config.rms_epsilon);
-        const z_head = z[value_head * dim ..][0..dim];
-        for (head_output, norm_weights, z_head) |*value, norm_weight, gate_value| value.* = value.* * norm_scale * norm_weight * silu(gate_value);
+        const z_head = context.z[value_head * dim ..][0..dim];
+        for (head_output, context.norm_weights, z_head) |*value, norm_weight, gate_value| value.* = value.* * norm_scale * norm_weight * silu(gate_value);
     }
+}
+
+pub fn deltaNetFinish(cache: *DeltaNetCache) void {
     cache.position += 1;
+}
+
+pub fn deltaNetStep(
+    config: Config,
+    cache: *DeltaNetCache,
+    qkv: []f32,
+    z: []const f32,
+    beta_alpha: []const f32,
+    conv_weights: []align(1) const f32,
+    dt_bias: []align(1) const f32,
+    decay: []align(1) const f32,
+    norm_weights: []align(1) const f32,
+    output: []f32,
+) Error!void {
+    const context = try deltaNetPrepare(config, cache, qkv, z, beta_alpha, conv_weights, dt_bias, decay, norm_weights, output);
+    deltaNetHeadRange(context, 0, config.value_head_count);
+    deltaNetFinish(cache);
 }
 
 pub fn linearAttentionSingleToken(
@@ -462,7 +641,11 @@ pub fn linearAttentionSingleToken(
     const decay: []align(1) const f32 = std.mem.bytesAsSlice(f32, decay_view.bytes());
     const norm_weights: []align(1) const f32 = std.mem.bytesAsSlice(f32, norm_view.bytes());
 
-    try deltaNetStep(config, cache, workspace.qkv, workspace.z, workspace.beta_alpha, conv_weights, dt_bias, decay, norm_weights, workspace.delta_output);
+    if (parallel_step_hook) |hook| {
+        try hook(config, cache, workspace.qkv, workspace.z, workspace.beta_alpha, conv_weights, dt_bias, decay, norm_weights, workspace.delta_output);
+    } else {
+        try deltaNetStep(config, cache, workspace.qkv, workspace.z, workspace.beta_alpha, conv_weights, dt_bias, decay, norm_weights, workspace.delta_output);
+    }
     try executor.matVec(weights.output, workspace.delta_output, workspace.projected);
     for (state, workspace.projected) |*value, projected| value.* += projected;
 }
@@ -592,6 +775,179 @@ pub fn moeSingleToken(
     for (state, workspace.routed, workspace.shared) |*value, routed, shared| value.* += routed + shared_scale * shared;
 }
 
+fn linearAttentionPrefillLayer(
+    executor: *executor_mod.CpuExecutor,
+    config: Config,
+    weights: LinearWeights,
+    cache: *DeltaNetCache,
+    workspace: *PrefillWorkspace,
+    token_count: usize,
+) Error!void {
+    const hidden = config.hidden_size;
+    const channels = config.convChannels();
+    const states = workspace.states[0 .. token_count * hidden];
+    const normalized = workspace.normalized[0 .. token_count * hidden];
+    const qkv = workspace.qkv[0 .. token_count * channels];
+    const z = workspace.z[0 .. token_count * config.inner_size];
+    const beta_width = std.math.mul(usize, 2, config.value_head_count) catch return Error.OutOfMemory;
+    const beta_alpha = workspace.beta_alpha[0 .. token_count * beta_width];
+    const recurrence = workspace.recurrence[0 .. token_count * config.inner_size];
+    const projected = workspace.projected[0 .. token_count * hidden];
+
+    try executor.rmsNormBatch(weights.attention_norm, states, normalized, token_count, config.rms_epsilon);
+    try executor.matMul(weights.qkv, normalized, qkv, token_count);
+    try executor.matMul(weights.z_gate, normalized, z, token_count);
+    try executor.matMul(weights.beta_alpha, normalized, beta_alpha, token_count);
+
+    const conv_elements = channels * config.conv_kernel;
+    if (weights.conv1d.ggml_type != gguf.type_f32 or weights.conv1d.n_dimensions != 2 or
+        weights.conv1d.dimensions[0] != config.conv_kernel or weights.conv1d.dimensions[1] != channels or
+        weights.conv1d.byte_len != conv_elements * @sizeOf(f32) or
+        weights.dt_bias.ggml_type != gguf.type_f32 or weights.dt_bias.n_dimensions != 1 or weights.dt_bias.dimensions[0] != config.value_head_count or
+        weights.decay.ggml_type != gguf.type_f32 or weights.decay.n_dimensions != 1 or weights.decay.dimensions[0] != config.value_head_count or
+        weights.state_norm.ggml_type != gguf.type_f32 or weights.state_norm.n_dimensions != 1 or weights.state_norm.dimensions[0] != config.state_size)
+    {
+        return Error.InvalidExecutionShape;
+    }
+    // Keep these small F32 vectors pinned across the sequential recurrence;
+    // large projections above are still released between bounded matMul calls.
+    var conv_view = try executor.manager.acquire(weights.conv1d.handle);
+    defer conv_view.release();
+    var dt_view = try executor.manager.acquire(weights.dt_bias.handle);
+    defer dt_view.release();
+    var decay_view = try executor.manager.acquire(weights.decay.handle);
+    defer decay_view.release();
+    var norm_view = try executor.manager.acquire(weights.state_norm.handle);
+    defer norm_view.release();
+    const conv_weights: []align(1) const f32 = std.mem.bytesAsSlice(f32, conv_view.bytes());
+    const dt_bias: []align(1) const f32 = std.mem.bytesAsSlice(f32, dt_view.bytes());
+    const decay: []align(1) const f32 = std.mem.bytesAsSlice(f32, decay_view.bytes());
+    const norm_weights: []align(1) const f32 = std.mem.bytesAsSlice(f32, norm_view.bytes());
+    for (0..token_count) |token| {
+        const step_hook = parallel_step_hook;
+        if (step_hook) |hook| {
+            try hook(
+                config,
+                cache,
+                qkv[token * channels ..][0..channels],
+                z[token * config.inner_size ..][0..config.inner_size],
+                beta_alpha[token * beta_width ..][0..beta_width],
+                conv_weights,
+                dt_bias,
+                decay,
+                norm_weights,
+                recurrence[token * config.inner_size ..][0..config.inner_size],
+            );
+        } else try deltaNetStep(
+            config,
+            cache,
+            qkv[token * channels ..][0..channels],
+            z[token * config.inner_size ..][0..config.inner_size],
+            beta_alpha[token * beta_width ..][0..beta_width],
+            conv_weights,
+            dt_bias,
+            decay,
+            norm_weights,
+            recurrence[token * config.inner_size ..][0..config.inner_size],
+        );
+    }
+    try executor.matMul(weights.output, recurrence, projected, token_count);
+    for (states, projected) |*value, result| value.* += result;
+}
+
+fn fullAttentionPrefillLayer(
+    executor: *executor_mod.CpuExecutor,
+    config: Config,
+    weights: FullAttentionWeights,
+    cache: *FullAttentionCache,
+    workspace: *PrefillWorkspace,
+    token_count: usize,
+) Error!void {
+    const hidden = config.hidden_size;
+    const query_width = config.attention_head_count * config.attention_head_dim;
+    const raw_width = std.math.mul(usize, 2, query_width) catch return Error.OutOfMemory;
+    const kv_width = config.attention_kv_head_count * config.attention_head_dim;
+    if (query_width != config.inner_size or cache.kv_width != kv_width) return Error.InvalidExecutionShape;
+    if (token_count > cache.capacity -| cache.len) return Error.KvCacheFull;
+
+    const states = workspace.states[0 .. token_count * hidden];
+    const normalized = workspace.normalized[0 .. token_count * hidden];
+    const raw = workspace.qkv[0 .. token_count * raw_width];
+    const contexts = workspace.recurrence[0 .. token_count * query_width];
+    const projected = workspace.projected[0 .. token_count * hidden];
+    const first_position = cache.len;
+    const keys = cache.keys[first_position * kv_width ..][0 .. token_count * kv_width];
+    const values = cache.values[first_position * kv_width ..][0 .. token_count * kv_width];
+
+    try executor.rmsNormBatch(weights.attention_norm, states, normalized, token_count, config.rms_epsilon);
+    try executor.matMul(weights.query_gate, normalized, raw, token_count);
+    try executor.matMul(weights.key, normalized, keys, token_count);
+    try executor.matMul(weights.value, normalized, values, token_count);
+
+    if (weights.query_norm.ggml_type != gguf.type_f32 or weights.query_norm.n_dimensions != 1 or weights.query_norm.dimensions[0] != config.attention_head_dim or
+        weights.key_norm.ggml_type != gguf.type_f32 or weights.key_norm.n_dimensions != 1 or weights.key_norm.dimensions[0] != config.attention_head_dim)
+    {
+        return Error.InvalidExecutionShape;
+    }
+    var qnorm_view = try executor.manager.acquire(weights.query_norm.handle);
+    defer qnorm_view.release();
+    var knorm_view = try executor.manager.acquire(weights.key_norm.handle);
+    defer knorm_view.release();
+    const qnorm: []align(1) const f32 = std.mem.bytesAsSlice(f32, qnorm_view.bytes());
+    const knorm: []align(1) const f32 = std.mem.bytesAsSlice(f32, knorm_view.bytes());
+    const group_size = config.attention_head_count / config.attention_kv_head_count;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(config.attention_head_dim)));
+
+    for (0..token_count) |chunk_token| {
+        const position = first_position + chunk_token;
+        const raw_token = raw[chunk_token * raw_width ..][0..raw_width];
+        const query = workspace.token.attention_query_gate[0..query_width];
+        const gate = workspace.token.attention_query_gate[query_width .. 2 * query_width];
+        for (0..config.attention_head_count) |head| {
+            const raw_head = raw_token[head * 2 * config.attention_head_dim ..][0 .. 2 * config.attention_head_dim];
+            @memcpy(query[head * config.attention_head_dim ..][0..config.attention_head_dim], raw_head[0..config.attention_head_dim]);
+            @memcpy(gate[head * config.attention_head_dim ..][0..config.attention_head_dim], raw_head[config.attention_head_dim .. 2 * config.attention_head_dim]);
+        }
+        const key = cache.keys[position * kv_width ..][0..kv_width];
+        rmsNormHeads(query, qnorm, config.attention_head_count, config.attention_head_dim, config.rms_epsilon);
+        rmsNormHeads(key, knorm, config.attention_kv_head_count, config.attention_head_dim, config.rms_epsilon);
+        applyPartialRope(query, config.attention_head_count, config.attention_head_dim, config.rope_dimension_count, position, config.rope_theta);
+        applyPartialRope(key, config.attention_kv_head_count, config.attention_head_dim, config.rope_dimension_count, position, config.rope_theta);
+
+        const context = contexts[chunk_token * query_width ..][0..query_width];
+        for (0..config.attention_head_count) |head| {
+            const query_head = query[head * config.attention_head_dim ..][0..config.attention_head_dim];
+            const kv_head = head / group_size;
+            const scores = cache.scores[0 .. position + 1];
+            var maximum: f32 = -std.math.inf(f32);
+            for (scores, 0..) |*score, token| {
+                const cached_key = cache.keys[token * kv_width + kv_head * config.attention_head_dim ..][0..config.attention_head_dim];
+                var dot: f32 = 0;
+                for (query_head, cached_key) |q, k| dot += q * k;
+                score.* = dot * scale;
+                maximum = @max(maximum, score.*);
+            }
+            var denominator: f32 = 0;
+            for (scores) |*score| {
+                score.* = @exp(score.* - maximum);
+                denominator += score.*;
+            }
+            const context_head = context[head * config.attention_head_dim ..][0..config.attention_head_dim];
+            @memset(context_head, 0);
+            for (scores, 0..) |score, token| {
+                const cached_value = cache.values[token * kv_width + kv_head * config.attention_head_dim ..][0..config.attention_head_dim];
+                const probability = score / denominator;
+                for (context_head, cached_value) |*result, cached| result.* += probability * cached;
+            }
+            const gate_head = gate[head * config.attention_head_dim ..][0..config.attention_head_dim];
+            for (context_head, gate_head) |*result, gate_value| result.* *= sigmoid(gate_value);
+        }
+    }
+    cache.len += token_count;
+    try executor.matMul(weights.output, contexts, projected, token_count);
+    for (states, projected) |*value, result| value.* += result;
+}
+
 pub fn initLayerCaches(
     allocator: std.mem.Allocator,
     config: Config,
@@ -662,6 +1018,33 @@ pub const StateBudget = struct {
         }
     }
 
+    /// Validate the layer caches plus a chunk-capacity-sized prefill workspace.
+    pub fn validatePrefill(self: StateBudget, config: Config, layer_count: usize, full_attention_interval: usize, context_capacity: usize, chunk_capacity: usize) Error!void {
+        if (chunk_capacity == 0) return Error.InvalidQwenConfig;
+        if (self.cache_bytes) |limit| {
+            const per_recurrent = try config.deltaNetCacheBytes();
+            const per_full = try config.fullAttentionCacheBytes(context_capacity);
+            const full_layers = layer_count / full_attention_interval;
+            const recurrent_layers = layer_count - full_layers;
+            const total = std.math.add(usize, std.math.mul(usize, recurrent_layers, per_recurrent) catch return Error.OutOfMemory, std.math.mul(usize, full_layers, per_full) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+            if (total > limit) return Error.StateBudgetExceeded;
+        }
+        if (self.workspace_bytes) |limit| {
+            if (try config.prefillWorkspaceBytes(chunk_capacity) > limit) return Error.StateBudgetExceeded;
+        }
+    }
+
+    /// Sum of per-layer cache bytes plus a chunked-prefill workspace.
+    pub fn prefillStateBytes(config: Config, layer_count: usize, full_attention_interval: usize, context_capacity: usize, chunk_capacity: usize) Error!usize {
+        if (layer_count == 0 or full_attention_interval == 0 or context_capacity == 0 or chunk_capacity == 0) return Error.InvalidQwenConfig;
+        const per_recurrent = try config.deltaNetCacheBytes();
+        const per_full = try config.fullAttentionCacheBytes(context_capacity);
+        const full_layers = layer_count / full_attention_interval;
+        const recurrent_layers = layer_count - full_layers;
+        const caches = std.math.add(usize, std.math.mul(usize, recurrent_layers, per_recurrent) catch return Error.OutOfMemory, std.math.mul(usize, full_layers, per_full) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        return std.math.add(usize, caches, try config.prefillWorkspaceBytes(chunk_capacity)) catch return Error.OutOfMemory;
+    }
+
     /// Sum of per-layer cache bytes plus workspace bytes for accounting.
     pub fn stateBytes(config: Config, layer_count: usize, full_attention_interval: usize, context_capacity: usize) Error!usize {
         const per_recurrent = try config.deltaNetCacheBytes();
@@ -706,6 +1089,67 @@ pub fn modelSingleToken(
     };
     try executor.rmsNorm(output_norm, state, workspace.normalized, config.rms_epsilon);
     try executor.matVec(output_weight, workspace.normalized, logits);
+}
+
+/// Process an arbitrarily long prompt in bounded chunks. Each chunk advances
+/// every layer for all of its tokens before the next layer is entered, so each
+/// large projection is acquired once by `matMul`. Recurrence, causal attention,
+/// and token-routed MoE deliberately retain token order. Only the final prompt
+/// token is normalized/projected to `logits`.
+pub fn modelPrefillChunked(
+    executor: *executor_mod.CpuExecutor,
+    config: Config,
+    embedding: *const gguf.TensorDescriptor,
+    layers: []const LayerWeights,
+    output_norm: *const gguf.TensorDescriptor,
+    output_weight: *const gguf.TensorDescriptor,
+    tokens: []const usize,
+    caches: []LayerCache,
+    workspace: *PrefillWorkspace,
+    logits: []f32,
+) Error!void {
+    const required_beta_width = std.math.mul(usize, 2, config.value_head_count) catch return Error.OutOfMemory;
+    if (tokens.len == 0 or layers.len == 0 or layers.len != caches.len or workspace.capacity == 0 or
+        workspace.hidden != config.hidden_size or workspace.inner != config.inner_size or
+        workspace.beta_width != required_beta_width)
+    {
+        return Error.InvalidExecutionShape;
+    }
+    const required_projection_width = std.math.mul(usize, 2, config.inner_size) catch return Error.OutOfMemory;
+    if (workspace.projection_width < @max(config.convChannels(), required_projection_width)) return Error.InvalidExecutionShape;
+    const hidden = config.hidden_size;
+    var chunk_start: usize = 0;
+    while (chunk_start < tokens.len) {
+        const token_count = @min(workspace.capacity, tokens.len - chunk_start);
+        const states = workspace.states[0 .. token_count * hidden];
+        for (tokens[chunk_start..][0..token_count], 0..) |token, index| {
+            try executor.tokenEmbedding(embedding, token, states[index * hidden ..][0..hidden]);
+        }
+
+        for (layers, caches) |layer, *cache| switch (layer) {
+            .recurrent => |weights| switch (cache.*) {
+                .recurrent => |*delta_cache| {
+                    try linearAttentionPrefillLayer(executor, config, weights.attention, delta_cache, workspace, token_count);
+                    for (0..token_count) |token| try moeSingleToken(executor, config, weights.moe, &workspace.token, states[token * hidden ..][0..hidden]);
+                },
+                else => return Error.InvalidExecutionShape,
+            },
+            .full_attention => |weights| switch (cache.*) {
+                .full_attention => |*attention_cache| {
+                    try fullAttentionPrefillLayer(executor, config, weights.attention, attention_cache, workspace, token_count);
+                    for (0..token_count) |token| try moeSingleToken(executor, config, weights.moe, &workspace.token, states[token * hidden ..][0..hidden]);
+                },
+                else => return Error.InvalidExecutionShape,
+            },
+        };
+
+        if (chunk_start + token_count == tokens.len) {
+            const final_state = states[(token_count - 1) * hidden ..][0..hidden];
+            try executor.rmsNorm(output_norm, final_state, workspace.token.normalized, config.rms_epsilon);
+            try executor.matVec(output_weight, workspace.token.normalized, logits);
+        }
+        chunk_start += token_count;
+    }
 }
 
 test "DeltaNet recurrence preserves convolution history and matches scalar reference" {
@@ -809,6 +1253,12 @@ test "state budget estimators match actual cache and workspace allocations" {
     defer workspace.deinit();
     try std.testing.expectEqual(workspace.byteLen(), try config.workspaceBytes());
 
+    var prefill = try PrefillWorkspace.init(allocator, config, 3);
+    defer prefill.deinit();
+    try std.testing.expectEqual(prefill.byteLen(), try config.prefillWorkspaceBytes(3));
+    try std.testing.expect(prefill.byteLen() > workspace.byteLen());
+    try std.testing.expectError(Error.StateBudgetExceeded, PrefillWorkspace.initBudgeted(allocator, config, 3, .{ .workspace_bytes = try config.prefillWorkspaceBytes(3) - 1 }));
+
     const capacity: usize = 37;
     var full = try FullAttentionCache.init(allocator, capacity, config);
     defer full.deinit();
@@ -842,6 +1292,8 @@ test "initLayerCachesBudgeted enforces combined state budget before allocating" 
     // Actual need: 6 recurrent caches + 2 full-attention caches + workspace.
     const needed = try StateBudget.stateBytes(config, layer_count, interval, capacity);
     const cache_only = 6 * try config.deltaNetCacheBytes() + 2 * try config.fullAttentionCacheBytes(capacity);
+    const prefill_needed = try StateBudget.prefillStateBytes(config, layer_count, interval, capacity, 4);
+    try std.testing.expectEqual(cache_only + try config.prefillWorkspaceBytes(4), prefill_needed);
 
     // Exactly enough must succeed.
     const exact = try initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .cache_bytes = needed, .workspace_bytes = needed });
@@ -850,6 +1302,8 @@ test "initLayerCachesBudgeted enforces combined state budget before allocating" 
     // One byte short must be rejected before any allocation.
     try std.testing.expectError(Error.StateBudgetExceeded, initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .cache_bytes = cache_only - 1 }));
     try std.testing.expectError(Error.StateBudgetExceeded, initLayerCachesBudgeted(allocator, config, layer_count, interval, capacity, .{ .workspace_bytes = try config.workspaceBytes() - 1 }));
+    try std.testing.expectError(Error.StateBudgetExceeded, (StateBudget{ .workspace_bytes = try config.prefillWorkspaceBytes(4) - 1 }).validatePrefill(config, layer_count, interval, capacity, 4));
+    try (StateBudget{ .workspace_bytes = try config.prefillWorkspaceBytes(4) }).validatePrefill(config, layer_count, interval, capacity, 4);
 
     // Unlimited legacy policy still works.
     const legacy = try initLayerCaches(allocator, config, layer_count, interval, capacity);

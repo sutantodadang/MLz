@@ -591,5 +591,10 @@ Bukti model nyata (Llama-3.2-1B, weight budget 4 MiB):
 Verifikasi: `zig build test -Dsimd-backend=false` PASS; smoke run budget
 positif dan negatif PASS; `zig fmt` bersih.
 
-Sisa Phase 10: batched/chunked Qwen prompt kernel, streaming/sampling pada
-service, SIMD/thread-pool DeltaNet/MoE orchestration.
+Sisa Phase 10 (selesai):
+1. Combined non-weight state budget (DeltaNet recurrent + KV + workspace) — estimator byte-exact, penolakan transaksional, ter-wire ke Qwen path dan serving path.
+2. StateBudget di serving path (ResidencyService) — policy cache/workspace via CLI, smoke test positif & negatif pada model nyata.
+3. Qwen chunked prompt kernel — modelPrefillChunked bit-identik dengan incremental (max-error=0, faults 77.256 → 64.453 pada 2 token, 27 GiB nyata).
+4. Bit-exact parallel DeltaNet pool (opt-in, value-head partition, MLZ_QWEN_PARALLEL) — checksum identik scalar pada full 48-layer model nyata; tetap opt-in karena MoE dominan, bukan recurrence.
+
+Sisa kerja lanjutan (di luar Phase 10): streaming SSE/sampling non-greedy pada service, endpoint HTTP, SIMD per-op, dan integrasi backend GGML resmi.

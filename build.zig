@@ -2038,6 +2038,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod_test_module.addIncludePath(b.path("src"));
+    mod_test_module.addIncludePath(llama_cpp_dep.path("include"));
     mod_test_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
     mod_test_module.addCSourceFile(.{
         .file = b.path("src/residency_mmap.c"),
