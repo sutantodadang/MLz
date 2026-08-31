@@ -467,3 +467,57 @@ Phase 9 berfokus pada serving-grade execution dan architecture coverage:
   chat template, atau batching server-level.
 - Verifikasi: `zig build test -Dsimd-backend=false` PASS (62/62), smoke run
   budget 16 MiB dan 4 MiB PASS, `zig fmt` + `git diff --check` bersih.
+
+### Status Phase 9: Qwen3-Next hybrid graph (item 5) - selesai
+
+- Modul `src/residency_qwen3next.zig` mengimplementasikan schedule hybrid nyata
+  dari GGUF `qwen3next`: tiga recurrent gated-DeltaNet layer lalu satu
+  full-attention layer, berulang sesuai `full_attention_interval`, untuk 48
+  block model Qwen3-Coder-Next.
+- Recurrent block lengkap: RMSNorm, bounded QKV/Z/beta-alpha projections,
+  depthwise causal convolution dengan raw-history persisten, GGML-compatible L2
+  Q/K norm, grouped gated-DeltaNet recurrence, per-head gated RMSNorm, output
+  projection, dan residual. `DeltaNetCache` memisahkan conv history dan matriks
+  recurrent writable dari budget immutable weights.
+- Full-attention block lengkap: interleaved per-head Q+gate projection, per-head
+  Q/K RMSNorm, partial RoPE (`rope.dimension_count`), GQA causal attention,
+  sigmoid output gating, output projection, KV cache, dan residual.
+- MoE lengkap di kedua jenis block: softmax top-10 dari 512 routed experts,
+  hanya selected expert slices yang di-fault, canonical GGML vec-dot arithmetic,
+  shared SwiGLU expert, learned sigmoid shared gate, dan residual.
+- `modelSingleToken()` menjalankan token embedding, seluruh hybrid layers,
+  output norm, dan 151,936 vocabulary logits. `initLayerCaches()` membentuk
+  cache recurrent/full-attention per layer sesuai schedule metadata.
+- Bug correctness yang ditemukan oleh reference gate:
+  1. `attn_q.weight` adalah interleaved `[Q_head, gate_head]`, bukan
+     `[all-Q, all-gate]`;
+  2. selected-expert path lama mendequantisasi weight lalu scalar-dot, bukan
+     canonical GGML activation quantization + `vec_dot`; setelah diperbaiki,
+     full-model top-1 berubah dari salah (`3830`) menjadi reference (`220`).
+  3. Q/K L2 norm mengikuti GGML `1 / max(sqrt(sum(x*x)), epsilon)`, bukan
+     `1 / sqrt(sum + epsilon)`.
+- Validator Qwen besar sekarang menjalankan projection probe, layer-0
+  DeltaNet+MoE, layer-3 full-attention+MoE, full 48-layer logits, resident-ish
+  64 MiB vs bounded 4 MiB exact gate, dan optional llama.cpp mmap reference
+  (`qwen-reference=true`) agar default validation tidak memetakan 27 GiB dua
+  kali.
+- Hasil `Qwen3-Coder-Next-Q2_K.gguf` (27.21 GiB), token 1, budget 4 MiB:
+  - full 48-layer elapsed 2.33 s snapshot, peak active mapping 4.00/4.00 MiB,
+    all-layer recurrent+KV state 75.42 MiB, workspace 0.14 MiB;
+  - resident-ish 64 MiB vs bounded 4 MiB: logits `max-error=0`, argmax 220/220;
+  - llama.cpp mmap reference: `max-error=0.843506`, mean `0.125230`, top-1
+    220/220, seluruh logits finite; reference RSS ~19.4 GiB (di luar manager);
+  - two-token recurrent-state/KV reuse: `max-error=1.247838`, mean `0.133008`,
+    top-1 220/220, state 75.47 MiB, finite.
+- Reference acceptance khusus Qwen Q2_K: single-token max <= 1.0 / mean <=
+  0.2; two-token max <= 1.5 / mean <= 0.3; finite dan top-1 sama. Exact gate
+  resident-vs-bounded tetap nol dan tidak dilonggarkan.
+- Verifikasi: `zig build test -Dsimd-backend=false` PASS; full-model Qwen
+  bounded validation PASS; optional llama.cpp single/two-token reference PASS;
+  existing Llama gates tetap PASS.
+
+Dengan item 1-5 selesai, Phase 9 dinyatakan selesai. Keterbatasan yang tersisa
+menjadi Phase 10: batched/chunked Qwen prompt kernel (saat ini token-by-token),
+server streaming/sampling integration untuk Qwen path, SIMD/thread-pool pada
+DeltaNet/MoE orchestration, dan budget policy gabungan weights + recurrent
+state + KV cache.

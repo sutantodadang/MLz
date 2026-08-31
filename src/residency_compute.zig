@@ -747,6 +747,69 @@ pub fn matVecQuantizedSliceWithPolicy(
     return matVecQuantizedAt(manager, descriptor, base_byte_offset, input, output, policy, dequant_scratch);
 }
 
+/// Canonical GGML selected-expert matvec. Only one 3-D expert slice is mapped,
+/// while arithmetic matches ggml_mul_mat by converting the activation to the
+/// weight type's vec_dot operand and calling GGML's CPU dot kernel.
+pub fn matVecQuantizedSliceGgmlWithPolicy(
+    manager: *residency.Manager,
+    descriptor: *const gguf.TensorDescriptor,
+    slice: usize,
+    input: []const f32,
+    output: []f32,
+    policy: TilePolicy,
+    quantized_input_scratch: []u8,
+) Error!void {
+    if (descriptor.n_dimensions != 3) return Error.InvalidTensorShape;
+    try validateTilePolicy(policy);
+    const slices = std.math.cast(usize, descriptor.dimensions[2]) orelse return Error.InvalidTensorShape;
+    if (slice >= slices) return Error.InvalidInput;
+    const format = quantizedFormat(descriptor.ggml_type) orelse return Error.InvalidTensorType;
+    const columns = std.math.cast(usize, descriptor.dimensions[0]) orelse return Error.InvalidTensorShape;
+    const rows = std.math.cast(usize, descriptor.dimensions[1]) orelse return Error.InvalidTensorShape;
+    if (columns == 0 or rows == 0 or columns % format.block_elements != 0 or input.len != columns or output.len != rows) return Error.InvalidInput;
+    const row_bytes = std.math.mul(usize, columns / format.block_elements, format.block_bytes) catch return Error.InvalidTensorShape;
+    const matrix_bytes = std.math.mul(usize, row_bytes, rows) catch return Error.InvalidTensorShape;
+    const expected_bytes = std.math.mul(usize, matrix_bytes, slices) catch return Error.InvalidTensorShape;
+    if (descriptor.byte_len != expected_bytes) return Error.InvalidTensorShape;
+    const base_byte_offset = std.math.mul(usize, slice, matrix_bytes) catch return Error.InvalidTensorShape;
+
+    ensureGgmlCpuInitialized();
+    const weight_traits = c.ggml_get_type_traits_cpu(descriptor.ggml_type);
+    if (weight_traits == null or weight_traits.*.vec_dot == null) return Error.InvalidTensorType;
+    const activation_traits = c.ggml_get_type_traits_cpu(weight_traits.*.vec_dot_type);
+    if (activation_traits == null or activation_traits.*.from_float == null) return Error.InvalidTensorType;
+    const input_bytes = c.ggml_row_size(weight_traits.*.vec_dot_type, @intCast(columns));
+    if (quantized_input_scratch.len < input_bytes) return Error.QuantizedScratchTooSmall;
+    activation_traits.*.from_float.?(input.ptr, quantized_input_scratch.ptr, @intCast(columns));
+
+    var row_start: usize = 0;
+    while (row_start < rows) {
+        const relative_row_offset = std.math.mul(usize, row_start, row_bytes) catch return Error.InvalidTensorShape;
+        const byte_offset = std.math.add(usize, base_byte_offset, relative_row_offset) catch return Error.InvalidTensorShape;
+        const capacity = try manager.rangeCapacity(descriptor.handle, byte_offset);
+        const tile_rows = try planTileRows(policy, capacity, row_bytes, rows - row_start);
+        const byte_len = std.math.mul(usize, tile_rows, row_bytes) catch return Error.InvalidTensorShape;
+        var view = try acquireTile(manager, descriptor, byte_offset, byte_len, policy);
+        defer view.release();
+        for (0..tile_rows) |tile_row| {
+            const quantized_row = view.bytes()[tile_row * row_bytes ..][0..row_bytes];
+            var sum: f32 = 0;
+            weight_traits.*.vec_dot.?(
+                @intCast(columns),
+                &sum,
+                0,
+                quantized_row.ptr,
+                0,
+                quantized_input_scratch.ptr,
+                0,
+                1,
+            );
+            output[row_start + tile_row] = sum;
+        }
+        row_start += tile_rows;
+    }
+}
+
 fn matVecQuantizedAt(
     manager: *residency.Manager,
     descriptor: *const gguf.TensorDescriptor,

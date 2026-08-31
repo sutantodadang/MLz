@@ -21,6 +21,28 @@ pub fn sequenceLogits(
     output: []f32,
     current_rss: *const fn () ?u64,
 ) !Run {
+    return sequenceLogitsWithMapping(path_z, tokens, output, current_rss, false);
+}
+
+/// Reference variant for very large models where materializing every weight in
+/// process RAM is unsafe. The OS-backed model mapping is outside the bounded
+/// residency manager and is reported separately by validators.
+pub fn sequenceLogitsMmap(
+    path_z: [:0]const u8,
+    tokens: []const usize,
+    output: []f32,
+    current_rss: *const fn () ?u64,
+) !Run {
+    return sequenceLogitsWithMapping(path_z, tokens, output, current_rss, true);
+}
+
+fn sequenceLogitsWithMapping(
+    path_z: [:0]const u8,
+    tokens: []const usize,
+    output: []f32,
+    current_rss: *const fn () ?u64,
+    use_mmap: bool,
+) !Run {
     if (tokens.len == 0 or tokens.len > std.math.maxInt(u32)) return Error.InvalidToken;
     for (tokens) |token| {
         if (token > std.math.maxInt(llama.Token)) return Error.InvalidToken;
@@ -32,7 +54,7 @@ pub fn sequenceLogits(
     var load_timer = try std.time.Timer.start();
     var model_params = llama.c.llama_model_default_params();
     model_params.n_gpu_layers = 0;
-    model_params.use_mmap = false;
+    model_params.use_mmap = use_mmap;
     model_params.use_mlock = false;
     const model = try llama.Model.load(path_z, model_params);
     defer model.deinit();

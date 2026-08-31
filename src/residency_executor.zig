@@ -330,14 +330,14 @@ pub const CpuExecutor = struct {
         if (descriptor.n_dimensions != 3) return Error.InvalidExecutionShape;
         const columns = std.math.cast(usize, descriptor.dimensions[0]) orelse return Error.InvalidExecutionShape;
         if (columns > self.dequant_scratch.len) return Error.ScratchCapacityExceeded;
-        try compute.matVecQuantizedSliceWithPolicy(
+        try compute.matVecQuantizedSliceGgmlWithPolicy(
             self.manager,
             descriptor,
             expert,
             input,
             output,
             self.tile_policy,
-            self.dequant_scratch,
+            std.mem.sliceAsBytes(self.dequant_scratch),
         );
     }
 

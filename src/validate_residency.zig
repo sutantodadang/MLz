@@ -4,6 +4,7 @@ const gguf = @import("gguf_residency.zig");
 const compute = @import("residency_compute.zig");
 const executor_mod = @import("residency_executor.zig");
 const llama_reference = @import("residency_llama_reference.zig");
+const qwen = @import("residency_qwen3next.zig");
 
 const default_budget_mib: usize = 16;
 const default_max_tensors: usize = 4;
@@ -19,6 +20,20 @@ const QwenBatchProbe = struct {
     max_abs_error: f32,
     scratch_bytes: usize,
     rss: ?u64,
+};
+
+const QwenModelRun = struct {
+    elapsed_ms: f64,
+    checksum: f64,
+    argmax: usize,
+    accounting: executor_mod.MemoryAccounting,
+    cache_bytes: usize,
+    workspace_bytes: usize,
+    logits: []f32,
+
+    fn deinit(self: *const QwenModelRun, allocator: std.mem.Allocator) void {
+        allocator.free(self.logits);
+    }
 };
 
 const Validation = struct {
@@ -142,7 +157,7 @@ fn referenceStatus(comparison: LlamaComparison) ReferenceStatus {
 
 fn usage() void {
     std.debug.print(
-        "usage: zig build validate-residency -- <model.gguf> [budget-mib] [max-tensors] [token-id] [prompt-tokens]\n" ++
+        "usage: zig build validate-residency -- <model.gguf> [budget-mib] [max-tensors] [token-id] [prompt-tokens] [qwen-reference]\n" ++
             "Validates tensors, layer-major prompt prefill, incremental KV reuse, and bounded logits.\n",
         .{},
     );
@@ -856,6 +871,260 @@ fn compareWithLlamaCpp(
     };
 }
 
+fn qwenDescriptor(index: *const gguf.TensorIndex, comptime format: []const u8, layer: usize) ?*const gguf.TensorDescriptor {
+    var buffer: [96]u8 = undefined;
+    const name = std.fmt.bufPrint(&buffer, format, .{layer}) catch return null;
+    return index.get(name);
+}
+
+fn runQwenLinearBlock(
+    allocator: std.mem.Allocator,
+    store: *residency.BackingStore,
+    index: *const gguf.TensorIndex,
+    budget: usize,
+) !?struct { elapsed_ms: f64, checksum: f64, accounting: executor_mod.MemoryAccounting, state_bytes: usize, workspace_bytes: usize } {
+    const config = qwen.Config.fromMetadata(index.execution) catch return null;
+    const attention_norm = qwenDescriptor(index, "blk.{d}.attn_norm.weight", 0) orelse return null;
+    const qkv = qwenDescriptor(index, "blk.{d}.attn_qkv.weight", 0) orelse return null;
+    const z_gate = qwenDescriptor(index, "blk.{d}.attn_gate.weight", 0) orelse return null;
+    const beta_alpha = qwenDescriptor(index, "blk.{d}.ssm_ba.weight", 0) orelse return null;
+    const conv1d = qwenDescriptor(index, "blk.{d}.ssm_conv1d.weight", 0) orelse return null;
+    const dt_bias = qwenDescriptor(index, "blk.{d}.ssm_dt.bias", 0) orelse return null;
+    const decay = qwenDescriptor(index, "blk.{d}.ssm_a", 0) orelse return null;
+    const state_norm = qwenDescriptor(index, "blk.{d}.ssm_norm.weight", 0) orelse return null;
+    const output = qwenDescriptor(index, "blk.{d}.ssm_out.weight", 0) orelse return null;
+    const post_attention_norm = qwenDescriptor(index, "blk.{d}.post_attention_norm.weight", 0) orelse return null;
+    const router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp.weight", 0) orelse return null;
+    const gate_experts = qwenDescriptor(index, "blk.{d}.ffn_gate_exps.weight", 0) orelse return null;
+    const up_experts = qwenDescriptor(index, "blk.{d}.ffn_up_exps.weight", 0) orelse return null;
+    const down_experts = qwenDescriptor(index, "blk.{d}.ffn_down_exps.weight", 0) orelse return null;
+    const shared_router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp_shexp.weight", 0) orelse return null;
+    const shared_gate = qwenDescriptor(index, "blk.{d}.ffn_gate_shexp.weight", 0) orelse return null;
+    const shared_up = qwenDescriptor(index, "blk.{d}.ffn_up_shexp.weight", 0) orelse return null;
+    const shared_down = qwenDescriptor(index, "blk.{d}.ffn_down_shexp.weight", 0) orelse return null;
+
+    var manager = try residency.Manager.init(allocator, store, budget);
+    defer manager.deinit();
+    _ = try index.registerAll(&manager);
+    var executor = try executor_mod.CpuExecutor.init(allocator, &manager, config.convChannels(), config.convChannels(), 64);
+    defer executor.deinit();
+    var cache = try qwen.DeltaNetCache.init(allocator, config);
+    defer cache.deinit();
+    var workspace = try qwen.Workspace.init(allocator, config);
+    defer workspace.deinit();
+    const state = try allocator.alloc(f32, config.hidden_size);
+    defer allocator.free(state);
+    fillInput(state);
+    var timer = try std.time.Timer.start();
+    try qwen.linearAttentionSingleToken(&executor, config, .{
+        .attention_norm = attention_norm,
+        .qkv = qkv,
+        .z_gate = z_gate,
+        .beta_alpha = beta_alpha,
+        .conv1d = conv1d,
+        .dt_bias = dt_bias,
+        .decay = decay,
+        .state_norm = state_norm,
+        .output = output,
+    }, &cache, &workspace, state);
+    try qwen.moeSingleToken(&executor, config, .{
+        .post_attention_norm = post_attention_norm,
+        .router = router,
+        .gate_experts = gate_experts,
+        .up_experts = up_experts,
+        .down_experts = down_experts,
+        .shared_router = shared_router,
+        .shared_gate = shared_gate,
+        .shared_up = shared_up,
+        .shared_down = shared_down,
+    }, &workspace, state);
+    var checksum: f64 = 0;
+    for (state) |value| checksum += value;
+    return .{
+        .elapsed_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms,
+        .checksum = checksum,
+        .accounting = executor.accounting(),
+        .state_bytes = cache.byteLen(),
+        .workspace_bytes = workspace.byteLen(),
+    };
+}
+
+fn qwenMoeWeights(index: *const gguf.TensorIndex, layer: usize) ?qwen.MoeWeights {
+    return .{
+        .post_attention_norm = qwenDescriptor(index, "blk.{d}.post_attention_norm.weight", layer) orelse return null,
+        .router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp.weight", layer) orelse return null,
+        .gate_experts = qwenDescriptor(index, "blk.{d}.ffn_gate_exps.weight", layer) orelse return null,
+        .up_experts = qwenDescriptor(index, "blk.{d}.ffn_up_exps.weight", layer) orelse return null,
+        .down_experts = qwenDescriptor(index, "blk.{d}.ffn_down_exps.weight", layer) orelse return null,
+        .shared_router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp_shexp.weight", layer) orelse return null,
+        .shared_gate = qwenDescriptor(index, "blk.{d}.ffn_gate_shexp.weight", layer) orelse return null,
+        .shared_up = qwenDescriptor(index, "blk.{d}.ffn_up_shexp.weight", layer) orelse return null,
+        .shared_down = qwenDescriptor(index, "blk.{d}.ffn_down_shexp.weight", layer) orelse return null,
+    };
+}
+
+fn collectQwenLayers(allocator: std.mem.Allocator, index: *const gguf.TensorIndex, interval: usize) !?[]qwen.LayerWeights {
+    const count: usize = index.execution.block_count orelse return null;
+    if (count == 0 or interval == 0) return null;
+    const layers = try allocator.alloc(qwen.LayerWeights, count);
+    errdefer allocator.free(layers);
+    for (layers, 0..) |*slot, layer| {
+        const moe = qwenMoeWeights(index, layer) orelse return null;
+        if ((layer + 1) % interval == 0) {
+            slot.* = .{ .full_attention = .{
+                .attention = .{
+                    .attention_norm = qwenDescriptor(index, "blk.{d}.attn_norm.weight", layer) orelse return null,
+                    .query_gate = qwenDescriptor(index, "blk.{d}.attn_q.weight", layer) orelse return null,
+                    .key = qwenDescriptor(index, "blk.{d}.attn_k.weight", layer) orelse return null,
+                    .value = qwenDescriptor(index, "blk.{d}.attn_v.weight", layer) orelse return null,
+                    .query_norm = qwenDescriptor(index, "blk.{d}.attn_q_norm.weight", layer) orelse return null,
+                    .key_norm = qwenDescriptor(index, "blk.{d}.attn_k_norm.weight", layer) orelse return null,
+                    .output = qwenDescriptor(index, "blk.{d}.attn_output.weight", layer) orelse return null,
+                },
+                .moe = moe,
+            } };
+        } else {
+            slot.* = .{ .recurrent = .{
+                .attention = .{
+                    .attention_norm = qwenDescriptor(index, "blk.{d}.attn_norm.weight", layer) orelse return null,
+                    .qkv = qwenDescriptor(index, "blk.{d}.attn_qkv.weight", layer) orelse return null,
+                    .z_gate = qwenDescriptor(index, "blk.{d}.attn_gate.weight", layer) orelse return null,
+                    .beta_alpha = qwenDescriptor(index, "blk.{d}.ssm_ba.weight", layer) orelse return null,
+                    .conv1d = qwenDescriptor(index, "blk.{d}.ssm_conv1d.weight", layer) orelse return null,
+                    .dt_bias = qwenDescriptor(index, "blk.{d}.ssm_dt.bias", layer) orelse return null,
+                    .decay = qwenDescriptor(index, "blk.{d}.ssm_a", layer) orelse return null,
+                    .state_norm = qwenDescriptor(index, "blk.{d}.ssm_norm.weight", layer) orelse return null,
+                    .output = qwenDescriptor(index, "blk.{d}.ssm_out.weight", layer) orelse return null,
+                },
+                .moe = moe,
+            } };
+        }
+    }
+    return layers;
+}
+
+fn runQwenFullModel(
+    allocator: std.mem.Allocator,
+    store: *residency.BackingStore,
+    index: *const gguf.TensorIndex,
+    budget: usize,
+    tokens: []const usize,
+) !?QwenModelRun {
+    const config = qwen.Config.fromMetadata(index.execution) catch return null;
+    const interval: usize = index.execution.full_attention_interval orelse return null;
+    const layers = (try collectQwenLayers(allocator, index, interval)) orelse return null;
+    defer allocator.free(layers);
+    const embedding = index.get("token_embd.weight") orelse return null;
+    const output_norm = index.get("output_norm.weight") orelse return null;
+    const output_weight = index.get("output.weight") orelse embedding;
+    const vocab: usize = @intCast(output_weight.dimensions[1]);
+    if (tokens.len == 0) return null;
+    for (tokens) |token| if (token >= embedding.dimensions[1]) return null;
+
+    var manager = try residency.Manager.init(allocator, store, budget);
+    defer manager.deinit();
+    _ = try index.registerAll(&manager);
+    var executor = try executor_mod.CpuExecutor.init(allocator, &manager, config.convChannels(), config.convChannels(), 64);
+    defer executor.deinit();
+    const context_capacity = @max(tokens.len, 1);
+    const caches = try qwen.initLayerCaches(allocator, config, layers.len, interval, context_capacity);
+    defer qwen.deinitLayerCaches(allocator, caches);
+    var workspace = try qwen.Workspace.init(allocator, config);
+    defer workspace.deinit();
+    const state = try allocator.alloc(f32, config.hidden_size);
+    defer allocator.free(state);
+    const logits = try allocator.alloc(f32, vocab);
+    errdefer allocator.free(logits);
+    var timer = try std.time.Timer.start();
+    for (tokens) |token| try qwen.modelSingleToken(&executor, config, embedding, layers, output_norm, output_weight, token, caches, &workspace, state, logits);
+    var checksum: f64 = 0;
+    var argmax: usize = 0;
+    for (logits, 0..) |value, i| {
+        checksum += value;
+        if (value > logits[argmax]) argmax = i;
+    }
+    var cache_bytes: usize = 0;
+    for (caches) |*cache| cache_bytes += cache.byteLen();
+    return .{
+        .elapsed_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms,
+        .checksum = checksum,
+        .argmax = argmax,
+        .accounting = executor.accounting(),
+        .cache_bytes = cache_bytes,
+        .workspace_bytes = workspace.byteLen(),
+        .logits = logits,
+    };
+}
+
+fn runQwenFullAttentionBlock(
+    allocator: std.mem.Allocator,
+    store: *residency.BackingStore,
+    index: *const gguf.TensorIndex,
+    budget: usize,
+) !?struct { elapsed_ms: f64, checksum: f64, accounting: executor_mod.MemoryAccounting, cache_bytes: usize, workspace_bytes: usize } {
+    const config = qwen.Config.fromMetadata(index.execution) catch return null;
+    const layer: usize = 3;
+    const attention_norm = qwenDescriptor(index, "blk.{d}.attn_norm.weight", layer) orelse return null;
+    const query_gate = qwenDescriptor(index, "blk.{d}.attn_q.weight", layer) orelse return null;
+    const key = qwenDescriptor(index, "blk.{d}.attn_k.weight", layer) orelse return null;
+    const value = qwenDescriptor(index, "blk.{d}.attn_v.weight", layer) orelse return null;
+    const query_norm = qwenDescriptor(index, "blk.{d}.attn_q_norm.weight", layer) orelse return null;
+    const key_norm = qwenDescriptor(index, "blk.{d}.attn_k_norm.weight", layer) orelse return null;
+    const output = qwenDescriptor(index, "blk.{d}.attn_output.weight", layer) orelse return null;
+    const post_attention_norm = qwenDescriptor(index, "blk.{d}.post_attention_norm.weight", layer) orelse return null;
+    const router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp.weight", layer) orelse return null;
+    const gate_experts = qwenDescriptor(index, "blk.{d}.ffn_gate_exps.weight", layer) orelse return null;
+    const up_experts = qwenDescriptor(index, "blk.{d}.ffn_up_exps.weight", layer) orelse return null;
+    const down_experts = qwenDescriptor(index, "blk.{d}.ffn_down_exps.weight", layer) orelse return null;
+    const shared_router = qwenDescriptor(index, "blk.{d}.ffn_gate_inp_shexp.weight", layer) orelse return null;
+    const shared_gate = qwenDescriptor(index, "blk.{d}.ffn_gate_shexp.weight", layer) orelse return null;
+    const shared_up = qwenDescriptor(index, "blk.{d}.ffn_up_shexp.weight", layer) orelse return null;
+    const shared_down = qwenDescriptor(index, "blk.{d}.ffn_down_shexp.weight", layer) orelse return null;
+
+    var manager = try residency.Manager.init(allocator, store, budget);
+    defer manager.deinit();
+    _ = try index.registerAll(&manager);
+    var executor = try executor_mod.CpuExecutor.init(allocator, &manager, config.convChannels(), config.convChannels(), 64);
+    defer executor.deinit();
+    var cache = try qwen.FullAttentionCache.init(allocator, 1, config);
+    defer cache.deinit();
+    var workspace = try qwen.Workspace.init(allocator, config);
+    defer workspace.deinit();
+    const state = try allocator.alloc(f32, config.hidden_size);
+    defer allocator.free(state);
+    fillInput(state);
+    var timer = try std.time.Timer.start();
+    try qwen.fullAttentionSingleToken(&executor, config, .{
+        .attention_norm = attention_norm,
+        .query_gate = query_gate,
+        .key = key,
+        .value = value,
+        .query_norm = query_norm,
+        .key_norm = key_norm,
+        .output = output,
+    }, &cache, &workspace, state);
+    try qwen.moeSingleToken(&executor, config, .{
+        .post_attention_norm = post_attention_norm,
+        .router = router,
+        .gate_experts = gate_experts,
+        .up_experts = up_experts,
+        .down_experts = down_experts,
+        .shared_router = shared_router,
+        .shared_gate = shared_gate,
+        .shared_up = shared_up,
+        .shared_down = shared_down,
+    }, &workspace, state);
+    var checksum: f64 = 0;
+    for (state) |state_value| checksum += state_value;
+    return .{
+        .elapsed_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms,
+        .checksum = checksum,
+        .accounting = executor.accounting(),
+        .cache_bytes = cache.byteLen(),
+        .workspace_bytes = workspace.byteLen(),
+    };
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -863,7 +1132,7 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    if (args.len < 2 or args.len > 6) {
+    if (args.len < 2 or args.len > 7) {
         usage();
         return error.InvalidArguments;
     }
@@ -883,6 +1152,10 @@ pub fn main() !void {
         try std.fmt.parseInt(usize, args[5], 10)
     else
         2;
+    const qwen_reference = if (args.len >= 7)
+        std.mem.eql(u8, args[6], "true") or std.mem.eql(u8, args[6], "1")
+    else
+        false;
     if (budget_mib == 0 or max_tensors == 0 or prompt_token_count == 0 or
         budget_mib > std.math.maxInt(usize) / (1024 * 1024))
     {
@@ -911,7 +1184,7 @@ pub fn main() !void {
             "Qwen3-Next bounded Q2_K batched projection: {s} ({d}x{d}, {d:.2} MiB), batch={d}\n" ++
                 "repeated={d:.2} ms faults/evictions={d}/{d}; batched={d:.2} ms faults/evictions={d}/{d}; " ++
                 "peak-map={d:.2}/{d:.2} MiB, scratch={d:.2} KiB, max-error={d}, rss={d:.2} MiB\n" ++
-                "scope: GGUF metadata + one canonical Q2_K projection; full Qwen3-Next DeltaNet/MoE inference is not claimed\n",
+                "scope: GGUF metadata + canonical Q2_K batched projection; full Qwen3-Next graph validation follows below\n",
             .{
                 probe.descriptor.name,
                 probe.descriptor.dimensions[1],
@@ -931,6 +1204,119 @@ pub fn main() !void {
                 rssMiB(probe.rss),
             },
         );
+        const linear = (try runQwenLinearBlock(allocator, &store, &index, budget)) orelse return error.NoSupportedTensor;
+        try out.print(
+            "Qwen3-Next layer-0 DeltaNet+MoE block: elapsed={d:.2} ms, checksum={d:.6}, peak-map={d:.2}/{d:.2} MiB, " ++
+                "faults/evictions={d}/{d}, recurrent-state={d:.2} MiB, workspace={d:.2} MiB\n" ++
+                "scope: complete single-token recurrent layer (DeltaNet + top-k routed MoE + gated shared expert + residual)\n",
+            .{
+                linear.elapsed_ms,
+                linear.checksum,
+                @as(f64, @floatFromInt(linear.accounting.peak_mapped_weight_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(linear.accounting.weight_budget_bytes)) / (1024.0 * 1024.0),
+                linear.accounting.faults,
+                linear.accounting.evictions,
+                @as(f64, @floatFromInt(linear.state_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(linear.workspace_bytes)) / (1024.0 * 1024.0),
+            },
+        );
+        if (linear.accounting.peak_mapped_weight_bytes > budget) return error.BudgetInvariantViolated;
+        const full_attention = (try runQwenFullAttentionBlock(allocator, &store, &index, budget)) orelse return error.NoSupportedTensor;
+        try out.print(
+            "Qwen3-Next layer-3 full-attention+MoE block: elapsed={d:.2} ms, checksum={d:.6}, peak-map={d:.2}/{d:.2} MiB, " ++
+                "faults/evictions={d}/{d}, KV={d:.2} KiB, workspace={d:.2} MiB\n",
+            .{
+                full_attention.elapsed_ms,
+                full_attention.checksum,
+                @as(f64, @floatFromInt(full_attention.accounting.peak_mapped_weight_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(full_attention.accounting.weight_budget_bytes)) / (1024.0 * 1024.0),
+                full_attention.accounting.faults,
+                full_attention.accounting.evictions,
+                @as(f64, @floatFromInt(full_attention.cache_bytes)) / 1024.0,
+                @as(f64, @floatFromInt(full_attention.workspace_bytes)) / (1024.0 * 1024.0),
+            },
+        );
+        if (full_attention.accounting.peak_mapped_weight_bytes > budget) return error.BudgetInvariantViolated;
+        const qwen_tokens = [_]usize{token};
+        const full_model = (try runQwenFullModel(allocator, &store, &index, budget, &qwen_tokens)) orelse return error.NoSupportedTensor;
+        defer full_model.deinit(allocator);
+        try out.print(
+            "Qwen3-Next full single-token logits: layers={d}, vocab={d}, elapsed={d:.2} ms, checksum={d:.6}, argmax={d}, " ++
+                "peak-map={d:.2}/{d:.2} MiB, faults/evictions={d}/{d}, all-layer-state={d:.2} MiB, workspace={d:.2} MiB\n",
+            .{
+                index.execution.block_count.?,
+                index.get("output.weight").?.dimensions[1],
+                full_model.elapsed_ms,
+                full_model.checksum,
+                full_model.argmax,
+                @as(f64, @floatFromInt(full_model.accounting.peak_mapped_weight_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(full_model.accounting.weight_budget_bytes)) / (1024.0 * 1024.0),
+                full_model.accounting.faults,
+                full_model.accounting.evictions,
+                @as(f64, @floatFromInt(full_model.cache_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(full_model.workspace_bytes)) / (1024.0 * 1024.0),
+            },
+        );
+        if (full_model.accounting.peak_mapped_weight_bytes > budget) return error.BudgetInvariantViolated;
+        const resident_budget = @max(budget, @as(usize, 64 * 1024 * 1024));
+        const resident_model = (try runQwenFullModel(allocator, &store, &index, resident_budget, &qwen_tokens)) orelse return error.NoSupportedTensor;
+        defer resident_model.deinit(allocator);
+        var resident_max_error: f32 = 0;
+        for (resident_model.logits, full_model.logits) |resident_value, bounded_value| resident_max_error = @max(resident_max_error, @abs(resident_value - bounded_value));
+        try out.print(
+            "Qwen3-Next resident-vs-bounded logits: resident-budget={d:.2} MiB, max-error={d}, argmax={d}/{d}\n",
+            .{ @as(f64, @floatFromInt(resident_budget)) / (1024.0 * 1024.0), resident_max_error, resident_model.argmax, full_model.argmax },
+        );
+        if (resident_max_error != 0 or resident_model.argmax != full_model.argmax) return error.ReferenceMismatch;
+
+        if (qwen_reference) {
+            const reference_logits = try allocator.alloc(f32, full_model.logits.len);
+            defer allocator.free(reference_logits);
+            const reference = try llama_reference.sequenceLogitsMmap(path_z, &[_]usize{token}, reference_logits, residency.currentRss);
+            var reference_argmax: usize = 0;
+            var max_error: f32 = 0;
+            var mean_error: f64 = 0;
+            var finite = true;
+            for (reference_logits, full_model.logits, 0..) |reference_value, bounded_value, i| {
+                finite = finite and std.math.isFinite(reference_value) and std.math.isFinite(bounded_value);
+                const difference = @abs(reference_value - bounded_value);
+                max_error = @max(max_error, difference);
+                mean_error += difference;
+                if (reference_value > reference_logits[reference_argmax]) reference_argmax = i;
+            }
+            mean_error /= @as(f64, @floatFromInt(reference_logits.len));
+            try out.print(
+                "Qwen3-Next llama.cpp mmap reference: load={d:.2} ms, decode={d:.2} ms, max-error={d:.6}, mean-error={d:.6}, " ++
+                    "argmax={d}/{d}, finite={any}, rss={d:.2} MiB\n",
+                .{ reference.load_ms, reference.decode_ms, max_error, mean_error, reference_argmax, full_model.argmax, finite, rssMiB(reference.current_rss) },
+            );
+            if (!finite or reference_argmax != full_model.argmax or max_error > 1.0 or mean_error > 0.2) return error.ReferenceMismatch;
+
+            const sequence = [_]usize{ token, (token + 1) % @as(usize, @intCast(index.get("token_embd.weight").?.dimensions[1])) };
+            const sequence_model = (try runQwenFullModel(allocator, &store, &index, budget, &sequence)) orelse return error.NoSupportedTensor;
+            defer sequence_model.deinit(allocator);
+            const sequence_reference = try llama_reference.sequenceLogitsMmap(path_z, &sequence, reference_logits, residency.currentRss);
+            reference_argmax = 0;
+            max_error = 0;
+            mean_error = 0;
+            finite = true;
+            for (reference_logits, sequence_model.logits, 0..) |reference_value, bounded_value, i| {
+                finite = finite and std.math.isFinite(reference_value) and std.math.isFinite(bounded_value);
+                const difference = @abs(reference_value - bounded_value);
+                max_error = @max(max_error, difference);
+                mean_error += difference;
+                if (reference_value > reference_logits[reference_argmax]) reference_argmax = i;
+            }
+            mean_error /= @as(f64, @floatFromInt(reference_logits.len));
+            try out.print(
+                "Qwen3-Next two-token recurrent-state reference: bounded={d:.2} ms, llama.cpp-decode={d:.2} ms, max-error={d:.6}, " ++
+                    "mean-error={d:.6}, argmax={d}/{d}, state={d:.2} MiB, finite={any}\n",
+                .{ sequence_model.elapsed_ms, sequence_reference.decode_ms, max_error, mean_error, reference_argmax, sequence_model.argmax, @as(f64, @floatFromInt(sequence_model.cache_bytes)) / (1024.0 * 1024.0), finite },
+            );
+            if (!finite or reference_argmax != sequence_model.argmax or max_error > 1.5 or mean_error > 0.3) return error.ReferenceMismatch;
+        } else {
+            try out.print("Qwen3-Next llama.cpp reference: skipped (pass final argument true to run the 27 GiB mmap reference)\n", .{});
+        }
         return;
     }
 
