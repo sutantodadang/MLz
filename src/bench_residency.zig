@@ -105,6 +105,9 @@ pub fn main() !void {
     const matmul_parallel = try runMatMul(allocator, &matmul_store, matmul_budget, matmul_rows_per_tile, 4);
     defer allocator.free(matmul_parallel.output);
 
+    // Routed-MoE microbenchmark: the dominant per-token cost of Qwen3-Next.
+    const moe = try runMoe(allocator);
+
     const out = std.fs.File.stdout().deprecatedWriter();
     try out.print(
         "residency benchmark ({d} tensors x {d} MiB, {d} passes)\n" ++
@@ -171,6 +174,20 @@ pub fn main() !void {
             matmul_sequential.elapsed_ms / @max(matmul_parallel.elapsed_ms, 0.000001),
             std.mem.eql(f32, matmul_sequential.output, matmul_parallel.output),
             @as(u32, @bitCast(matmul_sequential.sink)) ^ @as(u32, @bitCast(matmul_parallel.sink)),
+        },
+    );
+    try out.print(
+        "moe Q2_K {d} experts top-{d} hidden={d} intermediate={d}, {d} tokens: {d:.2} ms ({d:.2} ms/token), faults={d}, checksum={d:.4}\n",
+        .{
+            moe_experts,
+            moe_used,
+            moe_hidden,
+            moe_intermediate,
+            moe_tokens,
+            moe.elapsed_ms,
+            moe.elapsed_ms / moe_tokens,
+            moe.metrics.faults,
+            moe.checksum,
         },
     );
 }
@@ -276,6 +293,205 @@ fn runScheduledPrefetch(allocator: std.mem.Allocator, store: *residency.BackingS
     };
 }
 
+const MoeResult = struct {
+    elapsed_ms: f64,
+    metrics: residency.Metrics,
+    checksum: f64,
+};
+
+/// Routed-MoE microbenchmark shaped like Qwen3-Next: `moe_experts` experts of
+/// Q2_K gate/up/down matrices, top-`moe_used` routing per token, executed
+/// through the bounded residency executor for `moe_tokens` tokens.
+fn runMoe(allocator: std.mem.Allocator) !MoeResult {
+    const compute = @import("residency_compute.zig");
+    const gguf = @import("gguf_residency.zig");
+    const executor_mod = @import("residency_executor.zig");
+
+    const q2_block: usize = 256;
+    const q2_bytes_per_block: usize = 84;
+    const gate_row_bytes = moe_intermediate / q2_block * q2_bytes_per_block;
+    const up_row_bytes = gate_row_bytes;
+    const down_row_bytes = moe_hidden / q2_block * q2_bytes_per_block;
+    const gate_bytes = gate_row_bytes * moe_hidden * moe_experts;
+    const up_bytes = up_row_bytes * moe_hidden * moe_experts;
+    const down_bytes = down_row_bytes * moe_intermediate * moe_experts;
+    const router_bytes = moe_hidden * moe_experts * @sizeOf(f32);
+    const shared_router_bytes = moe_hidden * @sizeOf(f32);
+    const shared_gate_bytes = gate_row_bytes * moe_hidden;
+    const shared_up_bytes = up_row_bytes * moe_hidden;
+    const shared_down_bytes = down_row_bytes * moe_intermediate;
+    const shared_norm_bytes = moe_hidden * @sizeOf(f32);
+    const block_bytes = router_bytes + gate_bytes + up_bytes + down_bytes +
+        shared_router_bytes + shared_gate_bytes + shared_up_bytes + shared_down_bytes + shared_norm_bytes;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        // Weight bytes do not affect timing; a sparse file keeps the benchmark
+        // cheap while still exercising the full bounded mapping/fault path.
+        var file = try tmp.dir.createFile("moe-bench.bin", .{ .read = true });
+        defer file.close();
+        try file.setEndPos(block_bytes);
+    }
+    const path = try tmp.dir.realpathAlloc(allocator, "moe-bench.bin");
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var store = try residency.BackingStore.open(path_z);
+    defer store.close();
+    var manager = try residency.Manager.init(allocator, &store, try residency.mappingGranularity() * 8);
+    defer manager.deinit();
+
+    if (store.size < block_bytes) return error.BackingFileTooSmall;
+    var offset: usize = 0;
+    try manager.register(.{ .id = 0 }, offset, router_bytes);
+    offset += router_bytes;
+    try manager.register(.{ .id = 1 }, offset, gate_bytes);
+    offset += gate_bytes;
+    try manager.register(.{ .id = 2 }, offset, up_bytes);
+    offset += up_bytes;
+    try manager.register(.{ .id = 3 }, offset, down_bytes);
+    offset += down_bytes;
+    try manager.register(.{ .id = 4 }, offset, moe_hidden * @sizeOf(f32));
+    offset += moe_hidden * @sizeOf(f32);
+    try manager.register(.{ .id = 5 }, offset, gate_row_bytes * moe_hidden);
+    offset += gate_row_bytes * moe_hidden;
+    try manager.register(.{ .id = 6 }, offset, up_row_bytes * moe_hidden);
+    offset += up_row_bytes * moe_hidden;
+    try manager.register(.{ .id = 7 }, offset, down_row_bytes * moe_intermediate);
+    offset += down_row_bytes * moe_intermediate;
+    try manager.register(.{ .id = 8 }, offset, moe_hidden * @sizeOf(f32));
+
+    const router_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 0 },
+        .name = "moe_bench.router",
+        .file_offset = 0,
+        .byte_len = router_bytes,
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 2,
+        .dimensions = .{ moe_hidden, moe_experts, 1, 1 },
+    };
+    const gate_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 1 },
+        .name = "moe_bench.gate",
+        .file_offset = router_bytes,
+        .byte_len = gate_bytes,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 3,
+        .dimensions = .{ moe_hidden, moe_intermediate, moe_experts, 1 },
+    };
+    const up_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 2 },
+        .name = "moe_bench.up",
+        .file_offset = router_bytes + gate_bytes,
+        .byte_len = up_bytes,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 3,
+        .dimensions = .{ moe_hidden, moe_intermediate, moe_experts, 1 },
+    };
+    const down_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 3 },
+        .name = "moe_bench.down",
+        .file_offset = router_bytes + gate_bytes + up_bytes,
+        .byte_len = down_bytes,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 3,
+        .dimensions = .{ moe_intermediate, moe_hidden, moe_experts, 1 },
+    };
+    const shared_router_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 4 },
+        .name = "moe_bench.shared_router",
+        .file_offset = router_bytes + gate_bytes + up_bytes + down_bytes,
+        .byte_len = moe_hidden * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 1,
+        .dimensions = .{ moe_hidden, 1, 1, 1 },
+    };
+    const shared_gate_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 5 },
+        .name = "moe_bench.shared_gate",
+        .file_offset = router_bytes + gate_bytes + up_bytes + down_bytes + moe_hidden * @sizeOf(f32),
+        .byte_len = gate_row_bytes * moe_hidden,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 2,
+        .dimensions = .{ moe_hidden, moe_intermediate, 1, 1 },
+    };
+    const shared_up_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 6 },
+        .name = "moe_bench.shared_up",
+        .file_offset = router_bytes + gate_bytes + up_bytes + down_bytes + moe_hidden * @sizeOf(f32) + gate_row_bytes * moe_hidden,
+        .byte_len = up_row_bytes * moe_hidden,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 2,
+        .dimensions = .{ moe_hidden, moe_intermediate, 1, 1 },
+    };
+    const shared_down_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 7 },
+        .name = "moe_bench.shared_down",
+        .file_offset = router_bytes + gate_bytes + up_bytes + down_bytes + moe_hidden * @sizeOf(f32) + gate_row_bytes * moe_hidden + up_row_bytes * moe_hidden,
+        .byte_len = down_row_bytes * moe_intermediate,
+        .ggml_type = gguf.type_q2_k,
+        .n_dimensions = 2,
+        .dimensions = .{ moe_intermediate, moe_hidden, 1, 1 },
+    };
+    const shared_norm_desc = gguf.TensorDescriptor{
+        .handle = .{ .id = 8 },
+        .name = "moe_bench.shared_norm",
+        .file_offset = router_bytes + gate_bytes + up_bytes + down_bytes + moe_hidden * @sizeOf(f32) + gate_row_bytes * moe_hidden + up_row_bytes * moe_hidden + down_row_bytes * moe_intermediate,
+        .byte_len = moe_hidden * @sizeOf(f32),
+        .ggml_type = gguf.type_f32,
+        .n_dimensions = 1,
+        .dimensions = .{ moe_hidden, 1, 1, 1 },
+    };
+    const qwen = @import("residency_qwen3next.zig");
+    const weights = qwen.MoeWeights{
+        .post_attention_norm = &shared_norm_desc,
+        .router = &router_desc,
+        .gate_experts = &gate_desc,
+        .up_experts = &up_desc,
+        .down_experts = &down_desc,
+        .shared_router = &shared_router_desc,
+        .shared_gate = &shared_gate_desc,
+        .shared_up = &shared_up_desc,
+        .shared_down = &shared_down_desc,
+    };
+
+    var executor = try executor_mod.CpuExecutor.init(
+        allocator,
+        &manager,
+        @max(moe_hidden, moe_intermediate),
+        @max(moe_intermediate, moe_hidden),
+        1,
+    );
+    defer executor.deinit();
+
+    const input = try allocator.alloc(f32, moe_hidden);
+    defer allocator.free(input);
+    for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 31)) / 13.0 - 1.0;
+    const output = try allocator.alloc(f32, moe_hidden);
+    defer allocator.free(output);
+
+    _ = compute;
+    var timer = try std.time.Timer.start();
+    var checksum: f64 = 0;
+    for (0..moe_tokens) |_| {
+        try executor.moeSwiGlu(
+            weights.router,
+            weights.gate_experts,
+            weights.up_experts,
+            weights.down_experts,
+            moe_used,
+            input,
+            output,
+        );
+        for (output) |value| checksum += value;
+    }
+    const elapsed_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms;
+
+    return .{ .elapsed_ms = elapsed_ms, .metrics = manager.metrics(), .checksum = checksum };
+}
+
 fn runTokenLoop(
     allocator: std.mem.Allocator,
     store: *residency.BackingStore,
@@ -322,6 +538,11 @@ fn runTokenLoop(
 const matmul_rows = 4096;
 const matmul_columns = 4096;
 const matmul_batch = 8;
+const moe_experts = 512;
+const moe_used = 10;
+const moe_hidden = 2048;
+const moe_intermediate = 6144;
+const moe_tokens = 8;
 
 const MatMulResult = struct {
     elapsed_ms: f64,

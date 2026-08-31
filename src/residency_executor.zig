@@ -259,6 +259,9 @@ pub const CpuExecutor = struct {
     batch_scratch: []align(64) u8,
     activation_a: []f32,
     activation_b: []f32,
+    /// Routed-expert output accumulation buffer. Sized like activation_a so
+    /// moeSwiGlu does not allocate per token.
+    moe_output: []f32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -275,6 +278,8 @@ pub const CpuExecutor = struct {
         errdefer allocator.free(activation_a);
         const activation_b = allocator.alloc(f32, max_intermediate_elements) catch return Error.OutOfMemory;
         errdefer allocator.free(activation_b);
+        const moe_output = allocator.alloc(f32, max_intermediate_elements) catch return Error.OutOfMemory;
+        errdefer allocator.free(moe_output);
         const batch_scratch = allocator.alignedAlloc(u8, batch_scratch_alignment, 0) catch return Error.OutOfMemory;
 
         return .{
@@ -285,6 +290,7 @@ pub const CpuExecutor = struct {
             .batch_scratch = batch_scratch,
             .activation_a = activation_a,
             .activation_b = activation_b,
+            .moe_output = moe_output,
         };
     }
 
@@ -298,6 +304,7 @@ pub const CpuExecutor = struct {
 
     pub fn deinit(self: *CpuExecutor) void {
         self.allocator.free(self.batch_scratch);
+        self.allocator.free(self.moe_output);
         self.allocator.free(self.activation_b);
         self.allocator.free(self.activation_a);
         self.allocator.free(self.dequant_scratch);
@@ -449,12 +456,27 @@ pub const CpuExecutor = struct {
 
         const router_logits = self.activation_a[0..expert_count];
         try self.matVec(router, input, router_logits);
-        const selected = self.allocator.alloc(usize, expert_used_count) catch return Error.OutOfMemory;
-        defer self.allocator.free(selected);
-        const probabilities = self.allocator.alloc(f32, expert_used_count) catch return Error.OutOfMemory;
-        defer self.allocator.free(probabilities);
-        const expert_output = self.allocator.alloc(f32, output.len) catch return Error.OutOfMemory;
-        defer self.allocator.free(expert_output);
+        // Fast path: stack selection state for realistic top-k values. Models
+        // requesting more than 64 experts per token keep the old allocation
+        // path so behavior is unchanged.
+        var selected_buffer: [64]usize = undefined;
+        var probability_buffer: [64]f32 = undefined;
+        var selected: []usize = undefined;
+        var probabilities: []f32 = undefined;
+        var heap_selected: ?[]usize = null;
+        var heap_probabilities: ?[]f32 = null;
+        defer if (heap_selected) |buffer| self.allocator.free(buffer);
+        defer if (heap_probabilities) |buffer| self.allocator.free(buffer);
+        if (expert_used_count <= selected_buffer.len) {
+            selected = selected_buffer[0..expert_used_count];
+            probabilities = probability_buffer[0..expert_used_count];
+        } else {
+            heap_selected = self.allocator.alloc(usize, expert_used_count) catch return Error.OutOfMemory;
+            selected = heap_selected.?;
+            heap_probabilities = self.allocator.alloc(f32, expert_used_count) catch return Error.OutOfMemory;
+            probabilities = heap_probabilities.?;
+        }
+        const expert_output = self.moe_output[0..output.len];
 
         // Selection is deterministic for equal values: the lower expert index wins.
         for (selected, 0..) |*slot, rank| {
@@ -485,12 +507,35 @@ pub const CpuExecutor = struct {
             const up_values = self.activation_b[0..intermediate];
             try self.matVecExpert(gate_experts, expert, input, gate_values);
             try self.matVecExpert(up_experts, expert, input, up_values);
-            for (gate_values, up_values) |*gate_value, up_value| {
-                gate_value.* = gate_value.* / (1.0 + @exp(-gate_value.*)) * up_value;
+            // Elementwise arithmetic identical to the scalar form, executed as
+            // lane-parallel vectors: silu(g) * u with f32 rounding unchanged.
+            const lanes = 8;
+            const vectorized = intermediate - (intermediate % lanes);
+            var index: usize = 0;
+            while (index < vectorized) : (index += lanes) {
+                const gate_vec: @Vector(lanes, f32) = gate_values[index..][0..lanes].*;
+                const up_vec: @Vector(lanes, f32) = up_values[index..][0..lanes].*;
+                const ones: @Vector(lanes, f32) = @splat(1.0);
+                // Exact scalar form: divide by the denominator directly.
+                // g * (1/(1+e)) rounds differently than g / (1+e).
+                const gate_denominator = ones + @exp(-gate_vec);
+                (gate_values[index..][0..lanes]).* = gate_vec / gate_denominator * up_vec;
+            }
+            while (index < intermediate) : (index += 1) {
+                const gate_value = gate_values[index];
+                gate_values[index] = gate_value / (1.0 + @exp(-gate_value)) * up_values[index];
             }
             // Router scores are no longer needed after top-k selection.
             try self.matVecExpert(down_experts, expert, gate_values, expert_output);
-            for (output, expert_output) |*value, expert_value| value.* += probability * expert_value;
+            var tail: usize = 0;
+            while (tail < vectorized) : (tail += lanes) {
+                const output_vec: @Vector(lanes, f32) = output[tail..][0..lanes].*;
+                const expert_vec: @Vector(lanes, f32) = expert_output[tail..][0..lanes].*;
+                (output[tail..][0..lanes]).* = output_vec + @as(@Vector(lanes, f32), @splat(probability)) * expert_vec;
+            }
+            while (tail < output.len) : (tail += 1) {
+                output[tail] += probability * expert_output[tail];
+            }
         }
     }
 
@@ -1958,4 +2003,57 @@ test "CPU execution boundary rejects mismatched FFN shapes" {
         Error.InvalidExecutionShape,
         executor.ffnSwiGlu(&gate, &gate, &wrong_down, &([_]f32{ 1, 2, 3, 4 }), &output),
     );
+}
+
+test "vectorized MoE SwiGLU elementwise matches scalar bit-for-bit" {
+    // The SIMD lane path must produce exactly the same f32 rounding as the
+    // scalar reference: same operations, same order, per element.
+    const lanes = 8;
+    var gate_values: [40]f32 = undefined;
+    var up_values: [40]f32 = undefined;
+    var scalar_gate: [40]f32 = undefined;
+    for (&gate_values, &up_values, 0..) |*gate, *up, i| {
+        // Cover negative, zero, positive, and extreme magnitudes.
+        const magnitude: f32 = @floatFromInt((i *% 37) % 21);
+        const sign: f32 = if (i % 2 == 0) 1 else -1;
+        gate.* = sign * magnitude * 0.35 - 0.1;
+        up.* = sign * magnitude * 0.2 + 0.05;
+    }
+    @memcpy(&scalar_gate, &gate_values);
+
+    const vectorized = gate_values.len - (gate_values.len % lanes);
+    var index: usize = 0;
+    while (index < vectorized) : (index += lanes) {
+        const gate_vec: @Vector(lanes, f32) = gate_values[index..][0..lanes].*;
+        const up_vec: @Vector(lanes, f32) = up_values[index..][0..lanes].*;
+        const ones: @Vector(lanes, f32) = @splat(1.0);
+        const denominator = ones + @exp(-gate_vec);
+        (gate_values[index..][0..lanes]).* = gate_vec / denominator * up_vec;
+    }
+    while (index < gate_values.len) : (index += 1) {
+        const gate_value = gate_values[index];
+        gate_values[index] = gate_value / (1.0 + @exp(-gate_value)) * up_values[index];
+    }
+    var i: usize = 0;
+    for (scalar_gate, &up_values) |gate, up| {
+        const expected = gate / (1.0 + @exp(-gate)) * up;
+        try std.testing.expectEqual(expected, gate_values[i]);
+        i += 1;
+    }
+    // Probability-weighted accumulation must also match bit-for-bit.
+    var vector_output: [40]f32 = undefined;
+    var scalar_output: [40]f32 = undefined;
+    for (&vector_output, 0..) |*value, out_index| value.* = @as(f32, @floatFromInt(out_index)) * 0.125;
+    @memcpy(&scalar_output, &vector_output);
+    const probability: f32 = 0.317;
+    var tail: usize = 0;
+    while (tail < vectorized) : (tail += lanes) {
+        const output_vec: @Vector(lanes, f32) = vector_output[tail..][0..lanes].*;
+        const expert_vec: @Vector(lanes, f32) = @splat(0.5);
+        (vector_output[tail..][0..lanes]).* = output_vec + @as(@Vector(lanes, f32), @splat(probability)) * expert_vec;
+    }
+    while (tail < vector_output.len) : (tail += 1) vector_output[tail] += probability * 0.5;
+    for (scalar_output, &vector_output) |scalar, vector| {
+        try std.testing.expectEqual(scalar + probability * 0.5, vector);
+    }
 }
