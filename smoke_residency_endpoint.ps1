@@ -87,6 +87,26 @@ try {
     if ($chunks -lt 1) { throw "no SSE chunks" }
     if (-not $sawDone) { throw "missing data: [DONE]" }
     Write-Host "PASS streaming"
+
+    # Chat messages smoke (jinja chat template through the residency service).
+    $chatBody = @{
+        messages   = @(
+            @{ role = "user"; content = "The capital of France is" }
+        )
+        max_tokens = $MaxTokens
+        stream     = $false
+    } | ConvertTo-Json -Depth 4
+
+    $chatResp = Invoke-RestMethod -Uri $Url -Method Post -Body $chatBody `
+        -ContentType "application/json" -TimeoutSec 600
+
+    Write-Host "=== chat response ==="
+    Write-Host ($chatResp | ConvertTo-Json -Depth 5)
+
+    if (-not $chatResp.choices -or $chatResp.choices.Count -lt 1) { throw "chat: missing choices" }
+    if ($chatResp.choices[0].text.Length -lt 1) { throw "chat: empty completion" }
+    if ($chatResp.residency.peak_mapped_weight_bytes -gt $chatResp.residency.weight_budget_bytes) { throw "chat: budget exceeded" }
+    Write-Host "PASS chat messages"
 }
 finally {
     if ($proc -and -not $proc.HasExited) {

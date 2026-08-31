@@ -392,6 +392,45 @@ pub const ResidencyService = struct {
         tokens: []usize,
     };
 
+    pub const ChatMessage = struct {
+        role: []const u8,
+        content: []const u8,
+    };
+
+    /// Renders `messages` through the model's embedded jinja chat template and
+    /// tokenizes the result with special tokens enabled (the template output
+    /// may contain control tokens such as `<|eot_id|>`).
+    pub fn applyChatTemplate(
+        self: *ResidencyService,
+        messages: []const ChatMessage,
+    ) Error!TokenizeResult {
+        if (messages.len == 0) return Error.PromptEmpty;
+        const template = self.model.chatTemplate() orelse return Error.VocabUnavailable;
+
+        const chat_msgs = try self.allocator.alloc(llama.c.llama_chat_message, messages.len);
+        defer self.allocator.free(chat_msgs);
+        for (messages, 0..) |m, i| {
+            chat_msgs[i] = .{
+                .role = m.role.ptr,
+                .content = m.content.ptr,
+            };
+        }
+
+        const formatted = try llama.applyChatTemplateJinja(self.allocator, template, chat_msgs, true);
+        defer self.allocator.free(formatted);
+
+        const tokens_c = try llama.tokenize(self.allocator, self.vocab, formatted, false, true);
+        defer self.allocator.free(tokens_c);
+        const tokens = try self.allocator.alloc(usize, tokens_c.len);
+        errdefer self.allocator.free(tokens);
+        for (tokens_c, 0..) |token, i| {
+            const unsigned: usize = @intCast(@as(i64, token));
+            if (unsigned >= self.vocab_size) return Error.InvalidToken;
+            tokens[i] = unsigned;
+        }
+        return .{ .tokens = tokens };
+    }
+
     pub fn tokenize(self: *ResidencyService, text: []const u8, add_bos: bool) Error!TokenizeResult {
         if (text.len == 0) return Error.PromptEmpty;
         const tokens_c = try llama.tokenize(self.allocator, self.vocab, text, add_bos, false);

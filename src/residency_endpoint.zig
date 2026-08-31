@@ -235,12 +235,90 @@ pub fn handle(
         },
     };
 
-    const prompt = getString(obj, "prompt") orelse {
-        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "missing required field: prompt") catch {};
-        return;
-    };
-    if (prompt.len == 0) {
-        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "prompt must not be empty") catch {};
+    // Input modes: `messages` (chat, rendered via the model's jinja template)
+    // or `prompt` (raw completion text). Exactly one is required.
+    var prompt_tokens: ?[]usize = null;
+    defer if (prompt_tokens) |t| allocator.free(t);
+    if (obj.get("messages")) |mv| {
+        switch (mv) {
+            .array => |arr| {
+                if (arr.items.len == 0) {
+                    writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "messages must not be empty") catch {};
+                    return;
+                }
+                var messages = std.ArrayList(service_mod.ResidencyService.ChatMessage).empty;
+                defer messages.deinit(allocator);
+                for (arr.items) |item| {
+                    const mobj = switch (item) {
+                        .object => |o| o,
+                        else => {
+                            writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "messages entries must be objects") catch {};
+                            return;
+                        },
+                    };
+                    const role = getString(mobj, "role") orelse {
+                        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "message missing role") catch {};
+                        return;
+                    };
+                    const content = getString(mobj, "content") orelse {
+                        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "message missing content") catch {};
+                        return;
+                    };
+                    messages.append(allocator, .{ .role = role, .content = content }) catch |e| return e;
+                }
+                const service = endpoint.ensureService() catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => {
+                        writeJsonError(stream, 503, "Service Unavailable", "server_error", "failed to open the residency service") catch {};
+                        return;
+                    },
+                };
+                const tokenized = service.applyChatTemplate(messages.items) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => {
+                        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "failed to apply chat template") catch {};
+                        return;
+                    },
+                };
+                prompt_tokens = tokenized.tokens;
+            },
+            else => {
+                writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "messages must be an array") catch {};
+                return;
+            },
+        }
+    } else if (obj.get("prompt")) |pv| {
+        const prompt = switch (pv) {
+            .string => |s| s,
+            else => {
+                writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "prompt must be a string") catch {};
+                return;
+            },
+        };
+        if (prompt.len == 0) {
+            writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "prompt must not be empty") catch {};
+            return;
+        }
+        const service = endpoint.ensureService() catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => {
+                writeJsonError(stream, 503, "Service Unavailable", "server_error", "failed to open the residency service") catch {};
+                return;
+            },
+        };
+        // Tokenize the raw prompt text against the service vocabulary.
+        // add_bos is disabled to match the raw-completion semantics of the CLI
+        // service.
+        const tokenized = service.tokenize(prompt, false) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => {
+                writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "failed to tokenize prompt") catch {};
+                return;
+            },
+        };
+        prompt_tokens = tokenized.tokens;
+    } else {
+        writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "missing required field: prompt or messages") catch {};
         return;
     }
 
@@ -282,17 +360,6 @@ pub fn handle(
         },
     };
 
-    // Tokenize the raw prompt text against the service vocabulary. add_bos is
-    // disabled to match the raw-completion semantics of the CLI service.
-    const tokenized = service.tokenize(prompt, false) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => {
-            writeJsonError(stream, 400, "Bad Request", "invalid_request_error", "failed to tokenize prompt") catch {};
-            return;
-        },
-    };
-    defer allocator.free(tokenized.tokens);
-
     // Request id: short hex from the timestamp.
     var id_buf: [max_id_len]u8 = undefined;
     const id = std.fmt.bufPrint(&id_buf, "cmpl-{x}", .{std.time.nanoTimestamp()}) catch "cmpl-0";
@@ -302,7 +369,7 @@ pub fn handle(
         .sampling = sampling,
         .temperature = temperature,
         .top_k = top_k,
-        .prompt_tokens = tokenized.tokens,
+        .prompt_tokens = prompt_tokens.?,
     };
     if (endpoint.state_cache_bytes != 0 or endpoint.state_workspace_bytes != 0) {
         options.state_budget = .{

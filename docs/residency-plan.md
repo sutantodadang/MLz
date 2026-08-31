@@ -612,3 +612,21 @@ Sisa kerja lanjutan (di luar Phase 10): streaming SSE/sampling non-greedy pada s
   - streaming: 7 SSE chunks + `data: [DONE]` diterima.
 - Skrip smoke: `smoke_residency_endpoint.ps1` (lokal, tidak dibutuhkan CI).
 - Sisa (di luar scope ini): chat template/messages input, per-request budget override, multi-request concurrency >1, SIMD per-op pada orchestration, integrasi backend GGML resmi.
+
+### Status lanjutan: chat `messages` input pada residency endpoint — selesai
+
+- `ResidencyService.applyChatTemplate()`: merender `messages` melalui jinja
+  chat template bawaan model (`llama_model_chat_template` +
+  `mlz_render_chat_template`, add_generation_prompt=true) lalu men-tokenisasi
+  hasilnya dengan special tokens aktif — template output dapat memuat control
+  token seperti `<|eot_id|>`.
+- Endpoint `POST /v1/residency/completions` kini menerima `messages` (array
+  `{role, content}`, dirender via chat template) atau `prompt` (raw text);
+  keduanya divalidasi (400 untuk bentuk yang salah/kosong).
+- Smoke test end-to-end (Llama-3.2-1B, budget 8 MiB):
+  - raw prompt: 5 prompt tokens, output koheren, budget invariant terjaga;
+  - `messages` chat: 156 prompt tokens (template dirender penuh), output
+    dihasilkan, peak map 8.388.592/8.388.608 byte;
+  - streaming SSE tetap PASS.
+- Verifikasi: `zig build` + `zig build test -Dsimd-backend=false` PASS;
+  smoke script diperluas dengan kasus chat (`PASS chat messages`).
