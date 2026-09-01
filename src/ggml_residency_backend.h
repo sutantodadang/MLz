@@ -23,6 +23,8 @@ struct mlz_ggml_residency_stats {
     uint64_t node_post_calls;
     uint64_t current_active_nodes;
     uint64_t peak_active_nodes;
+    uint64_t residency_acquires;
+    uint64_t residency_releases;
 };
 
 // Host-compatible buffer type selected through
@@ -45,6 +47,42 @@ void mlz_ggml_residency_set_node_hooks_enabled(bool enabled);
 bool mlz_ggml_residency_node_hooks_enabled(void);
 void mlz_ggml_residency_node_pre(struct ggml_tensor * node);
 void mlz_ggml_residency_node_post(struct ggml_tensor * node);
+
+/* ---- File-backed residency mode (buffer bytes live in the GGUF file) ---- */
+
+/* Bridge callbacks, implemented by the Zig residency layer:
+ *   acquire: map the tensor's GGUF span; returns the mapped address (NULL on
+ *            failure, e.g. when the span exceeds the residency budget).
+ *   release: unmap/release the pinned view for this source id; returns false
+ *            when the id has no matching open view.
+ *   span:    resolve a tensor name to its GGUF file span. Returns false when
+ *            the model has no such tensor. */
+typedef void * (*mlz_ggml_residency_acquire_fn)(uint32_t source_id, uint64_t file_offset, size_t byte_len);
+typedef bool (*mlz_ggml_residency_release_fn)(uint32_t source_id);
+typedef bool (*mlz_ggml_residency_span_fn)(const char * tensor_name, uint64_t * file_offset, size_t * byte_len);
+
+void mlz_ggml_residency_set_bridge(
+        mlz_ggml_residency_acquire_fn acquire,
+        mlz_ggml_residency_release_fn release,
+        mlz_ggml_residency_span_fn span);
+
+/* Backed mode switches how set_tensor behaves: instead of copying weight
+ * bytes into the buffer, it registers the tensor's GGUF span and keeps
+ * tensor->data pointing at reserved (inaccessible) address space. Must be set
+ * before model load. */
+void mlz_ggml_residency_set_backed_mode(bool enabled);
+bool mlz_ggml_residency_backed_mode(void);
+
+/* Clears the source-span registry and residency acquire/release counters.
+ * Call between model runs, never while a backed buffer or graph is alive. */
+void mlz_ggml_residency_registry_reset(void);
+
+/* Number of spans registered so far; source ids are 1-based indices. */
+size_t mlz_ggml_residency_registry_count(void);
+
+/* Returns the span registered at 1-based `index`. */
+bool mlz_ggml_residency_registry_span(
+        size_t index, uint64_t * file_offset, size_t * byte_len);
 
 #ifdef __cplusplus
 }

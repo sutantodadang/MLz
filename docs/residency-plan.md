@@ -31,13 +31,13 @@ Membuktikan bahwa MLz dapat mengakses tensor/model dari backing file dengan acti
 | 6. End-to-end memory proof | Selesai | CPU execution adapter dengan bounded pin lifetime, full token path (embedding, seluruh decoder blocks, output norm, LM head), prompt prefill, incremental append/KV reuse, CLI budget, RSS instrumentation, dan llama.cpp reference tersedia | Resident-vs-bounded logits identik; prefill-vs-incremental identik; llama.cpp reference berada dalam toleransi numerik dan top-1 sama pada Llama 3.2 1B nyata |
 | 7. Concurrency/prefetch | Selesai | Thread-safe manager, bounded fixed-worker prefetch scheduler, sync page prefault, adaptive budget-aware tile policy, configurable replacement, dan long token-loop benchmark | Concurrent acquire/release menjaga invariant budget; queue menerapkan backpressure; prefetched acquire menjadi hit; adaptive tiles identik dan mengurangi faults; tuning tidak diklaim lebih cepat bila benchmark tidak mendukung |
 | 8. Batched prefill & execution proof | Selesai | Batched F32/quantized projection, layer-major causal Llama prefill, prompt 128/512 benchmark, same-window shared-manager executor stress, dan bounded Qwen3-Next Q2_K projection probe | Prefill identik dengan incremental; one-scan projection reuse mengurangi faults; prompt tetap dalam weight budget; Qwen probe tidak mengklaim graph DeltaNet/MoE penuh |
-| 11. Official GGML backend bridge | Milestone 2 selesai (node-hook boundary; pin-per-model, belum bounded) | Host-compatible `MLzResidency` buffer plus opt-in synchronized native per-node pre/post hooks; build-time patch menjaga vendored GGML tetap utuh | Custom backend tetap menjalankan stock kernels; pre/post nonzero dan seimbang, active kembali nol, logits tidak berubah saat CPU_REPACK off |
+| 11. Official GGML backend bridge | Milestone 3 selesai (bounded file-backed node residency) | `MLzResidency` buffer memakai reserved identity space; native node hooks acquire/rebase/release GGUF mappings melalui `residency.Manager`; stock GGML kernels tetap dipakai | Upload weight nol; acquire/release seimbang; peak mapping ≤ budget; logits bit-identik saat CPU_REPACK off; 762.81 MiB model tervalidasi pada budget 220 MiB |
 
-> Detail integrasi dan batas pin-per-model saat ini: [Official GGML Residency Backend Integration](ggml-residency-backend.md).
-> Milestone 2 hanya menyelesaikan boundary sinkron per-node dan instrumentasi;
-> callback belum terhubung ke descriptor/backing mapping. Heap model custom
-> masih dialokasikan penuh dan belum bounded. Langkah berikutnya adalah
-> menghubungkan pre/post ke acquire/release mapping residency.
+> Detail integrasi, validation command, dan minimum-budget constraint: [Official GGML Residency Backend Integration](ggml-residency-backend.md).
+> Milestone 3 sudah menghubungkan pre/post node hook ke descriptor GGUF dan
+> bounded mapping. Stock contiguous kernels masih mensyaratkan budget cukup
+> untuk source terbesar/node union; langkah berikutnya adalah tiled native
+> `MUL_MAT` untuk menjalankan tensor yang lebih besar daripada budget.
 
 ## Implemented API
 

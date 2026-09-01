@@ -1,45 +1,43 @@
 # Official GGML Residency Backend Integration
 
-MLz now ships a host-compatible `ggml_backend_buffer_type_t` that can be
-selected through llama.cpp's official `llama_model_params.tensor_buft_overrides`
-API. Milestone 2 adds an opt-in synchronized per-node boundary around the
-native GGML CPU graph runner, while retaining the Milestone 1 custom host
-buffer. It still does **not** provide bounded model residency.
+MLz provides a host-compatible `ggml_backend_buffer_type_t` selected through
+llama.cpp's official `llama_model_params.tensor_buft_overrides` API. The current
+milestone connects that buffer to the bounded file-backed residency manager and
+the synchronized native GGML CPU node boundary.
 
-## What this milestone proves
+## Execution model
 
-With the override enabled:
+In file-backed mode:
 
-- llama.cpp creates model tensors in the `MLzResidency` buffer type;
-- model loading reaches the custom buffer through `set_tensor`;
-- the standard GGML CPU scheduler accepts it as ordinary host memory;
-- inference executes the original llama.cpp graph and stock GGML CPU kernels;
-- with `-Dggml-residency-hooks=true`, thread 0 invokes balanced pre/post hooks
-  around each compute node, with barriers before compute, before post, and
-  before publication to the next node;
-- fusion is disabled only while hooks are enabled, so each callback corresponds
-  to one stock node; the disabled/dormant path retains upstream fusion and its
-  original barrier behavior;
-- no model graph or arithmetic is reimplemented by the validator.
+1. llama.cpp builds its ordinary model graph and places model tensors in the
+   `MLzResidency` buffer type.
+2. The buffer reserves inaccessible virtual address space for stable tensor
+   identity pointers; it does not commit or upload model bytes.
+3. During model load, `set_tensor` resolves each tensor name to its GGUF file
+   offset and records the source span.
+4. Before a CPU graph node runs, GGML thread 0 acquires every backed source via
+   `residency.Manager`, pins the mappings, and rebases `tensor->data`.
+5. A thread-pool barrier publishes those pointers. The unmodified stock GGML
+   kernel executes against the mapped GGUF bytes.
+6. After all workers finish, thread 0 restores the reserved identity pointers
+   and releases the pins. LRU may then evict those mappings.
+
+Fusion is disabled only while the residency hooks are enabled so that each
+pre/post callback corresponds to one stock node. Ordinary builds retain the
+upstream fused execution path.
 
 The implementation lives in:
 
 - `src/ggml_residency_backend.h`
 - `src/ggml_residency_backend.c`
-- `src/patch_ggml_residency.zig` (build-time patcher; vendored sources remain untouched)
+- `src/residency_ggml_bridge.zig`
+- `src/patch_ggml_residency.zig`
 - `src/residency_llama_reference.zig`
 - `src/validate_ggml_backend.zig`
 
-The backend is compiled into the GGML static library, uses platform-appropriate
-aligned allocation (`_aligned_malloc`/`_aligned_free` on Windows and
-`posix_memalign`/`free` on POSIX), and validates tensor/buffer bounds for all
-copy callbacks. Statistics are process-global atomics; reset clears interval
-counters while preserving the live allocation gauge, so freeing a pre-existing
-buffer cannot underflow accounting.
-
 ## Validation
 
-Run with CPU repack disabled for a strict bit-identical comparison:
+Build hooks and disable CPU repack for a strict bit-identical comparison:
 
 ```sh
 zig build validate-ggml-backend \
@@ -47,65 +45,70 @@ zig build validate-ggml-backend \
   -Dsimd-backend=false \
   -Dggml-residency-hooks=true \
   -Dcpu-repack=false -- \
-  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1 220
 ```
 
-Observed on the real 762.81 MiB Llama model:
+The third positional argument enables file-backed mode and specifies the mapped
+weight budget in MiB.
+
+Observed on the 762.81 MiB Llama-3.2-1B Q4_K_M model:
 
 ```text
-logits: exact=true, max-error=0, argmax=11/11
-backend buffers: allocated=1, tensors=147, uploads=147
-uploaded=762.81 MiB
+logits: exact=true, max-error=0, mean-error=0, argmax=11/11
+uploads=147, uploaded=0.00 MiB
+node hooks: pre=358, post=358, active=0, peak-active=1
+residency: budget=220.00 MiB, peak-resident=219.80 MiB
+           faults=148, hits=31, evictions=145
 ```
 
-With the default CPU repack build, the ordinary reference uses CPU_REPACK while
-the custom override is not a CPU_REPACK buffer type and therefore retains
-canonical CPU layout. That changes packed layouts and reduction kernels; it is
-not evidence of a faulty copy or a bounded-residency approximation. The
-validator accepts exact results immediately, otherwise requires finite logits,
-max error <= 0.1, mean error <= 0.02, and identical top-1. The observed result
-was max error 0.080871, mean error 0.013434, top-1 11/11.
+The backend allocation statistic still reports 762.81 MiB because it measures
+the logical GGML buffer/virtual address reservation. In backed mode those pages
+are `MEM_RESERVE/PAGE_NOACCESS` on Windows or `PROT_NONE` on POSIX and are not a
+762.81 MiB committed weight upload. `uploaded=0` plus the residency manager's
+`peak_resident_bytes` are the relevant physical mapping gates.
 
-The validator requires hook availability, nonzero and balanced pre/post counts,
-a zero final active-node gauge, and peak active nodes of at least one. It first
-runs the ordinary reference with hooks disabled, then enables hooks only for the
-custom sequence. Builds without the option retain the API but report
-`NodeHooksUnavailable`. `ggml-residency-hooks` and `simd-backend` are currently
-mutually exclusive because both alter the same upstream source.
+The legacy heap-upload mode remains available by omitting the budget argument.
+It is used as a compatibility/control path and still uploads the complete
+model.
 
-## Current limitation: allocation is still pin-per-model
+## Correctness and safety invariants
 
-This milestone intentionally allocates the complete packed model buffer and
-keeps every weight pointer stable for the model lifetime. It proves official
-backend selection and native graph execution, but does **not yet enforce the
-bounded mapping budget**. On the 762.81 MiB test model, peak custom-buffer
-allocation is 762.81 MiB.
+The validator requires:
 
-This is not something buffer callbacks alone can fix: stock CPU kernels directly
-dereference `ggml_tensor.data`; `get_tensor` is a host-copy API, not a compute
-fault callback. Replacing `tensor.data` after graph construction is unsafe
-without synchronizing every graph worker.
+- finite logits and exact equality when CPU repack is disabled;
+- nonzero, balanced node pre/post calls and a zero final active-node gauge;
+- zero uploaded weight bytes in backed mode;
+- balanced residency acquires/releases;
+- manager peak mapped bytes no greater than the requested budget;
+- use of the custom buffer type for all model tensors.
 
-## Next step: connect hooks to node-lifetime pinning
+The C backend records each node pin explicitly by tensor, source ID, and
+reserved identity offset. This allows tied/shared sources and GGML views to be
+restored correctly. Reserved address space intentionally faults if a stock
+kernel accesses a backed weight outside the synchronized node lifetime.
 
-The synchronized native boundary is now complete, but callbacks only instrument
-execution. The next integration stage must connect them to backing descriptors
-and bounded residency mappings:
+## Minimum budget and current limitation
 
-1. Before a node runs, thread 0 resolves its weight sources to GGUF descriptors,
-   acquires the required residency windows, and assigns stable data pointers.
-2. A threadpool barrier publishes those pointers to every GGML worker.
-3. The stock GGML op executes unchanged.
-4. After all workers finish the node, thread 0 releases the views; only then may
-   LRU eviction occur.
+Stock GGML CPU kernels dereference a contiguous `tensor->data` span. Therefore
+the budget must fit the union of backed source tensors required by one node and,
+at minimum, the largest individual source tensor.
 
-A whole tensor larger than the budget cannot use ordinary stock GGML kernels,
-because they expect contiguous `tensor.data`. Such tensors still require one of:
+For the validated model, `token_embd.weight` is approximately 205.49 MiB:
 
-- the existing MLz tiled executor;
-- an op-specific tiled CPU hook;
-- a budget at least as large as the largest tensor used by one node.
+- 220 MiB succeeds and remains bounded;
+- 200 MiB fails deterministically with `BudgetExceeded` before that tensor can
+  be mapped.
 
-Therefore the immediate backend target is **bounded per-node residency** with a
-well-defined minimum budget, followed by per-op tiled hooks for tensors larger
-than that budget.
+Running below this minimum requires an op-specific tiled GGML hook (especially
+for `MUL_MAT`) or the existing MLz tiled executor. The next backend milestone is
+tiled native `MUL_MAT`, which would acquire row/block windows rather than the
+entire weight tensor while preserving canonical GGML dot-product kernels.
+
+Other current limitations:
+
+- CPU host backend only; no CUDA/Metal/Vulkan residency bridge yet;
+- one active bridge/model instance per process;
+- `ggml-residency-hooks` and the custom SIMD source patch are mutually exclusive
+  because both currently rewrite the same vendored `ggml-cpu.c` at build time;
+- default CPU_REPACK uses a different packed layout/kernel than this arbitrary
+  host buffer, so strict bit equality is validated with `-Dcpu-repack=false`.
