@@ -2,8 +2,9 @@
 
 MLz now ships a host-compatible `ggml_backend_buffer_type_t` that can be
 selected through llama.cpp's official `llama_model_params.tensor_buft_overrides`
-API. This is the first integration milestone between bounded-residency work and
-the native llama.cpp/GGML graph runner.
+API. Milestone 2 adds an opt-in synchronized per-node boundary around the
+native GGML CPU graph runner, while retaining the Milestone 1 custom host
+buffer. It still does **not** provide bounded model residency.
 
 ## What this milestone proves
 
@@ -13,12 +14,19 @@ With the override enabled:
 - model loading reaches the custom buffer through `set_tensor`;
 - the standard GGML CPU scheduler accepts it as ordinary host memory;
 - inference executes the original llama.cpp graph and stock GGML CPU kernels;
+- with `-Dggml-residency-hooks=true`, thread 0 invokes balanced pre/post hooks
+  around each compute node, with barriers before compute, before post, and
+  before publication to the next node;
+- fusion is disabled only while hooks are enabled, so each callback corresponds
+  to one stock node; the disabled/dormant path retains upstream fusion and its
+  original barrier behavior;
 - no model graph or arithmetic is reimplemented by the validator.
 
 The implementation lives in:
 
 - `src/ggml_residency_backend.h`
 - `src/ggml_residency_backend.c`
+- `src/patch_ggml_residency.zig` (build-time patcher; vendored sources remain untouched)
 - `src/residency_llama_reference.zig`
 - `src/validate_ggml_backend.zig`
 
@@ -37,6 +45,7 @@ Run with CPU repack disabled for a strict bit-identical comparison:
 zig build validate-ggml-backend \
   -Doptimize=ReleaseFast \
   -Dsimd-backend=false \
+  -Dggml-residency-hooks=true \
   -Dcpu-repack=false -- \
   models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1
 ```
@@ -57,6 +66,13 @@ validator accepts exact results immediately, otherwise requires finite logits,
 max error <= 0.1, mean error <= 0.02, and identical top-1. The observed result
 was max error 0.080871, mean error 0.013434, top-1 11/11.
 
+The validator requires hook availability, nonzero and balanced pre/post counts,
+a zero final active-node gauge, and peak active nodes of at least one. It first
+runs the ordinary reference with hooks disabled, then enables hooks only for the
+custom sequence. Builds without the option retain the API but report
+`NodeHooksUnavailable`. `ggml-residency-hooks` and `simd-backend` are currently
+mutually exclusive because both alter the same upstream source.
+
 ## Current limitation: allocation is still pin-per-model
 
 This milestone intentionally allocates the complete packed model buffer and
@@ -70,10 +86,11 @@ dereference `ggml_tensor.data`; `get_tensor` is a host-copy API, not a compute
 fault callback. Replacing `tensor.data` after graph construction is unsafe
 without synchronizing every graph worker.
 
-## Next step: node-lifetime pinning
+## Next step: connect hooks to node-lifetime pinning
 
-The next integration stage must add an execution-lifetime boundary around the
-native CPU graph:
+The synchronized native boundary is now complete, but callbacks only instrument
+execution. The next integration stage must connect them to backing descriptors
+and bounded residency mappings:
 
 1. Before a node runs, thread 0 resolves its weight sources to GGUF descriptors,
    acquires the required residency windows, and assigns stable data pointers.
@@ -81,7 +98,6 @@ native CPU graph:
 3. The stock GGML op executes unchanged.
 4. After all workers finish the node, thread 0 releases the views; only then may
    LRU eviction occur.
-5. Fused nodes need the union of all source weights in the fused group.
 
 A whole tensor larger than the budget cannot use ordinary stock GGML kernels,
 because they expect contiguous `tensor.data`. Such tensors still require one of:

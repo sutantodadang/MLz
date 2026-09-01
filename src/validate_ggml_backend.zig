@@ -20,6 +20,10 @@ pub fn main() !void {
     const path_z = try llama.dupeZ(allocator, args[1]);
     defer allocator.free(path_z);
     llama.c.llama_log_set(silentLog, null);
+    llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
+    if (!llama.c.mlz_ggml_residency_node_hooks_available()) {
+        return error.NodeHooksUnavailable;
+    }
     const token = if (args.len == 3)
         try std.fmt.parseInt(usize, args[2], 10)
     else
@@ -44,6 +48,8 @@ pub fn main() !void {
         ordinary_logits,
         residency.currentRss,
     );
+    llama.c.mlz_ggml_residency_set_node_hooks_enabled(true);
+    defer llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
     const custom = try reference.sequenceLogitsGgmlBackend(
         path_z,
         &tokens,
@@ -79,6 +85,7 @@ pub fn main() !void {
         \\  logits: exact={any}, max-error={d:.9}, mean-error={d:.9}, argmax={d}/{d}
         \\  backend buffers: allocated={d}, tensors={d}, uploads={d}, uploaded={d:.2} MiB
         \\  backend allocation: current={d:.2} MiB, peak={d:.2} MiB
+        \\  node hooks: pre={d}, post={d}, active={d}, peak-active={d}
         \\
     , .{
         args[1],
@@ -99,6 +106,10 @@ pub fn main() !void {
         mib(stats.uploaded_bytes),
         mib(stats.current_allocated_bytes),
         mib(stats.peak_allocated_bytes),
+        stats.node_pre_calls,
+        stats.node_post_calls,
+        stats.current_active_nodes,
+        stats.peak_active_nodes,
     });
 
     // CPU_REPACK uses a different packed layout/reduction kernel than the
@@ -107,6 +118,12 @@ pub fn main() !void {
     // conservative numerical/top-1 gate used by the native reference path.
     if (!exact and !numerically_close) {
         return error.LogitMismatch;
+    }
+    if (stats.node_pre_calls == 0 or
+        stats.node_pre_calls != stats.node_post_calls or
+        stats.current_active_nodes != 0 or stats.peak_active_nodes < 1)
+    {
+        return error.NodeHookImbalance;
     }
     if (stats.buffers_allocated == 0 or stats.tensors_initialized == 0 or
         stats.tensor_uploads == 0 or stats.uploaded_bytes == 0 or

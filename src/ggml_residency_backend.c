@@ -36,15 +36,23 @@ static atomic_uint_fast64_t g_tensor_uploads;
 static atomic_uint_fast64_t g_uploaded_bytes;
 static atomic_uint_fast64_t g_current_allocated_bytes;
 static atomic_uint_fast64_t g_peak_allocated_bytes;
+static atomic_bool g_node_hooks_enabled;
+static atomic_uint_fast64_t g_node_pre_calls;
+static atomic_uint_fast64_t g_node_post_calls;
+static atomic_uint_fast64_t g_current_active_nodes;
+static atomic_uint_fast64_t g_peak_active_nodes;
 
-static void mlz_update_peak(uint_fast64_t current) {
-    uint_fast64_t peak = atomic_load_explicit(
-        &g_peak_allocated_bytes, memory_order_relaxed);
+static void mlz_update_atomic_peak(atomic_uint_fast64_t * peak_counter, uint_fast64_t current) {
+    uint_fast64_t peak = atomic_load_explicit(peak_counter, memory_order_relaxed);
     while (peak < current &&
            !atomic_compare_exchange_weak_explicit(
-               &g_peak_allocated_bytes, &peak, current,
+               peak_counter, &peak, current,
                memory_order_relaxed, memory_order_relaxed)) {
     }
+}
+
+static void mlz_update_peak(uint_fast64_t current) {
+    mlz_update_atomic_peak(&g_peak_allocated_bytes, current);
 }
 
 static void * mlz_aligned_alloc(size_t alignment, size_t size) {
@@ -335,12 +343,23 @@ void mlz_ggml_residency_reset_stats(void) {
     atomic_store_explicit(&g_tensors_initialized, 0, memory_order_relaxed);
     atomic_store_explicit(&g_tensor_uploads, 0, memory_order_relaxed);
     atomic_store_explicit(&g_uploaded_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_node_pre_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_node_post_calls, 0, memory_order_relaxed);
 
-    // current_allocated_bytes is a live gauge, not an interval counter. Keep it
-    // intact so resetting while buffers exist cannot underflow it on free.
+    // Live gauges are not interval counters. Preserve them so a reset during
+    // allocation or node execution cannot make a later decrement underflow.
     const uint_fast64_t current = atomic_load_explicit(
         &g_current_allocated_bytes, memory_order_relaxed);
     atomic_store_explicit(&g_peak_allocated_bytes, current, memory_order_relaxed);
+    mlz_update_atomic_peak(
+        &g_peak_allocated_bytes,
+        atomic_load_explicit(&g_current_allocated_bytes, memory_order_relaxed));
+    const uint_fast64_t active = atomic_load_explicit(
+        &g_current_active_nodes, memory_order_relaxed);
+    atomic_store_explicit(&g_peak_active_nodes, active, memory_order_relaxed);
+    mlz_update_atomic_peak(
+        &g_peak_active_nodes,
+        atomic_load_explicit(&g_current_active_nodes, memory_order_relaxed));
 }
 
 struct mlz_ggml_residency_stats mlz_ggml_residency_get_stats(void) {
@@ -352,5 +371,59 @@ struct mlz_ggml_residency_stats mlz_ggml_residency_get_stats(void) {
     stats.uploaded_bytes = atomic_load_explicit(&g_uploaded_bytes, memory_order_relaxed);
     stats.current_allocated_bytes = atomic_load_explicit(&g_current_allocated_bytes, memory_order_relaxed);
     stats.peak_allocated_bytes = atomic_load_explicit(&g_peak_allocated_bytes, memory_order_relaxed);
+    stats.node_pre_calls = atomic_load_explicit(&g_node_pre_calls, memory_order_relaxed);
+    stats.node_post_calls = atomic_load_explicit(&g_node_post_calls, memory_order_relaxed);
+    stats.current_active_nodes = atomic_load_explicit(&g_current_active_nodes, memory_order_relaxed);
+    stats.peak_active_nodes = atomic_load_explicit(&g_peak_active_nodes, memory_order_relaxed);
     return stats;
+}
+
+bool mlz_ggml_residency_node_hooks_available(void) {
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    return true;
+#else
+    return false;
+#endif
+}
+
+void mlz_ggml_residency_set_node_hooks_enabled(bool enabled) {
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    atomic_store_explicit(&g_node_hooks_enabled, enabled, memory_order_release);
+#else
+    (void) enabled;
+#endif
+}
+
+bool mlz_ggml_residency_node_hooks_enabled(void) {
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    // A graph samples the switch once so all workers follow the same barrier
+    // protocol even if another thread requests disable while it is running.
+    return atomic_load_explicit(&g_node_hooks_enabled, memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+void mlz_ggml_residency_node_pre(struct ggml_tensor * node) {
+    (void) node;
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    atomic_fetch_add_explicit(&g_node_pre_calls, 1, memory_order_relaxed);
+    const uint_fast64_t active = atomic_fetch_add_explicit(
+        &g_current_active_nodes, 1, memory_order_relaxed) + 1;
+    mlz_update_atomic_peak(&g_peak_active_nodes, active);
+#endif
+}
+
+void mlz_ggml_residency_node_post(struct ggml_tensor * node) {
+    (void) node;
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    atomic_fetch_add_explicit(&g_node_post_calls, 1, memory_order_relaxed);
+    uint_fast64_t active = atomic_load_explicit(
+        &g_current_active_nodes, memory_order_relaxed);
+    while (active != 0 &&
+           !atomic_compare_exchange_weak_explicit(
+               &g_current_active_nodes, &active, active - 1,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+#endif
 }

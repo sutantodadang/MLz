@@ -149,6 +149,14 @@ pub fn build(b: *std.Build) void {
     // tokens/sec improvement on local CPU inference. On by default; disable
     // with -Dcpu-repack=false if a target lacks support.
     const use_cpu_repack = b.option(bool, "cpu-repack", "Enable llama.cpp CPU repack accelerator (~2x perf)") orelse true;
+    const use_simd_backend = b.option(bool, "simd-backend", "Use custom SIMD backend for F32 matrix multiplication (x86_64 and aarch64)") orelse false;
+    const use_ggml_residency_hooks = b.option(bool, "ggml-residency-hooks", "Enable synchronized MLz hooks around each GGML CPU node") orelse false;
+    if (use_simd_backend and use_ggml_residency_hooks) {
+        @panic("-Dsimd-backend=true and -Dggml-residency-hooks=true are mutually exclusive");
+    }
+    if (use_ggml_residency_hooks) {
+        c_flags.append(b.allocator, "-DGGML_USE_MLZ_RESIDENCY_HOOKS") catch @panic("OOM");
+    }
     if (use_cpu_repack) {
         c_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
         cpp_flags.append(b.allocator, "-DGGML_USE_CPU_REPACK") catch @panic("OOM");
@@ -242,14 +250,22 @@ pub fn build(b: *std.Build) void {
         .flags = c_flags.items,
     });
 
-    // CPU backend (linked statically into ggml when GGML_BACKEND_DL is off)
-    // When simd-backend is enabled, we use a patched version of ggml-cpu.c
-    // that calls our custom SIMD kernels before the default implementation
-    const use_simd_backend = b.option(bool, "simd-backend", "Use custom SIMD backend for F32 matrix multiplication (x86_64 and aarch64)") orelse false;
-
-    // The SIMD backend uses a patched version of ggml-cpu.c with hook call inserted.
-    // When disabled, use the original from llama.cpp dependency.
-    const ggml_cpu_c_source = if (use_simd_backend and (actual_target.result.cpu.arch == .x86_64 or actual_target.result.cpu.arch == .aarch64))
+    // CPU backend (linked statically into ggml when GGML_BACKEND_DL is off).
+    // Residency hooks patch the exact vendored source at build time; no forked
+    // copy is kept in the repository.
+    const ggml_cpu_c_source = if (use_ggml_residency_hooks) blk: {
+        const patcher = b.addExecutable(.{
+            .name = "patch-ggml-residency",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/patch_ggml_residency.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const run_patcher = b.addRunArtifact(patcher);
+        run_patcher.addFileArg(llama_cpp_dep.path("ggml/src/ggml-cpu/ggml-cpu.c"));
+        break :blk run_patcher.addOutputFileArg("ggml-cpu-residency.c");
+    } else if (use_simd_backend and (actual_target.result.cpu.arch == .x86_64 or actual_target.result.cpu.arch == .aarch64))
         b.path("src/simd/ggml-cpu-simd.c")
     else
         llama_cpp_dep.path("ggml/src/ggml-cpu/ggml-cpu.c");
