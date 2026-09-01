@@ -31,6 +31,13 @@ Membuktikan bahwa MLz dapat mengakses tensor/model dari backing file dengan acti
 | 6. End-to-end memory proof | Selesai | CPU execution adapter dengan bounded pin lifetime, full token path (embedding, seluruh decoder blocks, output norm, LM head), prompt prefill, incremental append/KV reuse, CLI budget, RSS instrumentation, dan llama.cpp reference tersedia | Resident-vs-bounded logits identik; prefill-vs-incremental identik; llama.cpp reference berada dalam toleransi numerik dan top-1 sama pada Llama 3.2 1B nyata |
 | 7. Concurrency/prefetch | Selesai | Thread-safe manager, bounded fixed-worker prefetch scheduler, sync page prefault, adaptive budget-aware tile policy, configurable replacement, dan long token-loop benchmark | Concurrent acquire/release menjaga invariant budget; queue menerapkan backpressure; prefetched acquire menjadi hit; adaptive tiles identik dan mengurangi faults; tuning tidak diklaim lebih cepat bila benchmark tidak mendukung |
 | 8. Batched prefill & execution proof | Selesai | Batched F32/quantized projection, layer-major causal Llama prefill, prompt 128/512 benchmark, same-window shared-manager executor stress, dan bounded Qwen3-Next Q2_K projection probe | Prefill identik dengan incremental; one-scan projection reuse mengurangi faults; prompt tetap dalam weight budget; Qwen probe tidak mengklaim graph DeltaNet/MoE penuh |
+| 11. Official GGML backend bridge | Milestone 1 selesai (pin-per-model, belum bounded) | Host-compatible `MLzResidency` buffer type dipilih lewat `tensor_buft_overrides`; native llama.cpp graph dan stock GGML CPU kernels berjalan di atas buffer tersebut | 147 tensor real-model dialokasikan/upload melalui custom backend; logits bit-identik saat CPU_REPACK off; default repack tetap top-1 sama dalam tolerance |
+
+> Detail integrasi dan batas pin-per-model saat ini: [Official GGML Residency Backend Integration](ggml-residency-backend.md).
+> Milestone ini belum menghubungkan `Manager` bounded ke lifetime node GGML dan
+> tidak membatasi alokasi model custom buffer. Perbedaan logits pada build
+> CPU_REPACK default berasal dari packed layout/reduction kernel berbeda;
+> `-Dcpu-repack=false` telah terbukti bit-identik.
 
 ## Implemented API
 

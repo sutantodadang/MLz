@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const c = @cImport({
     @cInclude("llama.h");
+    @cInclude("ggml_residency_backend.h");
 });
 
 pub const Token = c.llama_token;

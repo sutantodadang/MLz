@@ -87,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    mod.addIncludePath(llama_cpp_dep.path("ggml/src"));
     mod.addCSourceFile(.{
         .file = b.path("src/residency_mmap.c"),
         .flags = &.{"-std=c11"},
@@ -232,6 +233,13 @@ pub fn build(b: *std.Build) void {
     ggml_lib.addCSourceFile(.{
         .file = llama_cpp_dep.path("ggml/src/ggml-threading.cpp"),
         .flags = cpp_flags.items,
+    });
+    // MLz host-compatible buffer type used by llama tensor_buft_overrides.
+    // It is linked into GGML so every executable can opt into native graph
+    // execution over the same custom buffer implementation.
+    ggml_lib.addCSourceFile(.{
+        .file = b.path("src/ggml_residency_backend.c"),
+        .flags = c_flags.items,
     });
 
     // CPU backend (linked statically into ggml when GGML_BACKEND_DL is off)
@@ -1972,6 +1980,38 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| validate_residency_run.addArgs(args);
     const validate_residency_step = b.step("validate-residency", "Validate bounded compute against a real GGUF model");
     validate_residency_step.dependOn(&validate_residency_run.step);
+
+    // Official GGML buffer-backend integration validator. It runs the native
+    // llama.cpp CPU graph twice (ordinary CPU buffers vs MLz's host-compatible
+    // tensor_buft_override) and accepts exact logits, or the documented tight
+    // numerical/top-1 gate when CPU_REPACK selects a different packed kernel.
+    const validate_ggml_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/validate_ggml_backend.zig"),
+        .target = actual_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    validate_ggml_backend_module.addIncludePath(b.path("src"));
+    validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("include"));
+    validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
+    validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("ggml/src"));
+    validate_ggml_backend_module.addCSourceFile(.{
+        .file = b.path("src/residency_mmap.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const validate_ggml_backend_exe = b.addExecutable(.{
+        .name = "validate_ggml_backend",
+        .root_module = validate_ggml_backend_module,
+    });
+    validate_ggml_backend_exe.linkLibrary(ggml_lib);
+    validate_ggml_backend_exe.linkLibrary(llama_lib);
+    const validate_ggml_backend_run = b.addRunArtifact(validate_ggml_backend_exe);
+    if (b.args) |args| validate_ggml_backend_run.addArgs(args);
+    const validate_ggml_backend_step = b.step(
+        "validate-ggml-backend",
+        "Validate native GGML graph execution over the MLz buffer backend",
+    );
+    validate_ggml_backend_step.dependOn(&validate_ggml_backend_run.step);
 
     // Opt-in bounded-residency completion service smoke run. Example:
     // zig build residency-serve -- models/model.gguf "Prompt" [budget-mib] [max-tokens]
