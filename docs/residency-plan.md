@@ -604,7 +604,18 @@ Sisa Phase 10 (selesai):
 3. Qwen chunked prompt kernel — modelPrefillChunked bit-identik dengan incremental (max-error=0, faults 77.256 → 64.453 pada 2 token, 27 GiB nyata).
 4. Bit-exact parallel DeltaNet pool (opt-in, value-head partition, MLZ_QWEN_PARALLEL) — checksum identik scalar pada full 48-layer model nyata; tetap opt-in karena MoE dominan, bukan recurrence.
 
-Sisa kerja lanjutan (di luar Phase 10): streaming SSE/sampling non-greedy pada service, endpoint HTTP, SIMD per-op, dan integrasi backend GGML resmi.
+Sisa kerja lanjutan di luar Phase 10 kini mencakup integrasi backend GGML resmi.
+Milestone native terbaru menjalankan stock graph/kernels GGML terhadap bounded
+GGUF mappings, termasuk row-tiled `MUL_MAT`, selected-expert `MUL_MAT_ID`, dan
+row-envelope `GET_ROWS`. Strict `cpu-repack=false` validation pada budget 4 MiB:
+
+- Llama-3.2-1B Q4_K_M (762.81 MiB): logits exact, argmax 11/11,
+  peak mapped 4.00 MiB, faults/evictions 319/318, uploaded weight 0 byte;
+- Qwen3-Coder-Next Q2_K (27.2 GiB): logits exact, argmax 3830/3830,
+  peak mapped 4.00 MiB, faults/evictions 2332/2331, uploaded weight 0 byte,
+  dan routed MoE tetap memakai canonical stock GGML `MUL_MAT_ID`.
+
+Detail dan limitation ada di `docs/ggml-residency-backend.md`.
 
 ### Status lanjutan: HTTP endpoint untuk bounded-residency completion - selesai
 

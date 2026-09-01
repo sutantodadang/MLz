@@ -56,15 +56,29 @@ void mlz_ggml_residency_node_post(struct ggml_tensor * node);
  *   release: unmap/release the pinned view for this source id; returns false
  *            when the id has no matching open view.
  *   span:    resolve a tensor name to its GGUF file span. Returns false when
- *            the model has no such tensor. */
+ *            the model has no such tensor.
+ *   acquire_range/range_capacity: map and size a tensor-relative subrange for
+ *            synchronized native kernel tiling. */
 typedef void * (*mlz_ggml_residency_acquire_fn)(uint32_t source_id, uint64_t file_offset, size_t byte_len);
 typedef bool (*mlz_ggml_residency_release_fn)(uint32_t source_id);
 typedef bool (*mlz_ggml_residency_span_fn)(const char * tensor_name, uint64_t * file_offset, size_t * byte_len);
+typedef void * (*mlz_ggml_residency_acquire_range_fn)(uint32_t source_id, size_t tensor_offset, size_t byte_len);
+typedef size_t (*mlz_ggml_residency_range_capacity_fn)(uint32_t source_id, size_t tensor_offset);
 
 void mlz_ggml_residency_set_bridge(
         mlz_ggml_residency_acquire_fn acquire,
         mlz_ggml_residency_release_fn release,
-        mlz_ggml_residency_span_fn span);
+        mlz_ggml_residency_span_fn span,
+        mlz_ggml_residency_acquire_range_fn acquire_range,
+        mlz_ggml_residency_range_capacity_fn range_capacity);
+
+/* Internal CPU-hook API used by the generated ggml-cpu.c integration. These
+ * functions are dormant unless backed mode and node hooks are both enabled. */
+bool mlz_ggml_residency_should_tile_mul_mat(struct ggml_tensor * node);
+bool mlz_ggml_residency_should_tile_mul_mat_id(struct ggml_tensor * node);
+size_t mlz_ggml_residency_tile_capacity(struct ggml_tensor * tensor, size_t tensor_offset);
+bool mlz_ggml_residency_tile_acquire(struct ggml_tensor * tensor, size_t tensor_offset, size_t byte_len);
+bool mlz_ggml_residency_tile_release(struct ggml_tensor * tensor);
 
 /* Backed mode switches how set_tensor behaves: instead of copying weight
  * bytes into the buffer, it registers the tensor's GGUF span and keeps

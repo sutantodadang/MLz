@@ -41,6 +41,7 @@ const Instance = struct {
     // thread 0 only, between barriers, so plain indexing is sufficient and
     // allocation-free. Indexed by (source_id - 1).
     open_views: std.ArrayList(?residency.TensorView),
+    views_mutex: std.Thread.Mutex = .{},
 };
 
 var g_instance: ?*Instance = null;
@@ -140,8 +141,6 @@ pub fn syncRegistry() Error!void {
         try instance.open_views.append(instance.allocator, null);
         errdefer _ = instance.open_views.pop();
         try instance.manager.register(descriptor.handle, file_offset, byte_len);
-        const capacity = try instance.manager.rangeCapacity(descriptor.handle, 0);
-        if (capacity < byte_len) return Error.BudgetExceeded;
     }
 }
 
@@ -154,6 +153,8 @@ pub fn acquireCallback(source_id: u32, file_offset: u64, byte_len: usize) callco
         std.debug.print("mlz bridge: acquire with no instance\n", .{});
         return null;
     };
+    instance.views_mutex.lock();
+    defer instance.views_mutex.unlock();
     if (source_id == 0 or source_id > instance.sources.items.len) {
         std.debug.print("mlz bridge: acquire bad source_id={d}\n", .{source_id});
         return null;
@@ -180,9 +181,41 @@ pub fn acquireCallback(source_id: u32, file_offset: u64, byte_len: usize) callco
     return @ptrCast(@constCast(slot.*.?.data.ptr));
 }
 
-/// Releases the view pinned for a 1-based source id. Called by the post-hook.
+/// Maps a validated logical subrange of a registered tensor. Tiled kernels
+/// reuse the same per-source slot as whole-node mapping and release it before
+/// acquiring the next tile.
+pub fn acquireRangeCallback(source_id: u32, tensor_offset: usize, byte_len: usize) callconv(.c) ?*anyopaque {
+    const instance = g_instance orelse return null;
+    instance.views_mutex.lock();
+    defer instance.views_mutex.unlock();
+    if (source_id == 0 or source_id > instance.sources.items.len or byte_len == 0) return null;
+    const source = instance.sources.items[source_id - 1];
+    if (tensor_offset > source.byte_len or byte_len > source.byte_len - tensor_offset) return null;
+
+    const slot = &instance.open_views.items[source_id - 1];
+    if (slot.* != null) return null;
+    slot.* = instance.manager.acquireRange(source.handle, tensor_offset, byte_len) catch return null;
+    return @ptrCast(@constCast(slot.*.?.data.ptr));
+}
+
+/// Reports the largest logical range starting at `tensor_offset` that can be
+/// mapped under the manager budget, or zero for an invalid source/range.
+pub fn rangeCapacityCallback(source_id: u32, tensor_offset: usize) callconv(.c) usize {
+    const instance = g_instance orelse return 0;
+    if (source_id == 0 or source_id > instance.sources.items.len) return 0;
+    const source = instance.sources.items[source_id - 1];
+    if (tensor_offset >= source.byte_len) return 0;
+    instance.views_mutex.lock();
+    defer instance.views_mutex.unlock();
+    return instance.manager.rangeCapacity(source.handle, tensor_offset) catch 0;
+}
+
+/// Releases the view pinned for a 1-based source id. Called by the post-hook
+/// for whole-node mappings and by the tiled kernel after each acquired range.
 pub fn releaseCallback(source_id: u32) callconv(.c) bool {
     const instance = g_instance orelse return false;
+    instance.views_mutex.lock();
+    defer instance.views_mutex.unlock();
     if (source_id == 0 or source_id > instance.open_views.items.len) return false;
     const slot = &instance.open_views.items[source_id - 1];
     var view = slot.* orelse return false;

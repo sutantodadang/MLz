@@ -15,12 +15,15 @@ In file-backed mode:
    identity pointers; it does not commit or upload model bytes.
 3. During model load, `set_tensor` resolves each tensor name to its GGUF file
    offset and records the source span.
-4. Before a CPU graph node runs, GGML thread 0 acquires every backed source via
-   `residency.Manager`, pins the mappings, and rebases `tensor->data`.
-5. A thread-pool barrier publishes those pointers. The unmodified stock GGML
-   kernel executes against the mapped GGUF bytes.
-6. After all workers finish, thread 0 restores the reserved identity pointers
-   and releases the pins. LRU may then evict those mappings.
+4. Before a CPU graph node runs, GGML thread 0 either acquires ordinary
+   backed sources as whole spans or selects an op-specific bounded path:
+   - regular `MUL_MAT` maps complete output-weight rows in budget-sized tiles;
+   - `MUL_MAT_ID` maps only selected routed-expert rows in budget-sized tiles;
+   - 2-D `GET_ROWS` maps the row envelope requested by the index tensor.
+5. Thread-pool barriers publish each mapping. The stock GGML conversion,
+   dequantization, and vec-dot kernels execute against the mapped GGUF bytes.
+6. After all workers finish a node or tile, thread 0 restores the reserved
+   identity pointer and releases the pin. LRU may then evict that mapping.
 
 Fusion is disabled only while the residency hooks are enabled so that each
 pre/post callback corresponds to one stock node. Ordinary builds retain the
@@ -45,7 +48,7 @@ zig build validate-ggml-backend \
   -Dsimd-backend=false \
   -Dggml-residency-hooks=true \
   -Dcpu-repack=false -- \
-  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1 220
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1 4
 ```
 
 The third positional argument enables file-backed mode and specifies the mapped
@@ -57,9 +60,24 @@ Observed on the 762.81 MiB Llama-3.2-1B Q4_K_M model:
 logits: exact=true, max-error=0, mean-error=0, argmax=11/11
 uploads=147, uploaded=0.00 MiB
 node hooks: pre=358, post=358, active=0, peak-active=1
-residency: budget=220.00 MiB, peak-resident=219.80 MiB
-           faults=148, hits=31, evictions=145
+residency: budget=4.00 MiB, peak-resident=4.00 MiB
+           faults=319, hits=16, evictions=318
 ```
+
+The same native backend was validated on the 27.2 GiB
+`Qwen3-Coder-Next-Q2_K.gguf` hybrid DeltaNet+MoE model:
+
+```text
+logits: exact=true, max-error=0, mean-error=0, argmax=3830/3830
+uploads=843, uploaded=0.00 MiB
+node hooks: pre=3066, post=3066, active=0, peak-active=1
+residency: budget=4.00 MiB, peak-resident=4.00 MiB
+           faults=2332, hits=0, evictions=2331
+```
+
+For Qwen, ordinary llama.cpp still builds the architecture-specific DeltaNet
+and routed-MoE graph. MLz only controls source mapping lifetime; selected expert
+arithmetic remains the stock `MUL_MAT_ID` GGML kernel.
 
 The backend allocation statistic still reports 762.81 MiB because it measures
 the logical GGML buffer/virtual address reservation. In backed mode those pages
@@ -87,27 +105,26 @@ reserved identity offset. This allows tied/shared sources and GGML views to be
 restored correctly. Reserved address space intentionally faults if a stock
 kernel accesses a backed weight outside the synchronized node lifetime.
 
-## Minimum budget and current limitation
+## Tiled-op scope and current limitations
 
-Stock GGML CPU kernels dereference a contiguous `tensor->data` span. Therefore
-the budget must fit the union of backed source tensors required by one node and,
-at minimum, the largest individual source tensor.
+The validated native paths allow budgets below the largest tensor by tiling
+regular 2-D `MUL_MAT`, routed 3-D `MUL_MAT_ID`, and 2-D `GET_ROWS`. Their key
+invariant is that each canonical GGML dot/dequantization still consumes one
+complete physical row, so arithmetic and reduction order are unchanged.
 
-For the validated model, `token_embd.weight` is approximately 205.49 MiB:
-
-- 220 MiB succeeds and remains bounded;
-- 200 MiB fails deterministically with `BudgetExceeded` before that tensor can
-  be mapped.
-
-Running below this minimum requires an op-specific tiled GGML hook (especially
-for `MUL_MAT`) or the existing MLz tiled executor. The next backend milestone is
-tiled native `MUL_MAT`, which would acquire row/block windows rather than the
-entire weight tensor while preserving canonical GGML dot-product kernels.
+Unsupported `GET_ROWS` layouts (for example model-weight views or sources with
+more than two dimensions) fall back to whole-source mapping. Sparse multi-row
+lookups currently map the contiguous envelope from the minimum to maximum row;
+if that envelope exceeds the budget, a future per-row `ops.cpp` hook is needed.
 
 Other current limitations:
 
 - CPU host backend only; no CUDA/Metal/Vulkan residency bridge yet;
 - one active bridge/model instance per process;
+- graph execution for one bridge must be externally serialized. Callback state
+  is mutex-protected against data races, but the current source-ID release ABI
+  permits only one open view per source, so concurrent graphs sharing one model
+  are rejected rather than independently pinned;
 - `ggml-residency-hooks` and the custom SIMD source patch are mutually exclusive
   because both currently rewrite the same vendored `ggml-cpu.c` at build time;
 - default CPU_REPACK uses a different packed layout/kernel than this arbitrary

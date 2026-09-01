@@ -155,7 +155,7 @@ pub fn sequenceLogitsGgmlBackendBacked(
     defer {
         llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
         llama.c.mlz_ggml_residency_set_backed_mode(false);
-        llama.c.mlz_ggml_residency_set_bridge(null, null, null);
+        llama.c.mlz_ggml_residency_set_bridge(null, null, null, null, null);
         bridge.deinit(allocator);
         llama.c.mlz_ggml_residency_registry_reset();
     }
@@ -170,6 +170,8 @@ pub fn sequenceLogitsGgmlBackendBacked(
         bridge.acquireCallback,
         bridge.releaseCallback,
         bridge.spanCallback,
+        bridge.acquireRangeCallback,
+        bridge.rangeCapacityCallback,
     );
     llama.c.mlz_ggml_residency_set_backed_mode(true);
 
