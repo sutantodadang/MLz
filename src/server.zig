@@ -1,5 +1,4 @@
 const std = @import("std");
-const residency_endpoint = @import("residency_endpoint.zig");
 
 const llama_cpp = @import("llama_cpp.zig");
 const residency_bridge = @import("residency_ggml_bridge.zig");
@@ -48,15 +47,6 @@ pub const ServerConfig = struct {
     /// auto multi-model serving. The startup model is always resident; requests
     /// naming another registry model load it (LRU-evicting at this cap).
     max_loaded_models: usize = 1,
-
-    /// Bounded-residency endpoint weight budget in MiB. 0 disables the
-    /// `POST /v1/residency/completions` endpoint entirely.
-    residency_budget_mib: usize = 0,
-
-    /// Number of independent bounded-residency service slots. Each slot
-    /// executes one completion at a time; requests beyond this capacity wait
-    /// on a busy slot. 1 = fully serialized (default).
-    residency_slots: usize = 1,
 };
 
 /// Wraps the always-resident startup engine plus an LRU pool of extra engines
@@ -134,7 +124,6 @@ const ServerCtx = struct {
     manager: *EngineManager,
     embed: *embeddings.EmbeddingService,
     default_model_path: []const u8,
-    residency: ?*residency_endpoint.ResidencyEndpoint = null,
 };
 
 const Header = struct {
@@ -202,27 +191,12 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
     var embed_service = embeddings.EmbeddingService.init(allocator, engine_cfg.n_ctx, engine_cfg.threads);
     defer embed_service.deinit();
 
-    // Bounded-residency endpoint: opt-in, lazily opened on first request.
-    // `residency_slots` service instances execute independently so up to that
-    // many completions run concurrently.
-    var residency_ep: ?residency_endpoint.ResidencyEndpoint = if (cfg.residency_budget_mib > 0)
-        try residency_endpoint.ResidencyEndpoint.init(
-            allocator,
-            model_path,
-            cfg.residency_budget_mib * 1024 * 1024,
-            @max(@as(usize, 1), cfg.residency_slots),
-        )
-    else
-        null;
-    defer if (residency_ep) |*ep| ep.deinit();
-
     var sctx = ServerCtx{
         .allocator = allocator,
         .cfg = cfg,
         .manager = &manager,
         .embed = &embed_service,
         .default_model_path = model_path,
-        .residency = if (residency_ep) |*ep| ep else null,
     };
 
     const addr = try resolveListenAddress(allocator, cfg.host, cfg.port);
@@ -480,15 +454,6 @@ fn handleConnection(
 
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/embeddings")) {
         try handleEmbeddings(allocator, stream, sctx, req.body);
-        return;
-    }
-
-    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/residency/completions")) {
-        if (sctx.residency) |ep| {
-            try residency_endpoint.handle(allocator, stream, ep, req.body);
-        } else {
-            try writeJsonError(allocator, stream, 404, "Not Found", "not_found", "residency endpoint disabled; start the server with --residency-budget-mib");
-        }
         return;
     }
 

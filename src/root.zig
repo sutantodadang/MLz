@@ -15,12 +15,6 @@ pub const model_manager = @import("model_manager.zig");
 pub const embeddings = @import("embeddings.zig");
 pub const residency = @import("residency.zig");
 pub const gguf_residency = @import("gguf_residency.zig");
-pub const residency_compute = @import("residency_compute.zig");
-pub const residency_executor = @import("residency_executor.zig");
-pub const residency_parallel = @import("residency_parallel.zig");
-pub const residency_qwen3next = @import("residency_qwen3next.zig");
-pub const residency_qwen3next_parallel = @import("residency_qwen3next_parallel.zig");
-pub const residency_service = @import("residency_service.zig");
 pub const residency_ggml_bridge = @import("residency_ggml_bridge.zig");
 pub const residency_memory_policy = @import("residency_memory_policy.zig");
 

@@ -95,8 +95,7 @@ sizes; it works for any architecture llama.cpp loads. Neither caps filesystem
 page cache, allocator slack, or GPU memory. A weight that cannot be mapped
 fails only that request (`503 residency_error`) and the server keeps serving.
 Official residency supports one model per process; leave it disabled to use
-ordinary llama.cpp multi-model serving. `--residency-budget-mib` independently
-enables the older proof endpoint. Details: `docs/ggml-residency-backend.md`.
+ordinary llama.cpp multi-model serving. Details: `docs/ggml-residency-backend.md`.
 
 ### Common CLI flags
 

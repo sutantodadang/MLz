@@ -133,8 +133,6 @@ pub fn main() !void {
             .host = cfg.server_host,
             .port = cfg.server_port,
             .api_key = cfg.server_api_key,
-            .residency_budget_mib = cfg.residency_budget_mib,
-            .residency_slots = cfg.residency_slots,
         }, .{
             .n_ctx = cfg.n_ctx,
             .n_gpu_layers = cfg.n_gpu_layers,

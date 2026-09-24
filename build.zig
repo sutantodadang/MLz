@@ -1951,56 +1951,6 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run SIMD benchmarks");
     bench_step.dependOn(&bench_run.step);
 
-    // Bounded tensor-residency benchmark. This is intentionally standalone:
-    // it exercises the real mmap/fault/LRU path without requiring a GGUF model.
-    const residency_module = b.createModule(.{
-        .root_source_file = b.path("src/bench_residency.zig"),
-        .target = actual_target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    residency_module.addIncludePath(b.path("src"));
-    residency_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
-    residency_module.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
-        .flags = &.{"-std=c11"},
-    });
-    const bench_residency_exe = b.addExecutable(.{
-        .name = "bench_residency",
-        .root_module = residency_module,
-    });
-    bench_residency_exe.linkLibrary(ggml_lib);
-    const bench_residency_run = b.addRunArtifact(bench_residency_exe);
-    if (b.args) |args| bench_residency_run.addArgs(args);
-    const bench_residency_step = b.step("bench-residency", "Benchmark bounded mmap tensor residency");
-    bench_residency_step.dependOn(&bench_residency_run.step);
-
-    // Opt-in validator for real GGUF model files. Example:
-    // zig build validate-residency -- models/model.gguf 16 4
-    const validate_residency_module = b.createModule(.{
-        .root_source_file = b.path("src/validate_residency.zig"),
-        .target = actual_target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    validate_residency_module.addIncludePath(b.path("src"));
-    validate_residency_module.addIncludePath(llama_cpp_dep.path("include"));
-    validate_residency_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
-    validate_residency_module.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
-        .flags = &.{"-std=c11"},
-    });
-    const validate_residency_exe = b.addExecutable(.{
-        .name = "validate_residency",
-        .root_module = validate_residency_module,
-    });
-    validate_residency_exe.linkLibrary(ggml_lib);
-    validate_residency_exe.linkLibrary(llama_lib);
-    const validate_residency_run = b.addRunArtifact(validate_residency_exe);
-    if (b.args) |args| validate_residency_run.addArgs(args);
-    const validate_residency_step = b.step("validate-residency", "Validate bounded compute against a real GGUF model");
-    validate_residency_step.dependOn(&validate_residency_run.step);
-
     // Official GGML buffer-backend integration validator. It runs the native
     // llama.cpp CPU graph twice (ordinary CPU buffers vs MLz's host-compatible
     // tensor_buft_override) and accepts exact logits, or the documented tight
@@ -2032,32 +1982,6 @@ pub fn build(b: *std.Build) void {
         "Validate native GGML graph execution over the MLz buffer backend",
     );
     validate_ggml_backend_step.dependOn(&validate_ggml_backend_run.step);
-
-    // Opt-in bounded-residency completion service smoke run. Example:
-    // zig build residency-serve -- models/model.gguf "Prompt" [budget-mib] [max-tokens]
-    const residency_service_module = b.createModule(.{
-        .root_source_file = b.path("src/residency_service_main.zig"),
-        .target = actual_target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    residency_service_module.addIncludePath(b.path("src"));
-    residency_service_module.addIncludePath(llama_cpp_dep.path("include"));
-    residency_service_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
-    residency_service_module.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
-        .flags = &.{"-std=c11"},
-    });
-    const residency_service_exe = b.addExecutable(.{
-        .name = "residency_service",
-        .root_module = residency_service_module,
-    });
-    residency_service_exe.linkLibrary(ggml_lib);
-    residency_service_exe.linkLibrary(llama_lib);
-    const residency_service_run = b.addRunArtifact(residency_service_exe);
-    if (b.args) |args| residency_service_run.addArgs(args);
-    const residency_service_step = b.step("residency-serve", "Run one bounded-residency completion against a real GGUF model");
-    residency_service_step.dependOn(&residency_service_run.step);
 
     // U1 — Per-kernel correctness validator (PLAN-ASSEMBLY-REWRITE Section 3).
     // Generates random F32 vectors, quantizes via ggml's reference, calls every

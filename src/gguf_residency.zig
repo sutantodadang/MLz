@@ -33,60 +33,6 @@ pub const TensorDescriptor = struct {
     dimensions: [max_dimensions]u64,
 };
 
-pub const Architecture = enum {
-    unknown,
-    llama,
-    qwen3next,
-};
-
-/// Optional execution metadata used by the proof execution adapters. Models
-/// remain indexable even when architecture-specific keys are absent.
-pub const ExecutionMetadata = struct {
-    architecture: Architecture = .unknown,
-    attention_head_count: ?u32 = null,
-    attention_kv_head_count: ?u32 = null,
-    attention_key_length: ?u32 = null,
-    attention_value_length: ?u32 = null,
-    block_count: ?u32 = null,
-    context_length: ?u32 = null,
-    embedding_length: ?u32 = null,
-    rms_epsilon: ?f32 = null,
-    rope_theta: ?f32 = null,
-    rope_dimension_count: ?u32 = null,
-    expert_count: ?u32 = null,
-    expert_used_count: ?u32 = null,
-    expert_feed_forward_length: ?u32 = null,
-    shared_expert_feed_forward_length: ?u32 = null,
-    ssm_conv_kernel: ?u32 = null,
-    ssm_state_size: ?u32 = null,
-    ssm_group_count: ?u32 = null,
-    ssm_time_step_rank: ?u32 = null,
-    ssm_inner_size: ?u32 = null,
-    full_attention_interval: ?u32 = null,
-};
-
-fn optionalU32(ctx: *c.gguf_context, key: [*:0]const u8) ?u32 {
-    const id = c.gguf_find_key(ctx, key);
-    if (id < 0 or c.gguf_get_kv_type(ctx, id) != c.GGUF_TYPE_UINT32) return null;
-    return c.gguf_get_val_u32(ctx, id);
-}
-
-fn optionalF32(ctx: *c.gguf_context, key: [*:0]const u8) ?f32 {
-    const id = c.gguf_find_key(ctx, key);
-    if (id < 0 or c.gguf_get_kv_type(ctx, id) != c.GGUF_TYPE_FLOAT32) return null;
-    return c.gguf_get_val_f32(ctx, id);
-}
-
-fn architecture(ctx: *c.gguf_context) Architecture {
-    const id = c.gguf_find_key(ctx, "general.architecture");
-    if (id < 0 or c.gguf_get_kv_type(ctx, id) != c.GGUF_TYPE_STRING) return .unknown;
-    const value = c.gguf_get_val_str(ctx, id) orelse return .unknown;
-    const name = std.mem.span(value);
-    if (std.mem.eql(u8, name, "llama")) return .llama;
-    if (std.mem.eql(u8, name, "qwen3next")) return .qwen3next;
-    return .unknown;
-}
-
 /// Owns a validated tensor index for a GGUF file. Parsing uses gguf's official
 /// metadata reader with data allocation disabled; tensor bytes remain solely in
 /// the backing file and are faulted by `residency.Manager`.
@@ -94,7 +40,6 @@ pub const TensorIndex = struct {
     allocator: std.mem.Allocator,
     descriptors: []TensorDescriptor,
     by_name: std.StringHashMap(usize),
-    execution: ExecutionMetadata,
 
     pub fn open(allocator: std.mem.Allocator, path_z: [:0]const u8, backing_size: u64) Error!TensorIndex {
         var tensor_ctx: ?*c.ggml_context = null;
@@ -159,49 +104,10 @@ pub const TensorIndex = struct {
             by_name.put(owned_name, i) catch return Error.OutOfMemory;
         }
 
-        const arch = architecture(ctx);
-        const execution = switch (arch) {
-            .llama => ExecutionMetadata{
-                .architecture = arch,
-                .attention_head_count = optionalU32(ctx, "llama.attention.head_count"),
-                .attention_kv_head_count = optionalU32(ctx, "llama.attention.head_count_kv"),
-                .block_count = optionalU32(ctx, "llama.block_count"),
-                .context_length = optionalU32(ctx, "llama.context_length"),
-                .embedding_length = optionalU32(ctx, "llama.embedding_length"),
-                .rms_epsilon = optionalF32(ctx, "llama.attention.layer_norm_rms_epsilon"),
-                .rope_theta = optionalF32(ctx, "llama.rope.freq_base"),
-            },
-            .qwen3next => ExecutionMetadata{
-                .architecture = arch,
-                .attention_head_count = optionalU32(ctx, "qwen3next.attention.head_count"),
-                .attention_kv_head_count = optionalU32(ctx, "qwen3next.attention.head_count_kv"),
-                .attention_key_length = optionalU32(ctx, "qwen3next.attention.key_length"),
-                .attention_value_length = optionalU32(ctx, "qwen3next.attention.value_length"),
-                .block_count = optionalU32(ctx, "qwen3next.block_count"),
-                .context_length = optionalU32(ctx, "qwen3next.context_length"),
-                .embedding_length = optionalU32(ctx, "qwen3next.embedding_length"),
-                .rms_epsilon = optionalF32(ctx, "qwen3next.attention.layer_norm_rms_epsilon"),
-                .rope_theta = optionalF32(ctx, "qwen3next.rope.freq_base"),
-                .rope_dimension_count = optionalU32(ctx, "qwen3next.rope.dimension_count"),
-                .expert_count = optionalU32(ctx, "qwen3next.expert_count"),
-                .expert_used_count = optionalU32(ctx, "qwen3next.expert_used_count"),
-                .expert_feed_forward_length = optionalU32(ctx, "qwen3next.expert_feed_forward_length"),
-                .shared_expert_feed_forward_length = optionalU32(ctx, "qwen3next.expert_shared_feed_forward_length"),
-                .ssm_conv_kernel = optionalU32(ctx, "qwen3next.ssm.conv_kernel"),
-                .ssm_state_size = optionalU32(ctx, "qwen3next.ssm.state_size"),
-                .ssm_group_count = optionalU32(ctx, "qwen3next.ssm.group_count"),
-                .ssm_time_step_rank = optionalU32(ctx, "qwen3next.ssm.time_step_rank"),
-                .ssm_inner_size = optionalU32(ctx, "qwen3next.ssm.inner_size"),
-                .full_attention_interval = optionalU32(ctx, "qwen3next.full_attention_interval"),
-            },
-            .unknown => ExecutionMetadata{},
-        };
-
         return .{
             .allocator = allocator,
             .descriptors = descriptors,
             .by_name = by_name,
-            .execution = execution,
         };
     }
 

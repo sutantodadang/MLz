@@ -177,7 +177,7 @@ Checklist:
   - optional GPU allocations: tidak berlaku, residency hanya CPU (P3.1).
 - [x] Satukan policy executor/service yang sudah ada dengan official GGML path.
       (Normal path memakai `src/residency_memory_policy.zig`; endpoint proof
-      lama `/v1/residency/completions` tetap memakai policy service-nya.)
+      lama sudah dihapus.)
 - [x] Tambahkan checked estimators sebelum alokasi context/model/request state.
       (`llama_model_params.no_alloc` + `llama_get_memory_breakdown`.)
 - [x] Tambahkan hard limit, soft limit/warning, dan overflow-safe arithmetic.
@@ -489,6 +489,11 @@ next push.
 
 
 ## Historical implementation log
+
+Kode proof lama (custom executor, `residency_service`, endpoint
+`/v1/residency/completions`, `validate-residency`, `bench-residency`,
+`residency-serve`) dihapus pada 2026-09-24; bagian di bawah hanya catatan
+historis.
 
 Bagian di bawah mempertahankan API notes, benchmark snapshots, dan keputusan
 fase lama untuk audit trail. Gunakan [Productization roadmap](#productization-roadmap--post-proof-tracking)

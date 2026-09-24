@@ -93,11 +93,6 @@ pub const Config = struct {
     /// Optional hard limit for KV/recurrent state, graph workspace, and logits,
     /// preflighted from llama.cpp's simulated (`no_alloc`) allocation sizes.
     residency_state_budget_mib: ?usize = null,
-    /// Legacy proof endpoint controls. Kept separate from normal-path mode.
-    /// A zero budget disables `/v1/residency/completions`.
-    residency_budget_mib: usize = 0,
-    /// Independent bounded-residency execution slots (concurrent completions).
-    residency_slots: usize = 1,
 
     // Custom SIMD backend runtime controls (consumed before model load to set
     // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
@@ -300,14 +295,6 @@ pub const Config = struct {
                 self.residency_weight_budget_mib = try parseNextInt(usize, &i, args);
             } else if (std.mem.eql(u8, arg, "--state-budget-mib")) {
                 self.residency_state_budget_mib = try parseNextInt(usize, &i, args);
-            } else if (std.mem.eql(u8, arg, "--residency-budget-mib")) {
-                const v = try parseNextInt(usize, &i, args);
-                if (v == 0) return ParseError.InvalidInt;
-                self.residency_budget_mib = v;
-            } else if (std.mem.eql(u8, arg, "--residency-slots")) {
-                const v = try parseNextInt(usize, &i, args);
-                if (v == 0) return ParseError.InvalidInt;
-                self.residency_slots = v;
             } else if (std.mem.eql(u8, arg, "--no-prefix-cache")) {
                 self.prefix_cache = false;
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
