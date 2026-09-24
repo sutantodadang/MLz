@@ -11,7 +11,7 @@ Starts MLz servers and checks, by named invariant:
   * an undersized state budget is rejected at startup;
   * Ctrl+C / SIGINT shuts the backed server down with exit code 0.
 
-usage: python tools/residency_server_smoke.py --exe zig-out/bin/MLz --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+usage: python tests/residency_server_smoke.py --exe zig-out/bin/MLz --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf
 """
 
 import argparse

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Search text files for lines matching a literal token.
 
-usage: python tools/grep_zig.py <token> <file> [context]
+usage: python tools/dev/grep_zig.py <token> <file> [context]
 """
 import sys
 

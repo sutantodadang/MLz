@@ -175,6 +175,25 @@ curl http://127.0.0.1:8080/v1/embeddings \
   -d '{"input":["hello","world"]}'
 ```
 
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `src/main.zig` | CLI entry point (chat, one-shot prompt, server, model registry) |
+| `src/root.zig` | library module `MLz` (imported by tools as `mlz`) |
+| `src/app/` | config (TOML/env/CLI), signals, terminal, model registry |
+| `src/engine/` | inference engine, continuous-batching scheduler, prefix cache, chat templates |
+| `src/server/` | OpenAI-compatible HTTP/WebSocket server, embeddings, model pool |
+| `src/llama/` | llama.cpp C API bindings and C++ shims |
+| `src/residency/` | bounded weight residency: manager, mmap store, GGUF index, GGML backend + bridge, memory policy |
+| `src/simd/` | custom AVX2/AVX-512/NEON kernels and the ggml-cpu patch |
+| `src/tools/` | build-time patcher, validators, SIMD bench/tests |
+| `build.zig`, `build/` | build orchestration; `build/` holds per-backend build logic |
+| `tests/` | end-to-end tests against a built binary |
+| `bench/` | serving benchmark and SIMD baseline |
+| `tools/` | CI/dev utilities (`tools/dev/` = one-off investigation scripts) |
+| `docs/` | design docs, roadmap, residency plan |
+
 ## Hardware acceleration
 
 GPU backends are enabled at build time:

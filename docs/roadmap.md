@@ -1,6 +1,6 @@
 # MLz Roadmap — vLLM/SGLang throughput, LM Studio ease, config-first tuning
 
-> Active implementation tracker: [Bounded Tensor Residency — Plan & Progress](docs/residency-plan.md)
+> Active implementation tracker: [Bounded Tensor Residency — Plan & Progress](residency-plan.md)
 
 ## Positioning
 

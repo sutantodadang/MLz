@@ -5,13 +5,13 @@ on:
     paths:
       - 'src/**'
       - 'build.zig*'
-      - 'tools/residency_server_smoke.py'
+      - 'tests/residency_server_smoke.py'
       - '.github/workflows/residency.yml'
   pull_request:
     paths:
       - 'src/**'
       - 'build.zig*'
-      - 'tools/residency_server_smoke.py'
+      - 'tests/residency_server_smoke.py'
       - '.github/workflows/residency.yml'
   # Real-model gates are heavy: nightly, or on demand.
   schedule:
@@ -112,7 +112,7 @@ jobs:
         if: matrix.server
         run: |
           zig build -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false
-          python3 tools/residency_server_smoke.py --exe zig-out/bin/MLz --model "$MODEL"
+          python3 tests/residency_server_smoke.py --exe zig-out/bin/MLz --model "$MODEL"
       - name: Server logs
         if: failure() && matrix.server
         run: tail -n 200 residency_smoke_*.log || true

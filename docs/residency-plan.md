@@ -110,7 +110,7 @@ Setiap PR yang mengubah status menambahkan entry berikut di bawah
 
 | ID | Priority | Workstream | Status | Owner | Evidence | Depends on |
 |---|---|---|---|---|---|---|
-| P0.1 | P0 | Normal server-path integration | Selesai | Codex, Claude | `tools/residency_server_smoke.py` 47/47, 2026-09-24 | Phase 11 milestone 4 |
+| P0.1 | P0 | Normal server-path integration | Selesai | Codex, Claude | `tests/residency_server_smoke.py` 47/47, 2026-09-24 | Phase 11 milestone 4 |
 | P0.2 | P0 | Unified memory policy and preflight | Selesai | Claude | `no_alloc` breakdown preflight; llama.cpp reports compute "matches expectation" | P0.1 |
 | P0.3 | P0 | Concurrent native graph pin tokens | Selesai | Codex, Claude | Validator `concurrent`/`cancel`/`fail` on Llama, Qwen3.5, Qwen3-Coder-Next; 15/15 stress | P0.1 |
 | P0.4 | P0 | Correctness/CI regression matrix | Selesai | Codex, Claude | Fast matrix + nightly/dispatch model job; every command reproduced locally | P0.1–P0.3 |
@@ -430,7 +430,7 @@ tolerance + top-1 gate; hasilnya tidak boleh disebut bit-identik.
 
 | Workstream | Required verification entry point |
 |---|---|
-| P0.1 | `python tools/residency_server_smoke.py --exe zig-out/bin/MLz --model <gguf>` (done) |
+| P0.1 | `python tests/residency_server_smoke.py --exe zig-out/bin/MLz --model <gguf>` (done) |
 | P0.2 | `residency_memory_policy.zig` tests + smoke `state budget rejection` (done) |
 | P0.3 | `validate-ggml-backend ... <model> <tokens> 4 concurrent|cancel|fail` (done) |
 | P0.4 | `.github/workflows/residency.yml` jobs `fast` and `models` (done) |
@@ -449,7 +449,7 @@ tracker productization dibuat dicatat sebagai baseline:
 - 2026-09-24 — P0.1/P0.2/P0.3/P0.4/P1.3 — working tree on `feat/phase-8-batched-prefill` (not committed)
   - Status: P0.1, P0.2, P0.3, P0.4 `Dalam proses`/`Belum mulai` → `Selesai`; P1.3 tetap `Dalam proses`.
   - Changes: node sources pinned all-or-nothing (`acquire_many`, no hold-and-wait, fail-fast when impossible); acquisition failures stop the graph with `GGML_STATUS_FAILED` (llama_decode rc=-3) instead of `abort()`; engine/scheduler discard partial KV and return `503 residency_error`; non-weight policy from llama.cpp `no_alloc` breakdown; architecture gate removed; `/v1/residency/metrics` adds acquire latency, failure classes, last reason, planned/allocated memory.
-  - Commands: `zig build test` with `-Dsimd-backend=false` × hooks on/off × CPU_REPACK on/off, plus default flags; `zig build` for the same; `git diff --check`; `zig build validate-ggml-backend -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false -- <model> <tokens> 4 <single|concurrent|cancel|fail>`; default CPU_REPACK tolerance gate on Llama; `python tools/residency_server_smoke.py --exe zig-out/bin/MLz.exe --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf`.
+  - Commands: `zig build test` with `-Dsimd-backend=false` × hooks on/off × CPU_REPACK on/off, plus default flags; `zig build` for the same; `git diff --check`; `zig build validate-ggml-backend -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false -- <model> <tokens> 4 <single|concurrent|cancel|fail>`; default CPU_REPACK tolerance gate on Llama; `python tests/residency_server_smoke.py --exe zig-out/bin/MLz.exe --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf`.
   - Environment: Windows 11, Zig 0.15.2, llama.cpp/GGML `b9106`, 4 threads for server, 1 thread for validator. Models (SHA-256): Llama-3.2-1B Q4_K_M `3f5a2242…2dcc1` (unsloth), Qwen3.5-4B Q4_K_S `27caeb0e…2ea77` (unsloth), Qwen3-Coder-Next Q2_K `2ac738bc…abad87`, Qwen3-4B Q4_K_M, Gemma-3-4B Q2_K.
   - Result: all four modes exact (bitwise logits) at 4 MiB on Llama (tokens `1,128000`), Qwen3.5-4B (`1,1000`) and Qwen3-Coder-Next (`1,151000`); `fail` mode exercised GET_ROWS, whole-node, tiled `MUL_MAT` and tiled `MUL_MAT_ID` failures, each with zero open pins and balanced hooks before an exact recovery. Qwen3-4B and Gemma-3-4B `single` exact. 15/15 repeated `concurrent`/`cancel`/`fail` runs with 4-token prompts. Server smoke 47/47: backed chat/completion/streaming/scheduler outputs equal the ordinary path, metrics invariants hold, injected failure → 503 then exact recovery (single-stream and scheduler), `--state-budget-mib 1` rejected at startup, SIGBREAK shutdown exit 0. Memory plan for Llama ctx 512: state 16,777,216 + compute 271,058,944 + logits 513,024 bytes; llama.cpp reported the allocated compute buffer "matches expectation". Qwen3-Coder-Next plan: state 91,619,328, compute 331,098,144 bytes. Default CPU_REPACK Llama: max error 0.040820480, mean 0.006926090, top-1 match.
   - Linux: the `fast` (hooks/CPU_REPACK combinations without SIMD) and Llama `models` job steps of `residency.yml` were replayed in WSL Ubuntu 26.04 with Zig 0.15.2: all builds/tests pass, model SHA verified, four exact modes and the CPU_REPACK gate pass, server smoke 0 failed invariants including SIGINT shutdown.

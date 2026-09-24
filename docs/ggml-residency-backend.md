@@ -201,7 +201,7 @@ latency and admission waits, hook/pin balance, failure counts with the last
 reason, and planned vs allocated memory per category. No per-tensor labels are
 exported.
 
-`tools/residency_server_smoke.py` checks the server end to end against the
+`tests/residency_server_smoke.py` checks the server end to end against the
 ordinary llama.cpp path, including failure injection, state-budget rejection,
 and graceful shutdown.
 
