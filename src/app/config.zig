@@ -33,6 +33,14 @@ pub const starter_toml: []const u8 =
     \\[speculative]
     \\# draft_model = "models/draft.gguf"
     \\
+    \\# Official GGML bounded weight residency. Requires a build made with
+    \\# -Dggml-residency-hooks=true. This limits active mapped immutable
+    \\# weights, not total process RSS/KV/workspace memory.
+    \\[residency]
+    \\enabled = false
+    \\backend = "ggml"
+    \\weight_budget_mib = 256
+    \\
 ;
 
 fn parseBool(s: []const u8) bool {
@@ -78,6 +86,14 @@ pub const Config = struct {
     max_concurrent: u32 = 1,
     prefix_cache: bool = true,
 
+    // Official GGML bounded-residency backend for the normal model path.
+    residency_enabled: bool = false,
+    residency_backend: []const u8 = "ggml",
+    residency_weight_budget_mib: usize = 256,
+    /// Optional hard limit for KV/recurrent state, graph workspace, and logits,
+    /// preflighted from llama.cpp's simulated (`no_alloc`) allocation sizes.
+    residency_state_budget_mib: ?usize = null,
+
     // Custom SIMD backend runtime controls (consumed before model load to set
     // env vars read by ggml_simd_hook.cpp).  Defaults preserve the build-time
     // behaviour: SIMD on if compiled with -Dsimd-backend=true, off otherwise.
@@ -97,6 +113,10 @@ pub const Config = struct {
         MissingModelPath,
         InvalidFloat,
         InvalidInt,
+        InvalidResidencyBackend,
+        ResidencyBudgetRequired,
+        ResidencyRequiresCpu,
+        ResidencyIncompatibleDraftModel,
         MissingArgument,
         OutOfMemory,
     };
@@ -120,6 +140,7 @@ pub const Config = struct {
 
     pub fn parse(allocator: std.mem.Allocator, args: []const [:0]u8) !Config {
         var cfg = Config{};
+        errdefer cfg.deinit(allocator);
 
         // Step 1: find --config path or default mlz.toml
         var config_file_path: ?[]const u8 = null;
@@ -164,7 +185,24 @@ pub const Config = struct {
 
         // Step 5: validate
         if (cfg.model_path.len == 0) return ParseError.MissingModelPath;
+        try cfg.validateResidency();
         return cfg;
+    }
+
+    fn validateResidency(self: *const Config) ParseError!void {
+        if (!self.residency_enabled) return;
+        if (!std.mem.eql(u8, self.residency_backend, "ggml")) {
+            return ParseError.InvalidResidencyBackend;
+        }
+        if (self.residency_weight_budget_mib == 0) {
+            return ParseError.ResidencyBudgetRequired;
+        }
+        // 999 is the application's "auto" default; residency resolves it to
+        // CPU-only in Engine.init. Explicit GPU offload would bypass the limit.
+        if (self.n_gpu_layers != 0 and self.n_gpu_layers != 999) return ParseError.ResidencyRequiresCpu;
+        // The bridge and C registry are process-global and currently own one
+        // backed model. Reject configurations which would load another model.
+        if (self.draft_model_path != null) return ParseError.ResidencyIncompatibleDraftModel;
     }
 
     fn applyArgs(self: *Config, allocator: std.mem.Allocator, args: []const [:0]u8) !void {
@@ -249,6 +287,14 @@ pub const Config = struct {
                 self.max_concurrent = try parseNextInt(u32, &i, args);
             } else if (std.mem.eql(u8, arg, "--prefix-cache")) {
                 self.prefix_cache = true;
+            } else if (std.mem.eql(u8, arg, "--residency")) {
+                self.residency_enabled = true;
+            } else if (std.mem.eql(u8, arg, "--residency-backend")) {
+                self.residency_backend = try getNextArg(&i, args) orelse return ParseError.MissingArgument;
+            } else if (std.mem.eql(u8, arg, "--weight-budget-mib")) {
+                self.residency_weight_budget_mib = try parseNextInt(usize, &i, args);
+            } else if (std.mem.eql(u8, arg, "--state-budget-mib")) {
+                self.residency_state_budget_mib = try parseNextInt(usize, &i, args);
             } else if (std.mem.eql(u8, arg, "--no-prefix-cache")) {
                 self.prefix_cache = false;
             } else if (std.mem.eql(u8, arg, "--no-simd")) {
@@ -347,6 +393,18 @@ pub const Config = struct {
                 } else {
                     std.log.warn("mlz.toml: unknown key serve.{s}", .{key});
                 }
+            } else if (std.mem.eql(u8, section, "residency")) {
+                if (std.mem.eql(u8, key, "enabled")) {
+                    self.residency_enabled = parseBool(str_val);
+                } else if (std.mem.eql(u8, key, "backend")) {
+                    self.residency_backend = try arena.dupe(u8, str_val);
+                } else if (std.mem.eql(u8, key, "weight_budget_mib")) {
+                    self.residency_weight_budget_mib = std.fmt.parseInt(usize, str_val, 10) catch return ParseError.InvalidInt;
+                } else if (std.mem.eql(u8, key, "state_budget_mib")) {
+                    self.residency_state_budget_mib = std.fmt.parseInt(usize, str_val, 10) catch return ParseError.InvalidInt;
+                } else {
+                    std.log.warn("mlz.toml: unknown key residency.{s}", .{key});
+                }
             } else if (std.mem.eql(u8, section, "sampling")) {
                 if (std.mem.eql(u8, key, "temp")) {
                     self.temp = std.fmt.parseFloat(f32, str_val) catch return ParseError.InvalidFloat;
@@ -434,6 +492,19 @@ pub const Config = struct {
             defer allocator.free(v);
             self.prefix_cache = parseBool(v);
         }
+        if (std.process.getEnvVarOwned(allocator, "MLZ_RESIDENCY_ENABLED") catch null) |v| {
+            defer allocator.free(v);
+            self.residency_enabled = parseBool(v);
+        }
+        if (try getStr(allocator, arena, "MLZ_RESIDENCY_BACKEND")) |v| self.residency_backend = v;
+        if (std.process.getEnvVarOwned(allocator, "MLZ_WEIGHT_BUDGET_MIB") catch null) |v| {
+            defer allocator.free(v);
+            self.residency_weight_budget_mib = std.fmt.parseInt(usize, v, 10) catch return ParseError.InvalidInt;
+        }
+        if (std.process.getEnvVarOwned(allocator, "MLZ_STATE_BUDGET_MIB") catch null) |v| {
+            defer allocator.free(v);
+            self.residency_state_budget_mib = std.fmt.parseInt(usize, v, 10) catch return ParseError.InvalidInt;
+        }
         if (std.process.getEnvVarOwned(allocator, "MLZ_TEMP") catch null) |v| {
             defer allocator.free(v);
             self.temp = std.fmt.parseFloat(f32, v) catch return ParseError.InvalidFloat;
@@ -478,6 +549,13 @@ pub const Config = struct {
         try writer.print("prefix_cache = {}\n", .{self.prefix_cache});
         if (self.server_api_key) |k| {
             try writer.print("api_key = \"{s}\"\n", .{k});
+        }
+        try writer.print("\n[residency]\n", .{});
+        try writer.print("enabled = {}\n", .{self.residency_enabled});
+        try writer.print("backend = \"{s}\"\n", .{self.residency_backend});
+        try writer.print("weight_budget_mib = {d}\n", .{self.residency_weight_budget_mib});
+        if (self.residency_state_budget_mib) |limit| {
+            try writer.print("state_budget_mib = {d}\n", .{limit});
         }
         try writer.print("\n[sampling]\n", .{});
         try writer.print("temp = {d:.4}\n", .{self.temp});
@@ -559,4 +637,31 @@ test "prefix_cache toml" {
     try cfg.applyToml(std.testing.allocator, "[serve]\nprefix_cache = true\n");
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.prefix_cache == true);
+}
+
+test "official residency toml" {
+    var cfg = Config{};
+    try cfg.applyToml(std.testing.allocator, "[residency]\nenabled = true\nbackend = \"ggml\"\nweight_budget_mib = 4\nstate_budget_mib = 512\n");
+    defer cfg.deinit(std.testing.allocator);
+    cfg.n_gpu_layers = 0;
+    try cfg.validateResidency();
+    try std.testing.expect(cfg.residency_enabled);
+    try std.testing.expectEqualStrings("ggml", cfg.residency_backend);
+    try std.testing.expectEqual(@as(usize, 4), cfg.residency_weight_budget_mib);
+    try std.testing.expectEqual(@as(?usize, 512), cfg.residency_state_budget_mib);
+}
+
+test "official residency preflight rejects incompatible config" {
+    var cfg = Config{ .residency_enabled = true, .n_gpu_layers = 0 };
+    cfg.residency_weight_budget_mib = 0;
+    try std.testing.expectError(Config.ParseError.ResidencyBudgetRequired, cfg.validateResidency());
+    cfg.residency_weight_budget_mib = 4;
+    cfg.n_gpu_layers = 1;
+    try std.testing.expectError(Config.ParseError.ResidencyRequiresCpu, cfg.validateResidency());
+    cfg.n_gpu_layers = 0;
+    cfg.residency_backend = "other";
+    try std.testing.expectError(Config.ParseError.InvalidResidencyBackend, cfg.validateResidency());
+    cfg.residency_backend = "ggml";
+    cfg.n_gpu_layers = 999;
+    try cfg.validateResidency();
 }

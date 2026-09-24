@@ -1,12 +1,13 @@
 const std = @import("std");
 
-const llama_cpp = @import("llama_cpp.zig");
-const chat = @import("chat.zig");
-const signal = @import("signal.zig");
-const inference = @import("inference.zig");
+const llama_cpp = @import("../llama/llama_cpp.zig");
+const residency_bridge = @import("../residency/ggml_bridge.zig");
+const chat = @import("../engine/chat.zig");
+const signal = @import("../app/signal.zig");
+const inference = @import("../engine/inference.zig");
 const openai = @import("openai.zig");
-const engine_mod = @import("engine.zig");
-const models = @import("models.zig");
+const engine_mod = @import("../engine/engine.zig");
+const models = @import("../app/models.zig");
 const model_manager = @import("model_manager.zig");
 const embeddings = @import("embeddings.zig");
 pub const Engine = engine_mod.Engine;
@@ -55,6 +56,7 @@ pub const EngineManager = struct {
     engine_cfg: EngineConfig,
     default_engine: *Engine,
     default_id: []const u8,
+    allow_extra_models: bool = true,
     lru: model_manager.LruManager(*Engine),
 
     pub const Acquired = struct {
@@ -109,6 +111,7 @@ pub const EngineManager = struct {
         if (name.len == 0 or std.mem.eql(u8, name, self.default_id)) {
             return .{ .engine = self.default_engine, .handle = null };
         }
+        if (!self.allow_extra_models) return error.ModelNotFound;
         const h = try self.lru.acquire(name);
         return .{ .engine = h.value().*, .handle = h };
     }
@@ -179,6 +182,7 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
         .engine_cfg = engine_cfg,
         .default_engine = &engine,
         .default_id = engine.modelId(),
+        .allow_extra_models = !engine_cfg.residency_enabled,
         .lru = undefined,
     };
     try manager.bind(@max(@as(usize, 1), cfg.max_loaded_models));
@@ -212,6 +216,9 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8, cfg: ServerConf
     // 503) once `max_concurrent_connections` is reached so a slow attacker
     // cannot exhaust threads or file descriptors.
     var conn_count = std.atomic.Value(u32).init(0);
+    // Handler threads borrow the engine, manager, and residency bridge.
+    // Let them finish before the deferred teardown frees those objects.
+    defer while (conn_count.load(.acquire) != 0) std.Thread.sleep(10 * std.time.ns_per_ms);
 
     while (!signal.shouldExit()) {
         const conn = server.accept() catch |err| {
@@ -358,6 +365,74 @@ fn handleConnection(
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
         const body = "{\"ok\":true}";
+        try writeResponse(stream, .{ .status = 200, .reason = "OK", .content_type = "application/json", .body = body });
+        return;
+    }
+
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/residency/metrics")) {
+        const engine = sctx.manager.default_engine;
+        const metrics = engine.residencyMetrics() orelse {
+            try writeJsonError(allocator, stream, 404, "Not Found", "not_found", "official residency backend disabled");
+            return;
+        };
+        const stats = engine.residencyStats().?;
+        const diag = residency_bridge.diagnostics().?;
+        var reason_buf: [256]u8 = undefined;
+        const reason_len = llama_cpp.c.mlz_ggml_residency_last_failure(&reason_buf, reason_buf.len);
+        const memory = engine.residency_memory;
+        const body = try std.json.Stringify.valueAlloc(allocator, .{
+            .weight = .{
+                .budget_bytes = metrics.budget_bytes,
+                .mapped_bytes = metrics.resident_bytes,
+                .peak_mapped_bytes = metrics.peak_resident_bytes,
+                .faults = metrics.faults,
+                .hits = metrics.hits,
+                .evictions = metrics.evictions,
+                .bytes_mapped = metrics.bytes_mapped,
+                .bytes_evicted = metrics.bytes_evicted,
+                .registered_tensors = metrics.registered_tensors,
+            },
+            .acquire = .{
+                .calls = diag.acquisitions,
+                .total_ns = diag.acquire_ns_total,
+                .max_ns = diag.acquire_ns_max,
+                .admission_waits = diag.admission_waits,
+                .open_pins = diag.open_pins,
+            },
+            .hooks = .{
+                .pre = stats.node_pre_calls,
+                .post = stats.node_post_calls,
+                .active = stats.current_active_nodes,
+                // Whole-span, tile, and GET_ROWS row pins.
+                .acquires = stats.residency_acquires,
+                .releases = stats.residency_releases,
+                .uploaded_weight_bytes = stats.uploaded_bytes,
+            },
+            .failures = .{
+                .graphs = stats.graph_failures,
+                .budget_impossible = diag.failures.budget_impossible,
+                .admission_timeout = diag.failures.admission_timeout,
+                .io = diag.failures.io,
+                .invalid = diag.failures.invalid,
+                .injected = diag.failures.injected,
+                .last_kind = @tagName(diag.last_failure),
+                .last_reason = reason_buf[0..reason_len],
+            },
+            .memory = if (memory) |m| .{
+                .state_budget_bytes = m.state_budget_bytes,
+                .planned = .{
+                    .state_bytes = m.estimate.state_bytes,
+                    .compute_bytes = m.estimate.compute_bytes,
+                    .output_bytes = m.estimate.output_bytes,
+                },
+                .allocated = .{
+                    .state_bytes = m.state_bytes,
+                    .compute_bytes = m.compute_bytes,
+                    .host_weight_bytes = m.host_weight_bytes,
+                },
+            } else null,
+        }, .{});
+        defer allocator.free(body);
         try writeResponse(stream, .{ .status = 200, .reason = "OK", .content_type = "application/json", .body = body });
         return;
     }
@@ -683,6 +758,7 @@ fn engineErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.InvalidRole => 400,
         error.ContextTooSmall => 413,
+        error.ResidencyExecutionFailed, error.QueueFull => 503,
         else => 500,
     };
 }
@@ -691,6 +767,8 @@ fn engineErrorType(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidRole => "invalid_request_error",
         error.ContextTooSmall => "request_too_large",
+        error.ResidencyExecutionFailed => "residency_error",
+        error.QueueFull => "server_busy",
         else => "internal_error",
     };
 }
@@ -699,6 +777,8 @@ fn engineErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidRole => "messages.role must be one of: system, user, assistant",
         error.ContextTooSmall => "prompt + max_tokens exceeds the model context window",
+        error.ResidencyExecutionFailed => "bounded weight residency failed during execution; request state was discarded (see /v1/residency/metrics)",
+        error.QueueFull => "request queue is full; retry later",
         else => "internal server error during generation",
     };
 }
@@ -708,6 +788,7 @@ fn writeEngineError(allocator: std.mem.Allocator, stream: std.net.Stream, err: a
     const reason: []const u8 = switch (status) {
         400 => "Bad Request",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
         else => "Internal Server Error",
     };
     try writeJsonError(allocator, stream, status, reason, engineErrorType(err), engineErrorMessage(err));

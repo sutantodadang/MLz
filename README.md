@@ -70,6 +70,33 @@ built-in defaults  <  mlz.toml  <  MLZ_* env vars  <  CLI flags
 min_p, seed), `[chat]` (stream, system, template, grammar), `[speculative]`
 (draft_model).
 
+### Bounded GGML weight residency (CPU)
+
+Build with native GGML hooks, then enable residency for the normal CLI or
+OpenAI-compatible server:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false
+.\zig-out\bin\MLz.exe model.gguf --server --residency --weight-budget-mib 256 --state-budget-mib 1024
+```
+
+`[residency] enabled = true`, `weight_budget_mib = 256`, and
+`state_budget_mib = 1024` in `mlz.toml` provide the same settings. Residency
+selects CPU when `n_gpu_layers = "auto"`; an explicit GPU layer count is
+rejected. `GET /v1/residency/metrics` reports the weight budget, current/peak
+mappings, faults, evictions, acquire latency, hook/pin balance, failure counts
+with the last failure reason, and planned vs allocated memory. The endpoint uses
+the server's API key when one is configured.
+
+`weight_budget_mib` caps active mapped immutable weights. `state_budget_mib`
+is a hard limit for KV/recurrent state, graph workspace, and the logits buffer,
+checked before anything is allocated using llama.cpp's simulated allocation
+sizes; it works for any architecture llama.cpp loads. Neither caps filesystem
+page cache, allocator slack, or GPU memory. A weight that cannot be mapped
+fails only that request (`503 residency_error`) and the server keeps serving.
+Official residency supports one model per process; leave it disabled to use
+ordinary llama.cpp multi-model serving. Details: `docs/ggml-residency-backend.md`.
+
 ### Common CLI flags
 
 | Flag | Purpose |
@@ -147,6 +174,25 @@ curl http://127.0.0.1:8080/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{"input":["hello","world"]}'
 ```
+
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `src/main.zig` | CLI entry point (chat, one-shot prompt, server, model registry) |
+| `src/root.zig` | library module `MLz` (imported by tools as `mlz`) |
+| `src/app/` | config (TOML/env/CLI), signals, terminal, model registry |
+| `src/engine/` | inference engine, continuous-batching scheduler, prefix cache, chat templates |
+| `src/server/` | OpenAI-compatible HTTP/WebSocket server, embeddings, model pool |
+| `src/llama/` | llama.cpp C API bindings and C++ shims |
+| `src/residency/` | bounded weight residency: manager, mmap store, GGUF index, GGML backend + bridge, memory policy |
+| `src/simd/` | custom AVX2/AVX-512/NEON kernels and the ggml-cpu patch |
+| `src/tools/` | build-time patcher, validators, SIMD bench/tests |
+| `build.zig`, `build/` | build orchestration; `build/` holds per-backend build logic |
+| `tests/` | end-to-end tests against a built binary |
+| `bench/` | serving benchmark and SIMD baseline |
+| `tools/` | CI/dev utilities (`tools/dev/` = one-off investigation scripts) |
+| `docs/` | design docs, roadmap, residency plan |
 
 ## Hardware acceleration
 

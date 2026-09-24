@@ -3,7 +3,7 @@
 //! context must be created with `embeddings = true` + a pooling type.
 
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const llama = @import("../llama/llama_cpp.zig");
 
 pub const Embedder = struct {
     allocator: std.mem.Allocator,

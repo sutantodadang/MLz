@@ -18,7 +18,7 @@
 //! Upgrade path if it matters: per-slot output queue drained by writer threads.
 
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const llama = @import("../llama/llama_cpp.zig");
 const inference = @import("inference.zig");
 const prefix = @import("prefix_cache.zig");
 
@@ -41,6 +41,8 @@ pub const Request = struct {
     text: std.ArrayList(u8) = .empty,
     completion_tokens: usize = 0,
     finish: inference.GenerationResult.FinishReason = .stop,
+    /// Set when the request ended because a decode step failed.
+    failure: ?anyerror = null,
 
     /// Block until the scheduler finishes this request.
     pub fn wait(self: *Request) void {
@@ -50,8 +52,13 @@ pub const Request = struct {
     }
 
     fn complete(self: *Request, reason: inference.GenerationResult.FinishReason, n: usize) void {
+        self.completeWith(reason, n, null);
+    }
+
+    fn completeWith(self: *Request, reason: inference.GenerationResult.FinishReason, n: usize, failure: ?anyerror) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.failure = failure;
         self.completion_tokens = n;
         self.finish = reason;
         self.done = true;
@@ -215,7 +222,7 @@ pub const Scheduler = struct {
                 // finish them all as aborted so submitters wake up.
                 for (self.slots) |*slot| {
                     if (slot.req) |req| {
-                        req.complete(.aborted, slot.n_decoded);
+                        req.completeWith(.aborted, slot.n_decoded, err);
                         _ = self.ctx.kvCacheSeqRm(slot.seq_id, -1, -1);
                         slot.req = null;
                         slot.state = .idle;

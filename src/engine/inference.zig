@@ -1,5 +1,5 @@
 const std = @import("std");
-const llama_cpp = @import("llama_cpp.zig");
+const llama_cpp = @import("../llama/llama_cpp.zig");
 const chat = @import("chat.zig");
 
 /// A formatted chat prompt and its tokenization.

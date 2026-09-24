@@ -1,12 +1,12 @@
 const std = @import("std");
-const llama_cpp = @import("llama_cpp.zig");
-const chat = @import("chat.zig");
-const signal = @import("signal.zig");
-const terminal = @import("terminal.zig");
-const server = @import("server.zig");
-const config = @import("config.zig");
-const inference = @import("inference.zig");
-const models = @import("models.zig");
+const llama_cpp = @import("llama/llama_cpp.zig");
+const chat = @import("engine/chat.zig");
+const signal = @import("app/signal.zig");
+const terminal = @import("app/terminal.zig");
+const server = @import("server/server.zig");
+const config = @import("app/config.zig");
+const inference = @import("engine/inference.zig");
+const models = @import("app/models.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -67,6 +67,9 @@ pub fn main() !void {
                     \\  --host <string>        Server host (default: 127.0.0.1)
                     \\  --port <int>           Server port (default: 8080)
                     \\  --api-key <string>     Require Authorization: Bearer <api-key>
+                    \\  --residency             Use official bounded GGML weights (CPU only)
+                    \\  --weight-budget-mib <n> Active mapped immutable-weight budget
+                    \\  --state-budget-mib <n>  Hard limit for KV/state, workspace, logits (preflighted)
                     \\
                     \\Custom SIMD backend (built with -Dsimd-backend=true):
                     \\  --no-simd              Disable custom SIMD hooks (use ggml default)
@@ -90,7 +93,6 @@ pub fn main() !void {
                     \\
                     \\Server endpoints: /v1/chat/completions, /v1/completions, /v1/models, /health
                     \\
-
                 , .{args[0]});
                 return;
             },
@@ -145,6 +147,9 @@ pub fn main() !void {
             .draft_model_path = cfg.draft_model_path,
             .max_concurrent = cfg.max_concurrent,
             .prefix_cache = cfg.prefix_cache,
+            .residency_enabled = cfg.residency_enabled,
+            .residency_weight_budget_bytes = try mibToBytes(cfg.residency_weight_budget_mib),
+            .residency_state_budget_bytes = if (cfg.residency_state_budget_mib) |limit| try mibToBytes(limit) else null,
         });
         return;
     }
@@ -165,8 +170,13 @@ pub fn main() !void {
         .draft_model_path = cfg.draft_model_path,
         .max_concurrent = cfg.max_concurrent,
         .prefix_cache = cfg.prefix_cache,
+        .residency_enabled = cfg.residency_enabled,
+        .residency_weight_budget_bytes = try mibToBytes(cfg.residency_weight_budget_mib),
+        .residency_state_budget_bytes = if (cfg.residency_state_budget_mib) |limit| try mibToBytes(limit) else null,
     };
 
+    var backend = llama_cpp.Backend.init();
+    defer backend.deinit();
     var engine = try server.Engine.init(allocator, model_path, engine_cfg);
     defer engine.deinit(allocator);
 
@@ -195,8 +205,10 @@ pub fn main() !void {
     if (cfg.prompt_mode) {
         if (cfg.user_prompt) |input| {
             const user_z = try chat.dupeZ(allocator, input);
-            errdefer allocator.free(user_z);
-            try msgs.append(allocator, .{ .role = .user, .content = user_z });
+            msgs.append(allocator, .{ .role = .user, .content = user_z }) catch |err| {
+                allocator.free(user_z);
+                return err;
+            };
 
             var dummy_ctx: u8 = 0;
             const sink: ?inference.TokenSink = if (cfg.stream) .{ .ctx = &dummy_ctx, .writeFn = printToken } else null;
@@ -322,6 +334,10 @@ pub fn main() !void {
 
         maybeSaveChat(allocator, cfg.save_chat_path, msgs.items);
     }
+}
+
+fn mibToBytes(value: usize) !usize {
+    return std.math.mul(usize, value, 1024 * 1024) catch error.InvalidResidencyBudget;
 }
 
 fn printToken(ctx: *anyopaque, bytes: []const u8) anyerror!void {

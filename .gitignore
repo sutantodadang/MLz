@@ -7,3 +7,6 @@ models
 .sisyphus/
 deps/
 mlz.toml
+.kode
+residency_smoke_*.log
+__pycache__/

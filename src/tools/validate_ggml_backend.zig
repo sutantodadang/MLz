@@ -1,0 +1,230 @@
+const std = @import("std");
+const mlz = @import("mlz");
+const llama = mlz.llama_cpp;
+const reference = @import("llama_reference.zig");
+const residency = mlz.residency;
+
+fn silentLog(_: llama.c.ggml_log_level, _: [*c]const u8, _: ?*anyopaque) callconv(.c) void {}
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    if (args.len < 2 or args.len > 5) {
+        std.debug.print(
+            "usage: validate-ggml-backend <model.gguf> [token-id[,token-id...]] [backed-budget-mib] [single|concurrent|cancel|fail]\n",
+            .{},
+        );
+        return error.InvalidArguments;
+    }
+
+    const path_z = try llama.dupeZ(allocator, args[1]);
+    defer allocator.free(path_z);
+    llama.c.llama_log_set(silentLog, null);
+    llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
+    if (!llama.c.mlz_ggml_residency_node_hooks_available()) {
+        return error.NodeHooksUnavailable;
+    }
+    const token_arg = if (args.len >= 3) args[2] else "1";
+    var tokens: std.ArrayList(usize) = .empty;
+    defer tokens.deinit(allocator);
+    var parts = std.mem.splitScalar(u8, token_arg, ',');
+    while (parts.next()) |part| {
+        if (tokens.items.len >= 512) return error.InvalidToken;
+        try tokens.append(allocator, try std.fmt.parseInt(usize, part, 10));
+    }
+    if (tokens.items.len == 0) return error.InvalidToken;
+    // Optional third argument switches validation to the file-backed mode:
+    // weights are never copied into the process; node hooks map each GGUF
+    // span per node through the residency manager under the given budget.
+    const backed_budget_mib: ?u64 = if (args.len >= 4)
+        try std.fmt.parseInt(u64, args[3], 10)
+    else
+        null;
+    const mode: reference.BackedMode = if (args.len < 5)
+        .single
+    else
+        std.meta.stringToEnum(reference.BackedMode, args[4]) orelse return error.InvalidArguments;
+
+    const vocab_count = try vocabularySize(path_z);
+    // llama_token is signed in the llama.cpp ABI: reject values which cannot
+    // survive the cast as well as values outside this model's vocabulary.
+    for (tokens.items) |token| {
+        if (token >= vocab_count or token > @as(usize, @intCast(std.math.maxInt(llama.Token)))) {
+            return error.InvalidToken;
+        }
+    }
+
+    const ordinary_logits = try allocator.alloc(f32, vocab_count);
+    defer allocator.free(ordinary_logits);
+    const backend_logits = try allocator.alloc(f32, vocab_count);
+    defer allocator.free(backend_logits);
+    const ordinary = try reference.sequenceLogitsMmap(
+        path_z,
+        tokens.items,
+        ordinary_logits,
+        residency.currentRss,
+    );
+    llama.c.mlz_ggml_residency_set_node_hooks_enabled(true);
+    defer llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
+    const custom = if (backed_budget_mib) |budget_mib|
+        try reference.sequenceLogitsGgmlBackendBacked(
+            allocator,
+            path_z,
+            tokens.items,
+            backend_logits,
+            residency.currentRss,
+            std.math.mul(usize, std.math.cast(usize, budget_mib) orelse
+                return error.InvalidBudget, 1024 * 1024) catch return error.InvalidBudget,
+            mode,
+        )
+    else
+        try reference.sequenceLogitsGgmlBackend(
+            path_z,
+            tokens.items,
+            backend_logits,
+            residency.currentRss,
+        );
+
+    var max_error: f32 = 0;
+    var sum_error: f64 = 0;
+    var exact = true;
+    for (ordinary_logits, backend_logits) |expected, actual| {
+        if (!std.math.isFinite(expected) or !std.math.isFinite(actual)) {
+            return error.NonFiniteLogits;
+        }
+        const difference = @abs(expected - actual);
+        max_error = @max(max_error, difference);
+        sum_error += difference;
+        exact = exact and @as(u32, @bitCast(expected)) == @as(u32, @bitCast(actual));
+    }
+
+    const expected_argmax = argmax(ordinary_logits);
+    const actual_argmax = argmax(backend_logits);
+    const stats = custom.stats;
+    const mean_error = sum_error / @as(f64, @floatFromInt(vocab_count));
+    const top1_matches = expected_argmax == actual_argmax;
+    const numerically_close = max_error <= 0.1 and mean_error <= 0.02 and top1_matches;
+    std.debug.print(
+        \\official GGML residency backend validation
+        \\  model: {s}
+        \\  tokens: {s}, vocab: {d}
+        \\  ordinary llama.cpp: load={d:.2} ms decode={d:.2} ms
+        \\  MLz buffer backend: load={d:.2} ms decode={d:.2} ms
+        \\  logits: exact={any}, max-error={d:.9}, mean-error={d:.9}, argmax={d}/{d}
+        \\  backend buffers: allocated={d}, tensors={d}, uploads={d}, uploaded={d:.2} MiB
+        \\  backend allocation: current={d:.2} MiB, peak={d:.2} MiB
+        \\  node hooks: pre={d}, post={d}, active={d}, peak-active={d}
+        \\
+    , .{
+        args[1],
+        token_arg,
+        vocab_count,
+        ordinary.load_ms,
+        ordinary.decode_ms,
+        custom.run.load_ms,
+        custom.run.decode_ms,
+        exact,
+        max_error,
+        mean_error,
+        expected_argmax,
+        actual_argmax,
+        stats.buffers_allocated,
+        stats.tensors_initialized,
+        stats.tensor_uploads,
+        mib(stats.uploaded_bytes),
+        mib(stats.current_allocated_bytes),
+        mib(stats.peak_allocated_bytes),
+        stats.node_pre_calls,
+        stats.node_post_calls,
+        stats.current_active_nodes,
+        stats.peak_active_nodes,
+    });
+
+    // CPU_REPACK uses a different packed layout/reduction kernel than the
+    // ordinary host buffer selected by this override. With cpu-repack=false
+    // this gate is bit-exact; with the default repack build require the same
+    // conservative numerical/top-1 gate used by the native reference path.
+    if (!exact and !numerically_close) {
+        return error.LogitMismatch;
+    }
+    if (stats.node_pre_calls == 0 or
+        stats.node_pre_calls != stats.node_post_calls or
+        stats.current_active_nodes != 0 or stats.peak_active_nodes < 1)
+    {
+        return error.NodeHookImbalance;
+    }
+    if (stats.buffers_allocated == 0 or stats.tensors_initialized == 0 or
+        stats.tensor_uploads == 0 or stats.current_allocated_bytes == 0 or
+        stats.peak_allocated_bytes == 0)
+    {
+        return error.CustomBackendNotUsed;
+    }
+    if (backed_budget_mib != null) {
+        // File-backed mode: no weight bytes may have been copied at load
+        // time, every acquire must be balanced by a release, and node hooks
+        // must actually have run.
+        if (stats.uploaded_bytes != 0) {
+            return error.BackedWeightsUploaded;
+        }
+        if (stats.residency_acquires == 0 or
+            stats.residency_acquires != stats.residency_releases)
+        {
+            return error.ResidencyAcquireReleaseImbalance;
+        }
+        if (stats.node_pre_calls == 0) {
+            return error.NodeHookImbalance;
+        }
+        const metrics = custom.residency_metrics orelse
+            return error.ResidencyBridgeMissing;
+        if (metrics.peak_resident_bytes > metrics.budget_bytes) {
+            return error.ResidencyBudgetExceeded;
+        }
+        std.debug.print(
+            \\  residency: budget={d:.2} MiB, peak-resident={d:.2} MiB, faults={d}, hits={d}, evictions={d}
+            \\
+        , .{
+            mib(metrics.budget_bytes),
+            mib(metrics.peak_resident_bytes),
+            metrics.faults,
+            metrics.hits,
+            metrics.evictions,
+        });
+    } else if (stats.uploaded_bytes == 0) {
+        return error.CustomBackendNotUsed;
+    }
+}
+
+fn vocabularySize(path_z: [:0]const u8) !usize {
+    const backend = llama.Backend.init();
+    defer backend.deinit();
+
+    var model_params = llama.c.llama_model_default_params();
+    // Parse only GGUF metadata/vocabulary. The two validation runs perform the
+    // actual ordinary/custom loads; avoid materializing weights a third time.
+    model_params.vocab_only = true;
+    model_params.use_mmap = true;
+    model_params.use_mlock = false;
+    const model = try llama.Model.load(path_z, model_params);
+    defer model.deinit();
+
+    const vocab = model.vocab() orelse return error.VocabUnavailable;
+    const count = llama.c.llama_vocab_n_tokens(vocab);
+    if (count <= 0) return error.VocabUnavailable;
+    return @intCast(count);
+}
+
+fn argmax(values: []const f32) usize {
+    var best: usize = 0;
+    for (values[1..], 1..) |value, index| {
+        if (value > values[best]) best = index;
+    }
+    return best;
+}
+
+fn mib(bytes: anytype) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+}

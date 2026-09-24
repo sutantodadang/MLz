@@ -17,7 +17,7 @@
 //! thread, so no locking.
 
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const llama = @import("../llama/llama_cpp.zig");
 const Token = llama.Token;
 
 pub const PrefixCache = struct {
