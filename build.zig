@@ -85,11 +85,13 @@ pub fn build(b: *std.Build) void {
         .target = actual_target,
         .link_libc = true,
     });
-    mod.addIncludePath(b.path("src"));
+    mod.addIncludePath(b.path("src/llama"));
+    mod.addIncludePath(b.path("src/residency"));
+    mod.addIncludePath(llama_cpp_dep.path("include"));
     mod.addIncludePath(llama_cpp_dep.path("ggml/include"));
     mod.addIncludePath(llama_cpp_dep.path("ggml/src"));
     mod.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
+        .file = b.path("src/residency/residency_mmap.c"),
         .flags = &.{"-std=c11"},
     });
 
@@ -246,7 +248,7 @@ pub fn build(b: *std.Build) void {
     // It is linked into GGML so every executable can opt into native graph
     // execution over the same custom buffer implementation.
     ggml_lib.addCSourceFile(.{
-        .file = b.path("src/ggml_residency_backend.c"),
+        .file = b.path("src/residency/ggml_residency_backend.c"),
         .flags = c_flags.items,
     });
 
@@ -257,7 +259,7 @@ pub fn build(b: *std.Build) void {
         const patcher = b.addExecutable(.{
             .name = "patch-ggml-residency",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/patch_ggml_residency.zig"),
+                .root_source_file = b.path("src/tools/patch_ggml_residency.zig"),
                 .target = b.graph.host,
                 .optimize = .ReleaseSafe,
             }),
@@ -1621,7 +1623,6 @@ pub fn build(b: *std.Build) void {
     ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/include"));
     ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src"));
     ggml_lib.addIncludePath(llama_cpp_dep.path("ggml/src/ggml-cpu"));
-    ggml_lib.addIncludePath(b.path("src")); // To find ggml_shim.h
     ggml_lib.linkLibC();
     if (actual_target.query.abi != .msvc) {
         ggml_lib.linkLibCpp();
@@ -1705,7 +1706,8 @@ pub fn build(b: *std.Build) void {
     }
 
     llama_lib.addIncludePath(llama_cpp_dep.path("vendor"));
-    llama_lib.addIncludePath(b.path("src"));
+    llama_lib.addIncludePath(b.path("src/llama"));
+    llama_lib.addIncludePath(b.path("src/residency"));
 
     inline for (.{ "caps", "lexer", "parser", "runtime", "string", "value" }) |jinja_src| {
         llama_lib.addCSourceFile(.{
@@ -1718,11 +1720,11 @@ pub fn build(b: *std.Build) void {
         .flags = cpp_flags.items,
     });
     llama_lib.addCSourceFile(.{
-        .file = b.path("src/jinja_shim.cpp"),
+        .file = b.path("src/llama/jinja_shim.cpp"),
         .flags = cpp_flags.items,
     });
     llama_lib.addCSourceFile(.{
-        .file = b.path("src/llama_memory_shim.cpp"),
+        .file = b.path("src/llama/llama_memory_shim.cpp"),
         .flags = cpp_flags.items,
     });
 
@@ -1773,7 +1775,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addIncludePath(b.path("src"));
+    exe.root_module.addIncludePath(b.path("src/llama"));
+    exe.root_module.addIncludePath(b.path("src/residency"));
 
     // Link GGML
     exe.linkLibrary(ggml_lib);
@@ -1936,7 +1939,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{
         .name = "bench_simd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_simd.zig"),
+            .root_source_file = b.path("src/tools/bench_simd.zig"),
             .target = actual_target,
             .optimize = optimize,
         }),
@@ -1956,19 +1959,17 @@ pub fn build(b: *std.Build) void {
     // tensor_buft_override) and accepts exact logits, or the documented tight
     // numerical/top-1 gate when CPU_REPACK selects a different packed kernel.
     const validate_ggml_backend_module = b.createModule(.{
-        .root_source_file = b.path("src/validate_ggml_backend.zig"),
+        .root_source_file = b.path("src/tools/validate_ggml_backend.zig"),
         .target = actual_target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "mlz", .module = mod },
+        },
     });
-    validate_ggml_backend_module.addIncludePath(b.path("src"));
     validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("include"));
     validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
     validate_ggml_backend_module.addIncludePath(llama_cpp_dep.path("ggml/src"));
-    validate_ggml_backend_module.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
-        .flags = &.{"-std=c11"},
-    });
     const validate_ggml_backend_exe = b.addExecutable(.{
         .name = "validate_ggml_backend",
         .root_module = validate_ggml_backend_module,
@@ -1990,7 +1991,7 @@ pub fn build(b: *std.Build) void {
     const test_simd_exe = b.addExecutable(.{
         .name = "test_simd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_simd.zig"),
+            .root_source_file = b.path("src/tools/test_simd.zig"),
             .target = actual_target,
             .optimize = optimize,
         }),
@@ -2022,11 +2023,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    mod_test_module.addIncludePath(b.path("src"));
+    mod_test_module.addIncludePath(b.path("src/llama"));
+    mod_test_module.addIncludePath(b.path("src/residency"));
     mod_test_module.addIncludePath(llama_cpp_dep.path("include"));
     mod_test_module.addIncludePath(llama_cpp_dep.path("ggml/include"));
     mod_test_module.addCSourceFile(.{
-        .file = b.path("src/residency_mmap.c"),
+        .file = b.path("src/residency/residency_mmap.c"),
         .flags = &.{"-std=c11"},
     });
     const mod_tests = b.addTest(.{

@@ -1,12 +1,12 @@
 const std = @import("std");
-const llama_cpp = @import("llama_cpp.zig");
-const chat = @import("chat.zig");
-const signal = @import("signal.zig");
-const terminal = @import("terminal.zig");
-const server = @import("server.zig");
-const config = @import("config.zig");
-const inference = @import("inference.zig");
-const models = @import("models.zig");
+const llama_cpp = @import("llama/llama_cpp.zig");
+const chat = @import("engine/chat.zig");
+const signal = @import("app/signal.zig");
+const terminal = @import("app/terminal.zig");
+const server = @import("server/server.zig");
+const config = @import("app/config.zig");
+const inference = @import("engine/inference.zig");
+const models = @import("app/models.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

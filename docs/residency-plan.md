@@ -176,7 +176,7 @@ Checklist:
     aktivasi graph berada di compute workspace);
   - optional GPU allocations: tidak berlaku, residency hanya CPU (P3.1).
 - [x] Satukan policy executor/service yang sudah ada dengan official GGML path.
-      (Normal path memakai `src/residency_memory_policy.zig`; endpoint proof
+      (Normal path memakai `src/residency/memory_policy.zig`; endpoint proof
       lama sudah dihapus.)
 - [x] Tambahkan checked estimators sebelum alokasi context/model/request state.
       (`llama_model_params.no_alloc` + `llama_get_memory_breakdown`.)

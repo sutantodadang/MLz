@@ -11,9 +11,9 @@
 //! single-model: validation tools open one model before enabling hooks.
 
 const std = @import("std");
-const residency = @import("residency.zig");
-const gguf_residency = @import("gguf_residency.zig");
-const llama_cpp = @import("llama_cpp.zig");
+const residency = @import("manager.zig");
+const gguf_residency = @import("gguf_index.zig");
+const llama_cpp = @import("../llama/llama_cpp.zig");
 
 const Manager = residency.Manager;
 const BackingStore = residency.BackingStore;

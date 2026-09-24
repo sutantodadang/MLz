@@ -1,13 +1,13 @@
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const llama = @import("../llama/llama_cpp.zig");
 const chat_lib = @import("chat.zig");
-const signal = @import("signal.zig");
+const signal = @import("../app/signal.zig");
 const inference = @import("inference.zig");
-const openai = @import("openai.zig");
+const openai = @import("../server/openai.zig");
 const sched = @import("scheduler.zig");
-const residency = @import("residency.zig");
-const residency_bridge = @import("residency_ggml_bridge.zig");
-const memory_policy = @import("residency_memory_policy.zig");
+const residency = @import("../residency/manager.zig");
+const residency_bridge = @import("../residency/ggml_bridge.zig");
+const memory_policy = @import("../residency/memory_policy.zig");
 
 /// Configuration for the inference engine.
 pub const EngineConfig = struct {

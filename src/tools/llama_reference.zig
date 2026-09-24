@@ -1,5 +1,6 @@
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const mlz = @import("mlz");
+const llama = mlz.llama_cpp;
 
 pub const Error = llama.LlamaError || error{
     BackendAlreadyInUse,
@@ -16,7 +17,7 @@ pub const Run = struct {
 pub const GgmlBackendRun = struct {
     run: Run,
     stats: llama.c.struct_mlz_ggml_residency_stats,
-    residency_metrics: ?@import("residency.zig").Metrics = null,
+    residency_metrics: ?mlz.residency.Metrics = null,
 };
 
 /// Runs a deterministic CPU-only llama.cpp prefill and copies the complete
@@ -154,7 +155,7 @@ pub fn sequenceLogitsGgmlBackendBacked(
         if (token > @as(usize, @intCast(std.math.maxInt(llama.Token)))) return Error.InvalidToken;
     }
 
-    const bridge = @import("residency_ggml_bridge.zig");
+    const bridge = mlz.residency_ggml_bridge;
     bridge.init(allocator, path_z, budget_bytes) catch |err| switch (err) {
         error.BridgeAlreadyInitialized => return error.BackendAlreadyInUse,
         else => return err,

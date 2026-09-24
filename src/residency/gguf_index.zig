@@ -1,5 +1,5 @@
 const std = @import("std");
-const residency = @import("residency.zig");
+const residency = @import("manager.zig");
 
 const c = @cImport({
     @cInclude("gguf.h");

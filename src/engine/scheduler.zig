@@ -18,7 +18,7 @@
 //! Upgrade path if it matters: per-slot output queue drained by writer threads.
 
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
+const llama = @import("../llama/llama_cpp.zig");
 const inference = @import("inference.zig");
 const prefix = @import("prefix_cache.zig");
 

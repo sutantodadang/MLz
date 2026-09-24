@@ -32,12 +32,12 @@ upstream fused execution path.
 
 The implementation lives in:
 
-- `src/ggml_residency_backend.h`
-- `src/ggml_residency_backend.c`
-- `src/residency_ggml_bridge.zig`
-- `src/patch_ggml_residency.zig`
-- `src/residency_llama_reference.zig`
-- `src/validate_ggml_backend.zig`
+- `src/residency/ggml_residency_backend.h`
+- `src/residency/ggml_residency_backend.c`
+- `src/residency/ggml_bridge.zig`
+- `src/tools/patch_ggml_residency.zig`
+- `src/tools/llama_reference.zig`
+- `src/tools/validate_ggml_backend.zig`
 
 ## Validation
 
@@ -64,7 +64,7 @@ zig build validate-ggml-backend -Doptimize=ReleaseFast -Dsimd-backend=false \
 ```
 
 The dependency is pinned to llama.cpp/GGML tag `b9106` in `build.zig.zon`.
-`src/patch_ggml_residency.zig` requires each upstream hook marker exactly once;
+`src/tools/patch_ggml_residency.zig` requires each upstream hook marker exactly once;
 the hooks-enabled build fails when the vendored CPU source shape drifts.
 
 Observed on the 762.81 MiB Llama-3.2-1B Q4_K_M model:
@@ -167,7 +167,7 @@ The weight budget bounds mapped immutable weights only. `state_budget_mib` is a
 hard limit for everything else a context allocates, planned before any
 allocation by simulating the model and context with
 `llama_model_params.no_alloc` and reading llama.cpp's own memory breakdown
-(`src/llama_memory_shim.cpp`):
+(`src/llama/llama_memory_shim.cpp`):
 
 | Category | Source |
 |---|---|

@@ -82,7 +82,7 @@ Per-kernel correctness/perf is exercised by `zig build bench -Dsimd-backend=true
    [src/simd/ggml_simd_hook.cpp](../src/simd/ggml_simd_hook.cpp).
 4. Wire the dispatch in `ggml_simd_try_mul_mat` (the `else if (src0->type == ...)`
    chain).
-5. Add a correctness test in [src/bench_simd.zig](../src/bench_simd.zig).
+5. Add a correctness test in [src/tools/bench_simd.zig](../src/tools/bench_simd.zig).
 6. Run `tests/e2e_token_diff.ps1` to confirm no end-to-end divergence.
 
 A future improvement (tracked in PLAN-ASSEMBLY-REWRITE) is to drive steps 2–4

@@ -1,7 +1,8 @@
 const std = @import("std");
-const llama = @import("llama_cpp.zig");
-const reference = @import("residency_llama_reference.zig");
-const residency = @import("residency.zig");
+const mlz = @import("mlz");
+const llama = mlz.llama_cpp;
+const reference = @import("llama_reference.zig");
+const residency = mlz.residency;
 
 fn silentLog(_: llama.c.ggml_log_level, _: [*c]const u8, _: ?*anyopaque) callconv(.c) void {}
 
