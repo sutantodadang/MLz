@@ -5,12 +5,14 @@ on:
     paths:
       - 'src/**'
       - 'build.zig*'
+      - 'build/**'
       - 'tests/residency_server_smoke.py'
       - '.github/workflows/residency.yml'
   pull_request:
     paths:
       - 'src/**'
       - 'build.zig*'
+      - 'build/**'
       - 'tests/residency_server_smoke.py'
       - '.github/workflows/residency.yml'
   # Real-model gates are heavy: nightly, or on demand.
