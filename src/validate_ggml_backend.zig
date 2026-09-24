@@ -12,9 +12,9 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    if (args.len < 2 or args.len > 4) {
+    if (args.len < 2 or args.len > 5) {
         std.debug.print(
-            "usage: validate-ggml-backend <model.gguf> [token-id] [backed-budget-mib]\n",
+            "usage: validate-ggml-backend <model.gguf> [token-id[,token-id...]] [backed-budget-mib] [single|concurrent|cancel|fail]\n",
             .{},
         );
         return error.InvalidArguments;
@@ -27,34 +27,43 @@ pub fn main() !void {
     if (!llama.c.mlz_ggml_residency_node_hooks_available()) {
         return error.NodeHooksUnavailable;
     }
-    const token = if (args.len >= 3)
-        try std.fmt.parseInt(usize, args[2], 10)
-    else
-        1;
+    const token_arg = if (args.len >= 3) args[2] else "1";
+    var tokens: std.ArrayList(usize) = .empty;
+    defer tokens.deinit(allocator);
+    var parts = std.mem.splitScalar(u8, token_arg, ',');
+    while (parts.next()) |part| {
+        if (tokens.items.len >= 512) return error.InvalidToken;
+        try tokens.append(allocator, try std.fmt.parseInt(usize, part, 10));
+    }
+    if (tokens.items.len == 0) return error.InvalidToken;
     // Optional third argument switches validation to the file-backed mode:
     // weights are never copied into the process; node hooks map each GGUF
     // span per node through the residency manager under the given budget.
-    const backed_budget_mib: ?u64 = if (args.len == 4)
+    const backed_budget_mib: ?u64 = if (args.len >= 4)
         try std.fmt.parseInt(u64, args[3], 10)
     else
         null;
+    const mode: reference.BackedMode = if (args.len < 5)
+        .single
+    else
+        std.meta.stringToEnum(reference.BackedMode, args[4]) orelse return error.InvalidArguments;
 
     const vocab_count = try vocabularySize(path_z);
     // llama_token is signed in the llama.cpp ABI: reject values which cannot
     // survive the cast as well as values outside this model's vocabulary.
-    if (token >= vocab_count or token > @as(usize, @intCast(std.math.maxInt(llama.Token)))) {
-        return error.InvalidToken;
+    for (tokens.items) |token| {
+        if (token >= vocab_count or token > @as(usize, @intCast(std.math.maxInt(llama.Token)))) {
+            return error.InvalidToken;
+        }
     }
 
     const ordinary_logits = try allocator.alloc(f32, vocab_count);
     defer allocator.free(ordinary_logits);
     const backend_logits = try allocator.alloc(f32, vocab_count);
     defer allocator.free(backend_logits);
-    const tokens = [_]usize{token};
-
     const ordinary = try reference.sequenceLogitsMmap(
         path_z,
-        &tokens,
+        tokens.items,
         ordinary_logits,
         residency.currentRss,
     );
@@ -64,16 +73,17 @@ pub fn main() !void {
         try reference.sequenceLogitsGgmlBackendBacked(
             allocator,
             path_z,
-            &tokens,
+            tokens.items,
             backend_logits,
             residency.currentRss,
-            std.math.cast(usize, budget_mib * 1024 * 1024) orelse
-                return error.InvalidBudget,
+            std.math.mul(usize, std.math.cast(usize, budget_mib) orelse
+                return error.InvalidBudget, 1024 * 1024) catch return error.InvalidBudget,
+            mode,
         )
     else
         try reference.sequenceLogitsGgmlBackend(
             path_z,
-            &tokens,
+            tokens.items,
             backend_logits,
             residency.currentRss,
         );
@@ -100,7 +110,7 @@ pub fn main() !void {
     std.debug.print(
         \\official GGML residency backend validation
         \\  model: {s}
-        \\  token: {d}, vocab: {d}
+        \\  tokens: {s}, vocab: {d}
         \\  ordinary llama.cpp: load={d:.2} ms decode={d:.2} ms
         \\  MLz buffer backend: load={d:.2} ms decode={d:.2} ms
         \\  logits: exact={any}, max-error={d:.9}, mean-error={d:.9}, argmax={d}/{d}
@@ -110,7 +120,7 @@ pub fn main() !void {
         \\
     , .{
         args[1],
-        token,
+        token_arg,
         vocab_count,
         ordinary.load_ms,
         ordinary.decode_ms,

@@ -8,3 +8,4 @@ models
 deps/
 mlz.toml
 .kode
+residency_smoke_*.log

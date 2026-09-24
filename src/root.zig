@@ -22,6 +22,7 @@ pub const residency_qwen3next = @import("residency_qwen3next.zig");
 pub const residency_qwen3next_parallel = @import("residency_qwen3next_parallel.zig");
 pub const residency_service = @import("residency_service.zig");
 pub const residency_ggml_bridge = @import("residency_ggml_bridge.zig");
+pub const residency_memory_policy = @import("residency_memory_policy.zig");
 
 test {
     // Run tests in all imported modules

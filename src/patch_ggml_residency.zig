@@ -4,13 +4,15 @@ const declaration_marker = "#include \"common.h\"\n";
 const declaration_patch = declaration_marker ++
     "\n#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS\n" ++
     "extern bool mlz_ggml_residency_node_hooks_enabled(void);\n" ++
-    "extern void mlz_ggml_residency_node_pre(struct ggml_tensor * node);\n" ++
-    "extern void mlz_ggml_residency_node_post(struct ggml_tensor * node);\n" ++
+    "extern bool mlz_ggml_residency_node_pre(struct ggml_tensor * node);\n" ++
+    "extern bool mlz_ggml_residency_node_post(struct ggml_tensor * node);\n" ++
+    "extern void mlz_ggml_residency_mark_failed(const struct ggml_tensor * tensor, const char * what);\n" ++
     "extern bool mlz_ggml_residency_should_tile_mul_mat(struct ggml_tensor * node);\n" ++
     "extern bool mlz_ggml_residency_should_tile_mul_mat_id(struct ggml_tensor * node);\n" ++
     "extern size_t mlz_ggml_residency_tile_capacity(struct ggml_tensor * tensor, size_t tensor_offset);\n" ++
     "extern bool mlz_ggml_residency_tile_acquire(struct ggml_tensor * tensor, size_t tensor_offset, size_t byte_len);\n" ++
     "extern bool mlz_ggml_residency_tile_release(struct ggml_tensor * tensor);\n" ++
+    "extern bool mlz_ggml_residency_get_rows_sparse(struct ggml_tensor * node, int ith);\n" ++
     "#endif /* GGML_USE_MLZ_RESIDENCY_HOOKS */\n";
 
 const mul_mat_marker =
@@ -70,6 +72,7 @@ const mul_mat_patch = mul_mat_marker ++
     "                if (tile_rows < 1 || tile_rows > INT_MAX ||\n" ++
     "                    !mlz_ggml_residency_tile_acquire(\n" ++
     "                        mlz_src0, tensor_offset, (size_t) tile_rows * mlz_row_bytes)) {\n" ++
+    "                    mlz_ggml_residency_mark_failed(mlz_src0, \"MUL_MAT tile acquisition failed\");\n" ++
     "                    atomic_store_explicit(&params->threadpool->current_chunk, -1, memory_order_release);\n" ++
     "                } else {\n" ++
     "                    atomic_store_explicit(&params->threadpool->current_chunk, (int) tile_rows, memory_order_release);\n" ++
@@ -78,8 +81,10 @@ const mul_mat_patch = mul_mat_marker ++
     "            ggml_barrier(params->threadpool);\n" ++
     "            const int64_t tile_rows = atomic_load_explicit(\n" ++
     "                &params->threadpool->current_chunk, memory_order_acquire);\n" ++
+    "            // Every worker observes the same value, so all leave together;\n" ++
+    "            // the node post hook turns the failure into GGML_STATUS_FAILED.\n" ++
     "            if (tile_rows < 1) {\n" ++
-    "                GGML_ABORT(\"MLz MUL_MAT tile acquisition failed\");\n" ++
+    "                return;\n" ++
     "            }\n" ++
     "            const int64_t ir0_start = row_start + tile_rows * mlz_ith / mlz_nth;\n" ++
     "            const int64_t ir0_end = row_start + tile_rows * (mlz_ith + 1) / mlz_nth;\n" ++
@@ -114,6 +119,7 @@ const mul_mat_id_patch =
     "                    tile_rows = MIN(tile_rows, nr0 - row_start);\n" ++
     "                    if (tile_rows < 1 || tile_rows > INT_MAX ||\n" ++
     "                        !mlz_ggml_residency_tile_acquire((struct ggml_tensor *) src0, tensor_offset, (size_t) tile_rows * nb01)) {\n" ++
+    "                        mlz_ggml_residency_mark_failed(src0, \"MUL_MAT_ID tile acquisition failed\");\n" ++
     "                        atomic_store_explicit((atomic_int *) (atomic_current_chunk + cur_a), -1, memory_order_release);\n" ++
     "                    } else {\n" ++
     "                        atomic_store_explicit((atomic_int *) (atomic_current_chunk + cur_a), (int) tile_rows, memory_order_release);\n" ++
@@ -121,7 +127,7 @@ const mul_mat_id_patch =
     "                }\n" ++
     "                ggml_barrier(params->threadpool);\n" ++
     "                const int64_t tile_rows = atomic_load_explicit((atomic_int *) (atomic_current_chunk + cur_a), memory_order_acquire);\n" ++
-    "                if (tile_rows < 1) { GGML_ABORT(\"MLz MUL_MAT_ID tile acquisition failed\"); }\n" ++
+    "                if (tile_rows < 1) { return; } // all workers leave; post hook fails the graph\n" ++
     "                const int64_t ir0_start = row_start + tile_rows * ith / nth;\n" ++
     "                const int64_t ir0_end = row_start + tile_rows * (ith + 1) / nth;\n" ++
     "                const char * src0_cur = (const char *) src0->data + cur_a * nb02;\n" ++
@@ -139,6 +145,20 @@ const mul_mat_id_patch =
     "#endif /* GGML_USE_MLZ_RESIDENCY_HOOKS */\n" ++
     mul_mat_id_marker;
 
+const get_rows_marker =
+    "        case GGML_OP_GET_ROWS:\n" ++
+    "            {\n" ++
+    "                ggml_compute_forward_get_rows(params, tensor);\n" ++
+    "            } break;";
+const get_rows_patch =
+    "        case GGML_OP_GET_ROWS:\n" ++
+    "            {\n" ++
+    "#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS\n" ++
+    "                if (mlz_ggml_residency_get_rows_sparse(tensor, params->ith)) break;\n" ++
+    "#endif\n" ++
+    "                ggml_compute_forward_get_rows(params, tensor);\n" ++
+    "            } break;";
+
 const loop_marker =
     "        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time\n" ++
     "        // Try fused ops, fall back to normal compute\n" ++
@@ -152,10 +172,17 @@ const loop_marker =
 const loop_patch =
     "#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS\n" ++
     "        if (mlz_hooks_enabled) {\n" ++
-    "            if (state->ith == 0) {\n" ++
-    "                mlz_ggml_residency_node_pre(node);\n" ++
+    "            // A failed pre hook holds no pins. Stop every worker at this\n" ++
+    "            // node and report GGML_STATUS_FAILED instead of aborting.\n" ++
+    "            if (state->ith == 0 && !mlz_ggml_residency_node_pre(node)) {\n" ++
+    "                mlz_ggml_residency_node_post(node);\n" ++
+    "                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);\n" ++
+    "                tp->ec = GGML_STATUS_FAILED;\n" ++
     "            }\n" ++
     "            ggml_barrier(state->threadpool);\n" ++
+    "            if (atomic_load_explicit(&tp->abort, memory_order_relaxed) == node_n + 1) {\n" ++
+    "                break;\n" ++
+    "            }\n" ++
     "            ggml_compute_forward(&params, node);\n" ++
     "        } else {\n" ++
     "#endif\n" ++
@@ -181,8 +208,11 @@ const barrier_patch =
     "#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS\n" ++
     "        if (mlz_hooks_enabled) {\n" ++
     "            ggml_barrier(state->threadpool);\n" ++
-    "            if (state->ith == 0) {\n" ++
-    "                mlz_ggml_residency_node_post(node);\n" ++
+    "            if (state->ith == 0 && !mlz_ggml_residency_node_post(node)) {\n" ++
+    "                // An operation failed inside this node. Its pins are released;\n" ++
+    "                // the loop condition stops all workers before the next node.\n" ++
+    "                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);\n" ++
+    "                tp->ec = GGML_STATUS_FAILED;\n" ++
     "            }\n" ++
     "            ggml_barrier(state->threadpool);\n" ++
     "        } else {\n" ++
@@ -218,7 +248,9 @@ pub fn main() !void {
     defer allocator.free(patched_mul_mat);
     const patched_mul_mat_id = try replaceExactlyOnce(allocator, patched_mul_mat, mul_mat_id_marker, mul_mat_id_patch, "MUL_MAT_ID expert loop");
     defer allocator.free(patched_mul_mat_id);
-    const patched_loop_start = try replaceExactlyOnce(allocator, patched_mul_mat_id, before_loop_marker, before_loop_patch, "graph loop start");
+    const patched_get_rows = try replaceExactlyOnce(allocator, patched_mul_mat_id, get_rows_marker, get_rows_patch, "GET_ROWS dispatch");
+    defer allocator.free(patched_get_rows);
+    const patched_loop_start = try replaceExactlyOnce(allocator, patched_get_rows, before_loop_marker, before_loop_patch, "graph loop start");
     defer allocator.free(patched_loop_start);
     const patched_compute = try replaceExactlyOnce(allocator, patched_loop_start, loop_marker, loop_patch, "node compute block");
     defer allocator.free(patched_compute);

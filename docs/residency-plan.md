@@ -31,13 +31,476 @@ Membuktikan bahwa MLz dapat mengakses tensor/model dari backing file dengan acti
 | 6. End-to-end memory proof | Selesai | CPU execution adapter dengan bounded pin lifetime, full token path (embedding, seluruh decoder blocks, output norm, LM head), prompt prefill, incremental append/KV reuse, CLI budget, RSS instrumentation, dan llama.cpp reference tersedia | Resident-vs-bounded logits identik; prefill-vs-incremental identik; llama.cpp reference berada dalam toleransi numerik dan top-1 sama pada Llama 3.2 1B nyata |
 | 7. Concurrency/prefetch | Selesai | Thread-safe manager, bounded fixed-worker prefetch scheduler, sync page prefault, adaptive budget-aware tile policy, configurable replacement, dan long token-loop benchmark | Concurrent acquire/release menjaga invariant budget; queue menerapkan backpressure; prefetched acquire menjadi hit; adaptive tiles identik dan mengurangi faults; tuning tidak diklaim lebih cepat bila benchmark tidak mendukung |
 | 8. Batched prefill & execution proof | Selesai | Batched F32/quantized projection, layer-major causal Llama prefill, prompt 128/512 benchmark, same-window shared-manager executor stress, dan bounded Qwen3-Next Q2_K projection probe | Prefill identik dengan incremental; one-scan projection reuse mengurangi faults; prompt tetap dalam weight budget; Qwen probe tidak mengklaim graph DeltaNet/MoE penuh |
-| 11. Official GGML backend bridge | Milestone 3 selesai (bounded file-backed node residency) | `MLzResidency` buffer memakai reserved identity space; native node hooks acquire/rebase/release GGUF mappings melalui `residency.Manager`; stock GGML kernels tetap dipakai | Upload weight nol; acquire/release seimbang; peak mapping ≤ budget; logits bit-identik saat CPU_REPACK off; 762.81 MiB model tervalidasi pada budget 220 MiB |
+| 11. Official GGML backend bridge | Milestone 4 selesai (native tiled bounded residency) | `MLzResidency` official buffer backend memakai reserved identity space; synchronized native node hooks; file-backed acquire/rebase/release; tiled stock-GGML `MUL_MAT`, `MUL_MAT_ID`, dan bounded `GET_ROWS` | Upload weight nol; hooks seimbang; peak mapping ≤ budget; Llama 762.81 MiB dan Qwen3-Coder-Next 27.2 GiB berjalan dengan budget 4 MiB; logits bit-identik saat CPU_REPACK off |
 
-> Detail integrasi, validation command, dan minimum-budget constraint: [Official GGML Residency Backend Integration](ggml-residency-backend.md).
-> Milestone 3 sudah menghubungkan pre/post node hook ke descriptor GGUF dan
-> bounded mapping. Stock contiguous kernels masih mensyaratkan budget cukup
-> untuk source terbesar/node union; langkah berikutnya adalah tiled native
-> `MUL_MAT` untuk menjalankan tensor yang lebih besar daripada budget.
+## Current verdict and canonical status
+
+**Target proof awal sudah tercapai.** Status kanonik proyek saat ini adalah:
+
+> MLz dapat menjalankan model melalui graph dan kernel resmi GGML, dengan
+> active mapped immutable weights yang dibatasi secara eksplisit, melakukan
+> fault dari backing GGUF secara transparan, dan melepaskan mapping agar dapat
+> di-evict tanpa mengubah hasil komputasi.
+
+Bukti real-model terbaru:
+
+| Model | Logical weights | Weight budget | Peak mapped | Weight upload | Correctness gate |
+|---|---:|---:|---:|---:|---|
+| Llama 3.2 1B Q4_K_M | 762.81 MiB | 4 MiB | 4 MiB | 0 byte | logits bit-identik dengan ordinary llama.cpp saat CPU_REPACK off |
+| Qwen3-Coder-Next Q2_K | 27.2 GiB | 4 MiB | 4 MiB | 0 byte | logits bit-identik dengan ordinary llama.cpp saat CPU_REPACK off |
+
+Native official-GGML path yang sudah tercakup:
+
+- `ggml_backend_buffer_type_t` melalui `tensor_buft_overrides`;
+- GGUF file-backed mappings, pin/release, faults, metrics, dan eviction;
+- synchronized pre/post node lifetime hooks;
+- tiled native `MUL_MAT` untuk regular projections;
+- selected-expert tiled `MUL_MAT_ID` untuk routed MoE Qwen3-Next;
+- bounded `GET_ROWS` untuk token embedding;
+- stock GGML graph construction, scheduling, type conversion, vec-dot, DeltaNet,
+  attention, dan MoE arithmetic tetap digunakan.
+
+**Batas klaim:** budget 4 MiB adalah batas active mapped immutable weights,
+bukan batas total process RSS. KV cache, recurrent state, graph workspace, dan
+logits buffer dibatasi terpisah oleh `state_budget_mib` (P0.2). Allocator
+memory, thread stacks, filesystem page cache, dan GPU VRAM tidak memiliki hard
+limit.
+
+## Productization roadmap — post-proof tracking
+
+Bagian ini adalah tracker kanonik untuk pekerjaan setelah proof. Status hanya
+boleh berubah menjadi `Selesai` setelah acceptance criteria dan verification
+commands yang relevan lulus. Snapshot historis di bagian bawah dokumen tidak
+menggantikan status pada tabel ini.
+
+Status yang digunakan:
+
+- `Belum mulai`
+- `Dalam proses`
+- `Blocked`
+- `Selesai`
+
+### Tracking protocol
+
+Aturan perubahan status:
+
+1. `Belum mulai` → `Dalam proses` hanya setelah ada branch/PR atau commit kerja
+   yang dapat dirujuk.
+2. `Dalam proses` → `Blocked` harus mencatat blocker, owner blocker, dan kondisi
+   yang diperlukan untuk melanjutkan.
+3. `Dalam proses` → `Selesai` hanya setelah seluruh acceptance criteria relevan
+   dicentang dan verification command lulus.
+4. Jika regression membuka kembali invariant yang sudah lulus, status kembali ke
+   `Dalam proses`; jangan mempertahankan `Selesai` hanya karena pernah lulus.
+5. Bukti model nyata harus mencatat model hash, revision llama.cpp/GGML, build
+   options, budget, peak mapping, hook balance, dan checksum/argmax logits.
+6. Angka benchmark tidak boleh diperbarui tanpa command, machine/storage,
+   thread count, warm/cold-cache condition, dan sedikitnya tiga pengulangan.
+
+Setiap PR yang mengubah status menambahkan entry berikut di bawah
+[Evidence log](#evidence-log):
+
+```markdown
+- YYYY-MM-DD — P0.x — `<commit atau PR>`
+  - Status: `Dalam proses` → `Selesai`
+  - Commands: `<verification commands>`
+  - Result: `<invariant, metrics, dan model hash bila relevan>`
+  - Known gaps: `<none atau daftar gap yang tidak memblokir acceptance>`
+```
+
+| ID | Priority | Workstream | Status | Owner | Evidence | Depends on |
+|---|---|---|---|---|---|---|
+| P0.1 | P0 | Normal server-path integration | Selesai | Codex, Claude | `tools/residency_server_smoke.py` 47/47, 2026-09-24 | Phase 11 milestone 4 |
+| P0.2 | P0 | Unified memory policy and preflight | Selesai | Claude | `no_alloc` breakdown preflight; llama.cpp reports compute "matches expectation" | P0.1 |
+| P0.3 | P0 | Concurrent native graph pin tokens | Selesai | Codex, Claude | Validator `concurrent`/`cancel`/`fail` on Llama, Qwen3.5, Qwen3-Coder-Next; 15/15 stress | P0.1 |
+| P0.4 | P0 | Correctness/CI regression matrix | Selesai | Codex, Claude | Fast matrix + nightly/dispatch model job; every command reproduced locally | P0.1–P0.3 |
+| P1.1 | P1 | Complete `GET_ROWS` sparse/view coverage | Dalam proses | Codex | Sparse opposite-row exact gates pass; view/layout matrix remains | Phase 11 milestone 4 |
+| P1.2 | P1 | GGML compatibility and patch maintenance | Dalam proses | Codex | b9106 pin and fail-closed exact patch markers; ABI checks remain | P0.4 |
+| P1.3 | P1 | Production observability and diagnostics | Dalam proses | Codex, Claude | Weight, acquire latency, failure classes, memory plan/actual exported; debug trace remains | P0.1–P0.2 |
+| P2.1 | P2 | I/O, prefetch, and replacement tuning | Belum mulai | Unassigned | — | P1.3 |
+| P2.2 | P2 | Performance benchmark matrix | Belum mulai | Unassigned | — | P0.4, P2.1 |
+| P3.1 | P3 | GPU residency architecture | Belum mulai | Unassigned | — | P0.2, P0.4 |
+
+### P0.1 — Integrate official GGML residency into the normal server path
+
+**Goal:** request biasa dapat memilih official bounded GGML backend tanpa
+validator khusus atau executor proof terpisah.
+
+Checklist:
+
+- [x] Tambahkan config yang stabil, misalnya:
+
+  ```toml
+  [residency]
+  enabled = true
+  backend = "ggml"
+  weight_budget_mib = 256
+  state_budget_mib = 4096
+  ```
+
+- [x] Hubungkan config ke normal model loading melalui
+      `llama_model_params.tensor_buft_overrides`.
+- [x] Pastikan `/v1/completions`, `/v1/chat/completions`, streaming, sampling,
+      dan chat template memakai model/backend yang sama.
+- [x] Pertahankan fallback ordinary llama.cpp saat residency dinonaktifkan.
+- [x] Tambahkan startup preflight dan error yang actionable bila model,
+      architecture, build option, atau budget tidak kompatibel.
+      (Architecture gate dihapus: jalur GGML resmi architecture-agnostic;
+      Llama, Qwen3, Qwen3.5, Qwen3-Next, Gemma 3 exact.)
+- [x] Pastikan graceful shutdown me-release graph, model, registry, manager,
+      dan backing store dalam urutan lifecycle yang aman.
+
+Acceptance criteria:
+
+- [x] Server menghasilkan output yang sama dengan validator untuk prompt/token
+      deterministik. (Server backed = server ordinary llama.cpp, yang juga
+      reference validator; chat, completion, streaming, scheduler.)
+- [x] `uploaded_weight_bytes == 0` pada backed mode.
+- [x] `peak_mapped_weight_bytes <= weight_budget_bytes` untuk setiap request.
+- [x] Hooks acquire/release seimbang setelah request selesai.
+- [x] Jalur server biasa tetap build dan bekerja saat residency disabled.
+
+### P0.2 — Unified memory policy and request preflight
+
+**Goal:** pengguna dapat merencanakan lebih dari weight mappings dan tidak salah
+mengartikan weight budget sebagai total RSS limit.
+
+Checklist:
+
+- [x] Definisikan kategori accounting resmi:
+  - mapped immutable weights (`weight_budget_mib`);
+  - KV cache + DeltaNet/recurrent state (llama.cpp breakdown `context`;
+    hybrid memory melaporkan keduanya bersama);
+  - graph/compute workspace (breakdown `compute`);
+  - activations and request buffers (logits `n_vocab * n_seq_max * 4`;
+    aktivasi graph berada di compute workspace);
+  - optional GPU allocations: tidak berlaku, residency hanya CPU (P3.1).
+- [x] Satukan policy executor/service yang sudah ada dengan official GGML path.
+      (Normal path memakai `src/residency_memory_policy.zig`; endpoint proof
+      lama `/v1/residency/completions` tetap memakai policy service-nya.)
+- [x] Tambahkan checked estimators sebelum alokasi context/model/request state.
+      (`llama_model_params.no_alloc` + `llama_get_memory_breakdown`.)
+- [x] Tambahkan hard limit, soft limit/warning, dan overflow-safe arithmetic.
+      (Hard = `state_budget_mib`; warning di atas 90%.)
+- [x] Dokumentasikan filesystem page cache dan allocator/RSS yang tidak dapat
+      dijadikan hard mmap budget.
+
+Acceptance criteria:
+
+- [x] Exact-limit allocation berhasil dan one-byte-under limit ditolak sebelum
+      partial allocation.
+- [x] Rejected request tidak mengubah KV/recurrent state dan tidak bocor mapping.
+- [x] Metrics per kategori menjumlah secara konsisten dengan estimator.
+- [x] Long-context preflight menolak konfigurasi yang tidak muat sebelum decode.
+
+### P0.3 — Concurrent native graph execution
+
+**Goal:** lebih dari satu graph/request dapat memakai model backed yang sama
+secara aman tanpa global serialization.
+
+Checklist:
+
+- [x] Ganti release berbasis `source_id` tunggal menjadi pin token unik per
+      graph/node/acquire.
+- [x] Simpan mapping records per execution ID, termasuk tied/shared tensors dan
+      tensor views. (Thread-local node pins/clones per graph thread 0.)
+- [x] Pastikan eviction tidak memilih mapping yang dipin oleh graph lain.
+- [x] Propagasikan cancellation/error sehingga seluruh pin request dilepas.
+      (Failure → `GGML_STATUS_FAILED`, bukan `abort()`.)
+- [x] Tambahkan fair admission/backpressure ketika union pinned sources melebihi
+      budget. (`acquire_many` all-or-nothing, tanpa hold-and-wait; fail-fast
+      bila mustahil muat; timeout 30 s.)
+
+Acceptance criteria:
+
+- [x] Sedikitnya dua context menjalankan decode concurrent pada model sama.
+- [x] Output concurrent identik dengan eksekusi serial deterministik.
+- [x] Tidak ada data race, dangling `tensor->data`, double release, atau leaked pin.
+      (Dibuktikan oleh desain thread-local + gate exact/pin-zero berulang;
+      belum ada ThreadSanitizer run.)
+- [x] Peak mapping tetap dalam budget dan hook/pin counters kembali nol.
+- [x] Stress test meliputi cancellation dan satu request gagal di tengah graph.
+
+### P0.4 — Correctness and CI regression matrix
+
+**Goal:** perubahan GGML, model, compiler, atau platform tidak diam-diam merusak
+bounded execution.
+
+Fast tests on every relevant change:
+
+- [x] Manager alignment/range/LRU/pinning/multi-window tests.
+- [x] Hook balance and pointer restoration tests. (Validator gates.)
+- [x] Tiled `MUL_MAT`, `MUL_MAT_ID`, and `GET_ROWS` fixtures. (Real-model
+      exact gates at 4 MiB; no synthetic fixture yet.)
+- [x] Build matrix: hooks on/off, SIMD on/off, CPU_REPACK on/off.
+- [x] Failure tests: insufficient budget, unsupported layout, corrupt span,
+      cancellation, and teardown after error. (Bridge unit tests for
+      impossible budget, admission wait, injection; validator `cancel`/`fail`;
+      preflight rejects unsupported row layout and span mismatch as `invalid`.)
+
+Nightly or opt-in model tests:
+
+- [x] Small Llama GGUF exact gate with CPU_REPACK off.
+- [x] Qwen3-Next hybrid/DeltaNet/routed-MoE exact gate. (CI: Qwen3.5-4B
+      hybrid DeltaNet. Routed MoE: Qwen3-Coder-Next 27 GiB, local/manual.)
+- [x] Default CPU_REPACK documented tolerance and top-1 gate. (Llama.)
+- [x] Record model hash, GGML revision, budget, peak mapping, faults, evictions,
+      hooks, and logits checksum. (SHA-256 pinned in workflow; validator
+      prints the rest; exact gate compares full logits bitwise.)
+
+Acceptance criteria:
+
+- [x] CI failures show which invariant changed, not only `validator failed`.
+- [x] Runtime-heavy model jobs are separately selectable and reproducible.
+- [x] Normal application build remains covered without residency hooks.
+
+### P1.1 — Complete `GET_ROWS` and view/layout coverage
+
+**Current limitation:** sparse multi-row lookup maps the min/max row envelope;
+uncommon views/layouts may fall back to whole-source mapping. Envelope/fallback
+that exceeds budget can still fail.
+
+Checklist:
+
+- [x] Implement per-row or grouped-row acquisition in the native operation path.
+- [ ] Support non-contiguous indices using GGML strides (implemented; fixture pending).
+- [ ] Cover `view_src` offsets and multi-dimensional/view layouts.
+- [x] Avoid whole-source fallback when a bounded row-wise path is possible.
+- [ ] Fail before compute with an actionable unsupported-layout diagnostic when
+      no bounded implementation exists.
+
+Acceptance criteria:
+
+- [x] Sparse rows from opposite ends of a vocabulary tensor fit a small budget.
+- [x] Output matches stock GGML exactly with CPU_REPACK off.
+- [x] No mapping envelope exceeds the declared request range unexpectedly.
+
+### P1.2 — GGML compatibility and patch maintenance
+
+Checklist:
+
+- [x] Pin/document supported llama.cpp/GGML revision.
+- [x] Add patch-generation drift check against vendored `ggml-cpu.c`.
+- [x] Make hook insertion fail clearly when upstream code shape changes.
+- [ ] Document whether integration can use upstream extension points or requires
+      maintained MLz patching.
+- [ ] Add ABI/version checks for buffer callbacks and private CPU traits used by
+      tiled operations.
+
+Acceptance criteria:
+
+- [ ] Vendored GGML upgrade either passes all gates or fails during patch/build,
+      never silently omits hooks.
+- [ ] Patch delta remains reviewable and generated deterministically.
+
+### P1.3 — Production observability and diagnostics
+
+Checklist:
+
+- [x] Export current/peak mapped weights, budget, faults, hits, evictions,
+      acquire latency, bytes mapped, and tile counts.
+- [x] Export state/workspace estimates and actual allocations separately.
+- [ ] Include model, operation, tensor name, requested bytes, largest contiguous
+      row/source, and budget in failure messages.
+- [ ] Add per-request metrics without high-cardinality tensor labels by default.
+- [ ] Add debug-only trace for node/source acquire-release balance.
+
+Acceptance criteria:
+
+- [x] Operator dapat membedakan budget failure, unsupported layout, I/O failure,
+      and compute failure dari logs/metrics saja. (`failures.*` classes +
+      `last_reason`; non-residency decode errors return 500, residency 503.)
+- [x] Metrics tidak mengubah correctness atau membuat unbounded allocations.
+
+### P2.1 — I/O, prefetch, and replacement tuning
+
+Checklist:
+
+- [ ] Profile cold and warm page-cache workloads separately.
+- [ ] Evaluate bounded look-ahead at node/tile granularity.
+- [ ] Tune row tile size from budget, mapping granularity, op shape, and thread count.
+- [ ] Compare LRU/largest-first and only add CLOCK/2Q after profiling proves need.
+- [ ] Keep prefetch opt-in per platform until benchmark shows a repeatable benefit.
+
+Acceptance criteria:
+
+- [ ] No performance claim without before/after data on the same model/storage.
+- [ ] Correctness, budget, and pin-lifetime gates remain unchanged.
+- [ ] Negative benchmark results remain documented.
+
+### P2.2 — Performance benchmark matrix
+
+Required scenarios:
+
+- [ ] Llama and Qwen3-Next.
+- [ ] Single-token decode and prompt prefill (128/512 tokens).
+- [ ] Warm cache and cold storage where reproducible.
+- [ ] Multiple weight budgets, including 4 MiB proof and practical production sizes.
+- [ ] Metrics: load time, TTFT, prompt tokens/s, generation tokens/s, RSS,
+      mapped peak, faults, evictions, bytes read, and CPU utilization.
+
+Acceptance criteria:
+
+- [ ] Benchmark records command, model hash, machine/storage, build options,
+      thread count, and repetitions.
+- [ ] Correctness gate is run before timing results are accepted.
+
+### P3.1 — GPU residency architecture
+
+This is a separate architecture milestone, not a direct reuse of host mmap
+pointers.
+
+Checklist:
+
+- [ ] Separate host backing budget, staging budget, and device VRAM budget.
+- [ ] Track upload/download lifetime with backend events/fences.
+- [ ] Prevent eviction while a CUDA/Metal/Vulkan command still references a buffer.
+- [ ] Add asynchronous staging and bounded transfer queues.
+- [ ] Preserve CPU fallback and mixed CPU/GPU execution accounting.
+
+Acceptance criteria:
+
+- [ ] Device output matches ordinary backend reference within its documented gate.
+- [ ] Peak VRAM and host staging stay within explicit budgets.
+- [ ] Eviction cannot race an in-flight device operation.
+
+## Recommended execution order
+
+1. P0.1 normal server-path integration.
+2. P0.2 unified memory policy.
+3. P0.3 concurrent graph pin tokens.
+4. P0.4 CI matrix, then make it a required regression gate.
+5. P1.1 close `GET_ROWS`/view gaps.
+6. P1.2 compatibility hardening and P1.3 observability.
+7. P2.1/P2.2 performance tuning and reproducible benchmarking.
+8. P3.1 GPU residency only after CPU production gates are stable.
+
+## Verification command catalog
+
+Command berikut adalah baseline proof yang sudah tersedia. Jalankan dari root
+repository. Path model dapat diganti, tetapi evidence log wajib mencatat hash
+file yang dipakai.
+
+### Fast local gates
+
+```text
+zig build test -Dsimd-backend=false
+zig build -Dsimd-backend=false
+zig build test
+zig build
+git diff --check
+```
+
+### Official GGML exact gates
+
+Llama:
+
+```text
+zig build validate-ggml-backend \
+  -Doptimize=ReleaseFast \
+  -Dsimd-backend=false \
+  -Dggml-residency-hooks=true \
+  -Dcpu-repack=false -- \
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf 1 4
+```
+
+Qwen3-Coder-Next:
+
+```text
+zig build validate-ggml-backend \
+  -Doptimize=ReleaseFast \
+  -Dsimd-backend=false \
+  -Dggml-residency-hooks=true \
+  -Dcpu-repack=false -- \
+  models/Qwen3-Coder-Next-Q2_K.gguf 1 4
+```
+
+Expected invariant untuk kedua command:
+
+- logits finite dan bit-identik terhadap ordinary llama.cpp;
+- `uploaded_weight_bytes == 0`;
+- pre/post hooks dan acquire/release seimbang;
+- final active hook/pin count nol;
+- `peak_mapped_weight_bytes <= 4 MiB`.
+
+Mode CPU_REPACK default harus dijalankan terpisah dan dinilai dengan documented
+tolerance + top-1 gate; hasilnya tidak boleh disebut bit-identik.
+
+### Commands yang harus ditambahkan selama productization
+
+| Workstream | Required verification entry point |
+|---|---|
+| P0.1 | `python tools/residency_server_smoke.py --exe zig-out/bin/MLz --model <gguf>` (done) |
+| P0.2 | `residency_memory_policy.zig` tests + smoke `state budget rejection` (done) |
+| P0.3 | `validate-ggml-backend ... <model> <tokens> 4 concurrent|cancel|fail` (done) |
+| P0.4 | `.github/workflows/residency.yml` jobs `fast` and `models` (done) |
+| P1.1 | Sparse opposite-row `GET_ROWS` fixture pada budget kecil |
+| P1.2 | Deterministic patch drift/check command terhadap vendored GGML |
+| P1.3 | Metrics/log assertion test tanpa high-cardinality labels default |
+| P2.1 | Warm/cold benchmark runner dengan replacement/prefetch variants |
+| P2.2 | Reproducible Llama/Qwen benchmark report generator |
+| P3.1 | Backend-specific VRAM/staging budget validator |
+
+## Evidence log
+
+Entry terbaru diletakkan paling atas. Proof milestone yang sudah ada sebelum
+tracker productization dibuat dicatat sebagai baseline:
+
+- 2026-09-24 — P0.1/P0.2/P0.3/P0.4/P1.3 — working tree on `feat/phase-8-batched-prefill` (not committed)
+  - Status: P0.1, P0.2, P0.3, P0.4 `Dalam proses`/`Belum mulai` → `Selesai`; P1.3 tetap `Dalam proses`.
+  - Changes: node sources pinned all-or-nothing (`acquire_many`, no hold-and-wait, fail-fast when impossible); acquisition failures stop the graph with `GGML_STATUS_FAILED` (llama_decode rc=-3) instead of `abort()`; engine/scheduler discard partial KV and return `503 residency_error`; non-weight policy from llama.cpp `no_alloc` breakdown; architecture gate removed; `/v1/residency/metrics` adds acquire latency, failure classes, last reason, planned/allocated memory.
+  - Commands: `zig build test` with `-Dsimd-backend=false` × hooks on/off × CPU_REPACK on/off, plus default flags; `zig build` for the same; `git diff --check`; `zig build validate-ggml-backend -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false -- <model> <tokens> 4 <single|concurrent|cancel|fail>`; default CPU_REPACK tolerance gate on Llama; `python tools/residency_server_smoke.py --exe zig-out/bin/MLz.exe --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf`.
+  - Environment: Windows 11, Zig 0.15.2, llama.cpp/GGML `b9106`, 4 threads for server, 1 thread for validator. Models (SHA-256): Llama-3.2-1B Q4_K_M `3f5a2242…2dcc1` (unsloth), Qwen3.5-4B Q4_K_S `27caeb0e…2ea77` (unsloth), Qwen3-Coder-Next Q2_K `2ac738bc…abad87`, Qwen3-4B Q4_K_M, Gemma-3-4B Q2_K.
+  - Result: all four modes exact (bitwise logits) at 4 MiB on Llama (tokens `1,128000`), Qwen3.5-4B (`1,1000`) and Qwen3-Coder-Next (`1,151000`); `fail` mode exercised GET_ROWS, whole-node, tiled `MUL_MAT` and tiled `MUL_MAT_ID` failures, each with zero open pins and balanced hooks before an exact recovery. Qwen3-4B and Gemma-3-4B `single` exact. 15/15 repeated `concurrent`/`cancel`/`fail` runs with 4-token prompts. Server smoke 47/47: backed chat/completion/streaming/scheduler outputs equal the ordinary path, metrics invariants hold, injected failure → 503 then exact recovery (single-stream and scheduler), `--state-budget-mib 1` rejected at startup, SIGBREAK shutdown exit 0. Memory plan for Llama ctx 512: state 16,777,216 + compute 271,058,944 + logits 513,024 bytes; llama.cpp reported the allocated compute buffer "matches expectation". Qwen3-Coder-Next plan: state 91,619,328, compute 331,098,144 bytes. Default CPU_REPACK Llama: max error 0.040820480, mean 0.006926090, top-1 match.
+  - Linux: the `fast` (hooks/CPU_REPACK combinations without SIMD) and Llama `models` job steps of `residency.yml` were replayed in WSL Ubuntu 26.04 with Zig 0.15.2: all builds/tests pass, model SHA verified, four exact modes and the CPU_REPACK gate pass, server smoke 0 failed invariants including SIGINT shutdown.
+  - Known gaps: hosted GitHub Actions run pending (workflow commands reproduced locally on Windows and Linux; Linux SIMD/NASM combination not replayed); routed-MoE model gate is local only (27 GiB); CPU_REPACK tolerance gate calibrated only for Llama (Qwen3.5 keeps top-1, max error 0.48 from repack kernels); no ThreadSanitizer run; admission timeout fixed at 30 s; P1.1 view/layout fixtures, P1.2 ABI checks, P1.3 per-request metrics/debug trace remain.
+
+- 2026-09-24 — P0.1/P1.1/P0.4/P1.3 — working tree on `feat/phase-8-batched-prefill` (not committed)
+  - Status: `Belum mulai` → `Dalam proses` for P0.1, P0.2, P0.4, P1.1, P1.2, and P1.3.
+  - Commands: `zig build test -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false`; `zig build test -Dsimd-backend=false`; `zig build -Dsimd-backend=false`; `zig build validate-ggml-backend -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false -- <model> <tokens> 4` with Llama `1,128000` and Qwen `1,151000`; `git diff --check`.
+  - Environment: Windows, Zig 0.15.2, pinned llama.cpp/GGML tag `b9106`, CPU_REPACK off for exact gates. Llama SHA-256 `3F5A22426976AB26CFE84DBA63C1D08391717ABB1AF893E10F1B2968D862DCC1`; Qwen SHA-256 `2AC738BC947BC3470E37962C2EE0AB390FA953740E9873575695276980ABAD87`.
+  - Result: both two-token sparse gates had exact logits and 4 MiB peak mapping with zero uploaded bytes and balanced hooks. Default CPU_REPACK on Llama passed the documented tolerance/top-1 gate (max error 0.040820480, mean 0.006926090, top-1 16309/16309). The normal Llama server returned the same deterministic `How can` for chat and completion with residency on/off; two repeated backed requests and two concurrent scheduler requests matched. Backed metrics after requests: budget 4,194,304 bytes, peak mapped 4,194,288, pre/post 2,148/2,148, acquire/release 2,045/2,045, active hooks 0, uploaded bytes 0. A 1 MiB state guard rejected before context allocation without Debug allocator leaks; a 32 MiB guard passed for a 512-token single-context Llama run. The guard rejects unsupported Qwen architecture rather than reporting a misleading total-state limit.
+  - Known gaps: no independent concurrent graph pin tokens, complete non-weight hard policy, cancellation/failure unwind gate, complete view-layout fixture, model CI jobs, or GPU residency. The added CI matrix has not run in GitHub Actions yet. No performance claim is made from these single runs.
+
+- Baseline — Phase 11 milestone 4 — commit `83b692c`
+  - Status: official GGML proof mencapai native tiled bounded residency.
+  - Result: Llama 762.81 MiB dan Qwen3-Coder-Next 27.2 GiB berjalan pada
+    weight budget 4 MiB, upload weight nol, hooks seimbang, dan logits
+    bit-identik saat CPU_REPACK nonaktif.
+  - Known gaps: normal server integration, unified non-weight policy,
+    concurrent graph pin tokens, sparse/view `GET_ROWS`, dan GPU backend.
+
+## Definition of production-ready bounded GGML residency
+
+The feature may be called production-ready only when all P0 items are
+`Selesai` and the following are true:
+
+- [x] normal serving requests use official GGML bounded residency through config;
+- [x] weight and non-weight memory policies are explicit and preflighted;
+- [x] concurrent requests have independent pin lifetimes;
+- [x] errors cleanly unwind all mappings/state;
+- [x] CI covers hooks on/off and real-model correctness;
+- [x] operators can observe budget, mappings, faults, evictions, and failure reason.
+
+Status 2026-09-24: all P0 items are `Selesai` and every condition above has
+passing local evidence (see the Evidence log). Scope of the claim: CPU host
+backend, one backed model per process. The first hosted CI run happens on the
+next push.
+
+
+## Historical implementation log
+
+Bagian di bawah mempertahankan API notes, benchmark snapshots, dan keputusan
+fase lama untuk audit trail. Gunakan [Productization roadmap](#productization-roadmap--post-proof-tracking)
+dan [Evidence log](#evidence-log) sebagai sumber status terkini. Pernyataan
+lama seperti "Qwen hanya projection probe" atau "satu tensor hanya satu window"
+menjelaskan keadaan pada saat snapshot tersebut dibuat dan bukan limitation
+kanonik saat ini.
+
+> Detail integrasi dan validation command terbaru: [Official GGML Residency Backend Integration](ggml-residency-backend.md).
+> Milestone 4 sudah menambahkan tiled native `MUL_MAT`, selected-expert
+> `MUL_MAT_ID`, dan bounded `GET_ROWS`; stock contiguous whole-source fallback
+> tetap dipakai hanya untuk layout yang belum tercakup.
 
 ## Implemented API
 

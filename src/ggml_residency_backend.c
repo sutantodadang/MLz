@@ -54,6 +54,15 @@ static atomic_uint_fast64_t g_current_active_nodes;
 static atomic_uint_fast64_t g_peak_active_nodes;
 static atomic_uint_fast64_t g_residency_acquires;
 static atomic_uint_fast64_t g_residency_releases;
+static atomic_uint_fast64_t g_graph_failures;
+
+/* Last failure reason for operators. Written rarely (failure path only), so a
+ * spin lock is sufficient. */
+static char g_last_failure[256];
+static atomic_flag g_last_failure_lock = ATOMIC_FLAG_INIT;
+/* Set by operations running on graph thread 0 and consumed by the node post
+ * hook on the same thread. */
+static _Thread_local bool g_graph_failed;
 
 /* ---- Backed-mode registry: which buffer offset maps to which GGUF span ---- */
 
@@ -81,18 +90,45 @@ static mlz_ggml_residency_release_fn g_release;
 static mlz_ggml_residency_span_fn g_span;
 static mlz_ggml_residency_acquire_range_fn g_acquire_range;
 static mlz_ggml_residency_range_capacity_fn g_range_capacity;
+static mlz_ggml_residency_acquire_many_fn g_acquire_many;
 
 void mlz_ggml_residency_set_bridge(
         mlz_ggml_residency_acquire_fn acquire,
         mlz_ggml_residency_release_fn release,
         mlz_ggml_residency_span_fn span,
         mlz_ggml_residency_acquire_range_fn acquire_range,
-        mlz_ggml_residency_range_capacity_fn range_capacity) {
+        mlz_ggml_residency_range_capacity_fn range_capacity,
+        mlz_ggml_residency_acquire_many_fn acquire_many) {
     g_acquire = acquire;
     g_release = release;
     g_span = span;
     g_acquire_range = acquire_range;
     g_range_capacity = range_capacity;
+    g_acquire_many = acquire_many;
+}
+
+void mlz_ggml_residency_mark_failed(const struct ggml_tensor * tensor, const char * what) {
+    const char * name = tensor != NULL ? tensor->name : "?";
+    fprintf(stderr, "mlz backed: %s for '%s'\n", what, name);
+    while (atomic_flag_test_and_set_explicit(&g_last_failure_lock, memory_order_acquire)) {
+    }
+    snprintf(g_last_failure, sizeof(g_last_failure), "%s for '%s'", what, name);
+    atomic_flag_clear_explicit(&g_last_failure_lock, memory_order_release);
+    g_graph_failed = true;
+}
+
+size_t mlz_ggml_residency_last_failure(char * out, size_t capacity) {
+    if (out == NULL || capacity == 0) {
+        return 0;
+    }
+    while (atomic_flag_test_and_set_explicit(&g_last_failure_lock, memory_order_acquire)) {
+    }
+    const size_t len = strlen(g_last_failure);
+    const size_t copied = len < capacity - 1 ? len : capacity - 1;
+    memcpy(out, g_last_failure, copied);
+    out[copied] = '\0';
+    atomic_flag_clear_explicit(&g_last_failure_lock, memory_order_release);
+    return copied;
 }
 
 void mlz_ggml_residency_set_backed_mode(bool enabled) {
@@ -426,14 +462,15 @@ static void mlz_buffer_get_tensor(
         if (source == NULL || source->byte_len < offset + size) {
             abort();
         }
+        uint64_t pin_token = 0;
         void * mapped = g_acquire(
-            source->source_id, source->file_offset, source->byte_len);
+            source->source_id, source->file_offset, source->byte_len, &pin_token);
         if (mapped == NULL) {
             fprintf(stderr, "mlz backed get: acquire failed for '%s'\n", tensor->name);
             abort();
         }
         memmove(data, (const uint8_t *) mapped + offset, size);
-        if (!g_release(source->source_id)) {
+        if (!g_release(pin_token)) {
             abort();
         }
         return;
@@ -511,13 +548,14 @@ static bool mlz_buffer_cpy_tensor(
         if (source == NULL || source->byte_len != src_size) {
             return false;
         }
+        uint64_t pin_token = 0;
         void * mapped = g_acquire(
-            source->source_id, source->file_offset, source->byte_len);
+            source->source_id, source->file_offset, source->byte_len, &pin_token);
         if (mapped == NULL) {
             return false;
         }
         memmove(dst->data, mapped, src_size);
-        if (!g_release(source->source_id)) {
+        if (!g_release(pin_token)) {
             abort();
         }
         return true;
@@ -643,6 +681,7 @@ void mlz_ggml_residency_reset_stats(void) {
     atomic_store_explicit(&g_uploaded_bytes, 0, memory_order_relaxed);
     atomic_store_explicit(&g_node_pre_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&g_node_post_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_graph_failures, 0, memory_order_relaxed);
 
     // Live gauges are not interval counters. Preserve them so a reset during
     // allocation or node execution cannot make a later decrement underflow.
@@ -675,6 +714,7 @@ struct mlz_ggml_residency_stats mlz_ggml_residency_get_stats(void) {
     stats.peak_active_nodes = atomic_load_explicit(&g_peak_active_nodes, memory_order_relaxed);
     stats.residency_acquires = atomic_load_explicit(&g_residency_acquires, memory_order_relaxed);
     stats.residency_releases = atomic_load_explicit(&g_residency_releases, memory_order_relaxed);
+    stats.graph_failures = atomic_load_explicit(&g_graph_failures, memory_order_relaxed);
     return stats;
 }
 
@@ -746,30 +786,21 @@ static const struct mlz_tensor_source * mlz_registry_for_tensor(
 }
 
 struct mlz_node_pin {
-    struct ggml_tensor * tensor;
     uint32_t source_id;
-    size_t identity_offset;
-    bool releases_source;
+    uint64_t token;
+    void * mapped_base;
 };
 
 static _Thread_local struct mlz_node_pin g_node_pins[GGML_MAX_SRC];
 static _Thread_local size_t g_node_pin_count;
+static _Thread_local struct ggml_tensor g_node_clones[GGML_MAX_SRC];
+static _Thread_local struct ggml_tensor * g_node_original_src[GGML_MAX_SRC];
 
-/* Acquires the live mapping for a weight tensor and repoints tensor->data.
- * The acquired view is held in the bridge, keyed by source_id, and released
- * by the matching post-hook. Returns false when the source is unregistered or
- * the residency manager cannot map it (e.g. budget too small). */
-static bool mlz_rebase_tensor(struct ggml_tensor * tensor) {
-    for (size_t index = 0; index < g_node_pin_count; ++index) {
-        if (g_node_pins[index].tensor == tensor) {
-            return true; /* duplicate source pointer in the same node */
-        }
-    }
-    const struct mlz_tensor_source * source = mlz_registry_for_tensor(tensor);
-    if (source == NULL || g_acquire == NULL ||
-        g_node_pin_count >= GGML_MAX_SRC) {
-        return false;
-    }
+/* Byte offset of a backed tensor inside its registered source span, or
+ * SIZE_MAX when the tensor does not lie completely within the span. */
+static size_t mlz_source_delta(
+        const struct ggml_tensor * tensor,
+        const struct mlz_tensor_source * source) {
     const struct ggml_tensor * owner =
         tensor->view_src != NULL ? tensor->view_src : tensor;
     const struct mlz_buffer_context * context =
@@ -780,64 +811,55 @@ static bool mlz_rebase_tensor(struct ggml_tensor * tensor) {
         identity_offset - source->buffer_offset > source->byte_len ||
         ggml_nbytes(tensor) > source->byte_len -
             (identity_offset - source->buffer_offset)) {
-        return false;
+        return SIZE_MAX;
     }
-    void * mapped = NULL;
-    bool releases_source = true;
-    for (size_t index = 0; index < g_node_pin_count; ++index) {
-        if (g_node_pins[index].source_id == source->source_id) {
-            mapped = (uint8_t *) g_node_pins[index].tensor->data -
-                (g_node_pins[index].identity_offset - source->buffer_offset);
-            releases_source = false;
-            break;
-        }
-    }
-    if (mapped == NULL) {
-        mapped = g_acquire(
-            source->source_id,
-            source->file_offset,
-            source->byte_len);
-    }
-    if (mapped == NULL) {
-        return false;
-    }
-    const size_t source_delta = identity_offset - source->buffer_offset;
-    tensor->data = (uint8_t *) mapped + source_delta;
-    g_node_pins[g_node_pin_count++] = (struct mlz_node_pin) {
-        .tensor = tensor,
-        .source_id = source->source_id,
-        .identity_offset = identity_offset,
-        .releases_source = releases_source,
-    };
-    if (releases_source) {
-        atomic_fetch_add_explicit(&g_residency_acquires, 1, memory_order_relaxed);
-    }
-    return true;
+    return identity_offset - source->buffer_offset;
 }
 
-/* Restores the reserved identity address and releases the pinned source view. */
-static bool mlz_restore_tensor(
-        struct ggml_tensor * tensor,
-        uint32_t source_id,
-        size_t identity_offset) {
-    if (g_release == NULL || source_id == 0 || source_id > g_registry_len) {
-        return false;
+/* A graph node is context-local; model weight tensors are shared. Replace only
+ * this node's source pointer with a thread-local copy so another context never
+ * observes a transient tensor->data rebase. `mapped` is the pinned base of the
+ * source span, or NULL for tiled sources that are mapped per tile. */
+static void mlz_clone_source(
+        struct ggml_tensor * node, int source_index, void * mapped, size_t delta) {
+    struct ggml_tensor * tensor = node->src[source_index];
+    g_node_original_src[source_index] = tensor;
+    g_node_clones[source_index] = *tensor;
+    node->src[source_index] = &g_node_clones[source_index];
+    if (mapped != NULL) {
+        g_node_clones[source_index].data = (uint8_t *) mapped + delta;
     }
-    const struct ggml_tensor * owner =
-        tensor->view_src != NULL ? tensor->view_src : tensor;
-    const ggml_backend_buffer_t buffer = owner->buffer;
-    if (buffer == NULL || buffer->buft != &g_mlz_buft ||
-        buffer->context == NULL) {
-        return false;
+}
+
+static void mlz_release_node_pins(void) {
+    for (size_t index = g_node_pin_count; index > 0; --index) {
+        const struct mlz_node_pin * pin = &g_node_pins[index - 1];
+        if (!g_release(pin->token)) {
+            /* A token the bridge does not know is a bookkeeping bug, not a
+             * recoverable resource failure. */
+            fprintf(stderr, "mlz backed: pin release failed for source %u\n", pin->source_id);
+            abort();
+        }
+        atomic_fetch_add_explicit(&g_residency_releases, 1, memory_order_relaxed);
     }
-    const struct mlz_buffer_context * context =
-        (const struct mlz_buffer_context *) buffer->context;
-    if (!context->backed || context->base == NULL || !g_release(source_id)) {
-        return false;
+    g_node_pin_count = 0;
+}
+
+static void mlz_restore_node_sources(struct ggml_tensor * node) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (g_node_original_src[i] != NULL) {
+            node->src[i] = g_node_original_src[i];
+            g_node_original_src[i] = NULL;
+        }
     }
-    tensor->data = (void *) ((uintptr_t) context->base + identity_offset);
-    atomic_fetch_add_explicit(&g_residency_releases, 1, memory_order_relaxed);
-    return true;
+}
+
+static bool mlz_is_backed_source(const struct ggml_tensor * src) {
+    const struct ggml_tensor * owner = src->view_src != NULL ? src->view_src : src;
+    return owner->buffer != NULL &&
+        owner->buffer->buft == &g_mlz_buft &&
+        owner->buffer->context != NULL &&
+        ((const struct mlz_buffer_context *) owner->buffer->context)->backed;
 }
 
 #endif /* GGML_USE_MLZ_RESIDENCY_HOOKS */
@@ -970,7 +992,7 @@ size_t mlz_ggml_residency_tile_capacity(
 #ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
 struct mlz_tile_pin {
     struct ggml_tensor * tensor;
-    uint32_t source_id;
+    uint64_t token;
     size_t identity_offset;
     bool active;
 };
@@ -1005,8 +1027,9 @@ bool mlz_ggml_residency_tile_acquire(
         byte_len > source->byte_len - tensor_source_offset - tensor_offset) {
         return false;
     }
+    uint64_t token = 0;
     void * mapped = g_acquire_range(
-        source->source_id, tensor_source_offset + tensor_offset, byte_len);
+        source->source_id, tensor_source_offset + tensor_offset, byte_len, &token);
     if (mapped == NULL) {
         return false;
     }
@@ -1016,7 +1039,7 @@ bool mlz_ggml_residency_tile_acquire(
     tensor->data = (void *) ((uintptr_t) mapped - tensor_offset);
     g_tile_pin = (struct mlz_tile_pin) {
         .tensor = tensor,
-        .source_id = source->source_id,
+        .token = token,
         .identity_offset = identity_offset,
         .active = true,
     };
@@ -1041,7 +1064,7 @@ bool mlz_ggml_residency_tile_release(struct ggml_tensor * tensor) {
     if (context == NULL || !context->backed || context->base == NULL) {
         return false;
     }
-    if (!g_release(g_tile_pin.source_id)) {
+    if (!g_release(g_tile_pin.token)) {
         return false;
     }
     tensor->data = (void *) ((uintptr_t) context->base + g_tile_pin.identity_offset);
@@ -1057,9 +1080,8 @@ bool mlz_ggml_residency_tile_release(struct ggml_tensor * tensor) {
 #ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
 static bool mlz_can_range_get_rows(struct ggml_tensor * node) {
     if (node == NULL || node->op != GGML_OP_GET_ROWS ||
-        g_acquire_range == NULL || node->src[0] == NULL ||
-        node->src[1] == NULL || node->src[0]->view_src != NULL ||
-        ggml_n_dims(node->src[0]) != 2 ||
+        g_acquire_range == NULL || g_range_capacity == NULL || g_release == NULL ||
+        node->src[0] == NULL || node->src[1] == NULL ||
         node->src[1]->type != GGML_TYPE_I32) {
         return false;
     }
@@ -1071,133 +1093,208 @@ static bool mlz_can_range_get_rows(struct ggml_tensor * node) {
         ((const struct mlz_buffer_context *) index_owner->buffer->context)->backed) {
         return false;
     }
-    return mlz_registry_for_tensor(node->src[0]) != NULL;
-}
-
-static bool mlz_rebase_get_rows(struct ggml_tensor * node) {
-    if (!mlz_can_range_get_rows(node)) {
-        return false;
-    }
-
-    struct ggml_tensor * tensor = node->src[0];
-    const struct mlz_tensor_source * source = mlz_registry_for_tensor(tensor);
-    if (source == NULL || g_node_pin_count >= GGML_MAX_SRC) {
-        return false;
-    }
-    const struct mlz_buffer_context * context =
-        (const struct mlz_buffer_context *) tensor->buffer->context;
-    if (context == NULL || !context->backed || context->base == NULL) {
-        return false;
-    }
-
-    const int64_t index_count = ggml_nelements(node->src[1]);
-    if (index_count <= 0) {
-        return false;
-    }
-    int32_t min_row = INT32_MAX;
-    int32_t max_row = INT32_MIN;
-    const struct ggml_tensor * indices = node->src[1];
-    for (int64_t index = 0; index < index_count; ++index) {
-        const int64_t i12 = index / (indices->ne[1] * indices->ne[0]);
-        const int64_t i11 = (index - i12 * indices->ne[1] * indices->ne[0]) /
-            indices->ne[0];
-        const int64_t i10 = index - i12 * indices->ne[1] * indices->ne[0] -
-            i11 * indices->ne[0];
-        const int32_t row = *(const int32_t *) ((const char *) indices->data +
-            i10 * indices->nb[0] + i11 * indices->nb[1] + i12 * indices->nb[2]);
-        if (row < 0 || row >= tensor->ne[1]) {
-            return false;
-        }
-        if (row < min_row) min_row = row;
-        if (row > max_row) max_row = row;
-    }
-
-    const size_t row_bytes = tensor->nb[1];
-    const size_t tensor_offset = (size_t) min_row * row_bytes;
-    const size_t byte_len = ((size_t) max_row - (size_t) min_row + 1) * row_bytes;
-    const size_t identity_offset =
-        (size_t) ((uintptr_t) tensor->data - (uintptr_t) context->base);
-    if (identity_offset < source->buffer_offset) {
-        return false;
-    }
-    const size_t tensor_source_offset = identity_offset - source->buffer_offset;
-    if (tensor_source_offset > source->byte_len ||
-        tensor_offset > source->byte_len - tensor_source_offset ||
-        byte_len > source->byte_len - tensor_source_offset - tensor_offset) {
-        return false;
-    }
-
-    void * mapped = g_acquire_range(
-        source->source_id, tensor_source_offset + tensor_offset, byte_len);
-    if (mapped == NULL) {
-        return false;
-    }
-    tensor->data = (void *) ((uintptr_t) mapped - tensor_offset);
-    g_node_pins[g_node_pin_count++] = (struct mlz_node_pin) {
-        .tensor = tensor,
-        .source_id = source->source_id,
-        .identity_offset = identity_offset,
-        .releases_source = true,
-    };
-    atomic_fetch_add_explicit(&g_residency_acquires, 1, memory_order_relaxed);
-    return true;
+    const struct ggml_tensor * tensor = node->src[0];
+    return tensor->nb[0] == ggml_type_size(tensor->type) &&
+        mlz_registry_for_tensor(tensor) != NULL;
 }
 #endif /* GGML_USE_MLZ_RESIDENCY_HOOKS */
 
-void mlz_ggml_residency_node_pre(struct ggml_tensor * node) {
+bool mlz_ggml_residency_get_rows_sparse(struct ggml_tensor * node, int ith) {
+#ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
+    if (!mlz_can_range_get_rows(node)) return false;
+    if (ith != 0) return true; // one pin per source; other workers meet at node-post barrier
+
+    const struct ggml_tensor * tensor = node->src[0];
+    const struct ggml_tensor * indices = node->src[1];
+    const struct mlz_tensor_source * source = mlz_registry_for_tensor(tensor);
+    const struct mlz_buffer_context * context =
+        (const struct mlz_buffer_context *) (tensor->view_src != NULL ?
+            tensor->view_src : tensor)->buffer->context;
+    const size_t identity_offset =
+        (size_t) ((uintptr_t) tensor->data - (uintptr_t) context->base);
+    const size_t source_offset = identity_offset >= source->buffer_offset ?
+        identity_offset - source->buffer_offset : SIZE_MAX;
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    const int64_t count = ggml_nelements(indices);
+    const struct ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+    if (identity_offset < source->buffer_offset || source_offset > source->byte_len ||
+        row_bytes == 0 || count < 1 ||
+        (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_I32 &&
+         tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16 &&
+         (traits == NULL || traits->to_float == NULL))) {
+        mlz_ggml_residency_mark_failed(tensor, "unsupported GET_ROWS layout");
+        return true;
+    }
+
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t i12 = i / (indices->ne[1] * indices->ne[0]);
+        const int64_t i11 = (i - i12 * indices->ne[1] * indices->ne[0]) / indices->ne[0];
+        const int64_t i10 = i - i12 * indices->ne[1] * indices->ne[0] - i11 * indices->ne[0];
+        const int32_t row = *(const int32_t *) ((const char *) indices->data +
+            i10 * indices->nb[0] + i11 * indices->nb[1] + i12 * indices->nb[2]);
+        const size_t available = source->byte_len - source_offset;
+        if (tensor->nb[1] == 0 || tensor->nb[2] == 0 || tensor->nb[3] == 0 ||
+            row < 0 || row >= tensor->ne[1] ||
+            (size_t) row > available / tensor->nb[1] ||
+            (size_t) i11 > available / tensor->nb[2] ||
+            (size_t) i12 > available / tensor->nb[3]) {
+            mlz_ggml_residency_mark_failed(tensor, "invalid GET_ROWS index/layout");
+            return true;
+        }
+        const size_t row_offset = (size_t) row * tensor->nb[1];
+        const size_t plane_offset = (size_t) i11 * tensor->nb[2];
+        const size_t volume_offset = (size_t) i12 * tensor->nb[3];
+        if (plane_offset > available - row_offset ||
+            volume_offset > available - row_offset - plane_offset) {
+            mlz_ggml_residency_mark_failed(tensor, "GET_ROWS strides exceed source span");
+            return true;
+        }
+        const size_t offset = row_offset + plane_offset + volume_offset;
+        if (offset > available || row_bytes > available - offset ||
+            g_range_capacity(source->source_id, source_offset + offset) < row_bytes) {
+            mlz_ggml_residency_mark_failed(tensor, "GET_ROWS row exceeds weight budget or source span");
+            return true;
+        }
+        uint64_t token = 0;
+        void * mapped = g_acquire_range(source->source_id, source_offset + offset, row_bytes, &token);
+        if (mapped == NULL) {
+            mlz_ggml_residency_mark_failed(tensor, "GET_ROWS acquire failed");
+            return true;
+        }
+        atomic_fetch_add_explicit(&g_residency_acquires, 1, memory_order_relaxed);
+        void * dst = (char *) node->data + i10 * node->nb[1] +
+            i11 * node->nb[2] + i12 * node->nb[3];
+        if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
+            memcpy(dst, mapped, row_bytes);
+        } else if (tensor->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) mapped, (float *) dst, tensor->ne[0]);
+        } else if (tensor->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mapped, (float *) dst, tensor->ne[0]);
+        } else {
+            traits->to_float(mapped, (float *) dst, tensor->ne[0]);
+        }
+        if (!g_release(token)) {
+            fprintf(stderr, "mlz backed: GET_ROWS release failed for '%s'\n", tensor->name);
+            abort();
+        }
+        atomic_fetch_add_explicit(&g_residency_releases, 1, memory_order_relaxed);
+    }
+    return true;
+#else
+    (void) node;
+    (void) ith;
+    return false;
+#endif
+}
+
+bool mlz_ggml_residency_node_pre(struct ggml_tensor * node) {
 #ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
     atomic_fetch_add_explicit(&g_node_pre_calls, 1, memory_order_relaxed);
     const uint_fast64_t active = atomic_fetch_add_explicit(
         &g_current_active_nodes, 1, memory_order_relaxed) + 1;
     mlz_update_atomic_peak(&g_peak_active_nodes, active);
 
-    /* Backed mode: map every model-weight source and rebase tensor->data.
-     * Thread 0 records exact identity offsets for post-hook restoration. */
-    if (!atomic_load_explicit(&g_backed_mode, memory_order_relaxed) ||
-        g_acquire == NULL) {
-        return;
-    }
     g_node_pin_count = 0;
+    g_graph_failed = false;
+    memset(g_node_original_src, 0, sizeof(g_node_original_src));
+    /* Backed mode: clone each shared model-weight source into this graph node
+     * before mapping it. Other contexts keep the original identity pointer. */
+    if (!atomic_load_explicit(&g_backed_mode, memory_order_relaxed) ||
+        g_acquire_many == NULL || g_release == NULL) {
+        return true;
+    }
     const bool tiled_mul_mat = mlz_ggml_residency_should_tile_mul_mat(node);
     const bool tiled_mul_mat_id =
         mlz_ggml_residency_should_tile_mul_mat_id(node);
     const bool ranged_get_rows = mlz_can_range_get_rows(node);
-    if (ranged_get_rows && !mlz_rebase_get_rows(node)) {
-        fprintf(stderr, "mlz backed: row-range rebase failed for '%s'\n",
-                node->src[0]->name);
-        abort();
+    if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL &&
+        mlz_registry_for_tensor(node->src[0]) != NULL && !ranged_get_rows) {
+        mlz_ggml_residency_mark_failed(node->src[0], "unsupported GET_ROWS layout");
+        g_graph_failed = false;
+        atomic_fetch_add_explicit(&g_graph_failures, 1, memory_order_relaxed);
+        return false;
     }
+
+    /* Pass 1: collect distinct whole-span sources and pin them together so a
+     * node never holds part of its inputs while waiting for the rest. */
+    uint32_t source_ids[GGML_MAX_SRC];
+    size_t deltas[GGML_MAX_SRC];
+    int source_slot[GGML_MAX_SRC];
+    size_t source_count = 0;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        source_slot[i] = -1;
         struct ggml_tensor * src = node->src[i];
         if (src == NULL) {
             break;
         }
-        if ((tiled_mul_mat || tiled_mul_mat_id || ranged_get_rows) && i == 0) {
+        if (i == 0 && (tiled_mul_mat || tiled_mul_mat_id || ranged_get_rows)) {
             continue;
         }
-        struct ggml_tensor * owner =
-            src->view_src != NULL ? src->view_src : src;
-        if (owner->buffer == NULL ||
-            owner->buffer->buft != &g_mlz_buft ||
-            owner->buffer->context == NULL) {
+        if (!mlz_is_backed_source(src)) {
             continue;
         }
-        struct mlz_buffer_context * context =
-            (struct mlz_buffer_context *) owner->buffer->context;
-        if (!context->backed) {
-            continue;
+        const struct mlz_tensor_source * source = mlz_registry_for_tensor(src);
+        const size_t delta = source != NULL ? mlz_source_delta(src, source) : SIZE_MAX;
+        if (delta == SIZE_MAX) {
+            mlz_ggml_residency_mark_failed(src, "unregistered or out-of-span weight view");
+            g_graph_failed = false;
+            atomic_fetch_add_explicit(&g_graph_failures, 1, memory_order_relaxed);
+            return false;
         }
-        /* Each source is tracked explicitly by pre-hook, so tied mappings
-         * and GGML views restore the exact original identity pointer. */
-        if (!mlz_rebase_tensor(src)) {
-            fprintf(stderr, "mlz backed: rebase failed for '%s'\n", src->name);
-            abort();
+        deltas[i] = delta;
+        size_t slot = 0;
+        while (slot < source_count && source_ids[slot] != source->source_id) {
+            ++slot;
+        }
+        if (slot == source_count) {
+            source_ids[source_count++] = source->source_id;
+        }
+        source_slot[i] = (int) slot;
+    }
+
+    void * mapped[GGML_MAX_SRC];
+    uint64_t tokens[GGML_MAX_SRC];
+    if (source_count != 0) {
+        if (!g_acquire_many(source_count, source_ids, mapped, tokens)) {
+            const struct ggml_tensor * weight = node;
+            for (int i = 0; i < GGML_MAX_SRC && node->src[i] != NULL; ++i) {
+                if (source_slot[i] == 0) {
+                    weight = node->src[i];
+                    break;
+                }
+            }
+            mlz_ggml_residency_mark_failed(weight, "weight acquisition failed");
+            g_graph_failed = false;
+            atomic_fetch_add_explicit(&g_graph_failures, 1, memory_order_relaxed);
+            return false;
+        }
+        for (size_t slot = 0; slot < source_count; ++slot) {
+            g_node_pins[slot] = (struct mlz_node_pin) {
+                .source_id = source_ids[slot],
+                .token = tokens[slot],
+                .mapped_base = mapped[slot],
+            };
+        }
+        g_node_pin_count = source_count;
+        atomic_fetch_add_explicit(&g_residency_acquires, source_count, memory_order_relaxed);
+    }
+
+    /* Pass 2: rebase node-local clones. Nothing below can fail. */
+    for (int i = 0; i < GGML_MAX_SRC && node->src[i] != NULL; ++i) {
+        if (i == 0 && (tiled_mul_mat || tiled_mul_mat_id)) {
+            mlz_clone_source(node, i, NULL, 0);
+        } else if (source_slot[i] >= 0) {
+            mlz_clone_source(node, i, mapped[source_slot[i]], deltas[i]);
         }
     }
+    return true;
+#else
+    (void) node;
+    return true;
 #endif
 }
 
-void mlz_ggml_residency_node_post(struct ggml_tensor * node) {
+bool mlz_ggml_residency_node_post(struct ggml_tensor * node) {
 #ifdef GGML_USE_MLZ_RESIDENCY_HOOKS
     atomic_fetch_add_explicit(&g_node_post_calls, 1, memory_order_relaxed);
     uint_fast64_t active = atomic_load_explicit(
@@ -1208,27 +1305,18 @@ void mlz_ggml_residency_node_post(struct ggml_tensor * node) {
                memory_order_relaxed, memory_order_relaxed)) {
     }
 
-    if (!atomic_load_explicit(&g_backed_mode, memory_order_relaxed) ||
-        g_release == NULL) {
-        return;
+    if (atomic_load_explicit(&g_backed_mode, memory_order_relaxed) && g_release != NULL) {
+        mlz_release_node_pins();
     }
+    mlz_restore_node_sources(node);
+    const bool failed = g_graph_failed;
+    g_graph_failed = false;
+    if (failed) {
+        atomic_fetch_add_explicit(&g_graph_failures, 1, memory_order_relaxed);
+    }
+    return !failed;
+#else
     (void) node;
-    for (size_t index = g_node_pin_count; index > 0; --index) {
-        const struct mlz_node_pin * pin = &g_node_pins[index - 1];
-        if (pin->releases_source) {
-            if (!mlz_restore_tensor(
-                    pin->tensor, pin->source_id, pin->identity_offset)) {
-                fprintf(stderr, "mlz backed: restore failed for '%s'\n",
-                        pin->tensor->name);
-                abort();
-            }
-        } else {
-            const struct mlz_buffer_context * context =
-                (const struct mlz_buffer_context *) pin->tensor->buffer->context;
-            pin->tensor->data =
-                (void *) ((uintptr_t) context->base + pin->identity_offset);
-        }
-    }
-    g_node_pin_count = 0;
+    return true;
 #endif
 }

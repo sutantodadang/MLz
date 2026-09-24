@@ -70,6 +70,34 @@ built-in defaults  <  mlz.toml  <  MLZ_* env vars  <  CLI flags
 min_p, seed), `[chat]` (stream, system, template, grammar), `[speculative]`
 (draft_model).
 
+### Bounded GGML weight residency (CPU)
+
+Build with native GGML hooks, then enable residency for the normal CLI or
+OpenAI-compatible server:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dsimd-backend=false -Dggml-residency-hooks=true -Dcpu-repack=false
+.\zig-out\bin\MLz.exe model.gguf --server --residency --weight-budget-mib 256 --state-budget-mib 1024
+```
+
+`[residency] enabled = true`, `weight_budget_mib = 256`, and
+`state_budget_mib = 1024` in `mlz.toml` provide the same settings. Residency
+selects CPU when `n_gpu_layers = "auto"`; an explicit GPU layer count is
+rejected. `GET /v1/residency/metrics` reports the weight budget, current/peak
+mappings, faults, evictions, acquire latency, hook/pin balance, failure counts
+with the last failure reason, and planned vs allocated memory. The endpoint uses
+the server's API key when one is configured.
+
+`weight_budget_mib` caps active mapped immutable weights. `state_budget_mib`
+is a hard limit for KV/recurrent state, graph workspace, and the logits buffer,
+checked before anything is allocated using llama.cpp's simulated allocation
+sizes; it works for any architecture llama.cpp loads. Neither caps filesystem
+page cache, allocator slack, or GPU memory. A weight that cannot be mapped
+fails only that request (`503 residency_error`) and the server keeps serving.
+Official residency supports one model per process; leave it disabled to use
+ordinary llama.cpp multi-model serving. `--residency-budget-mib` independently
+enables the older proof endpoint. Details: `docs/ggml-residency-backend.md`.
+
 ### Common CLI flags
 
 | Flag | Purpose |

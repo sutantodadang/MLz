@@ -1721,6 +1721,10 @@ pub fn build(b: *std.Build) void {
         .file = b.path("src/jinja_shim.cpp"),
         .flags = cpp_flags.items,
     });
+    llama_lib.addCSourceFile(.{
+        .file = b.path("src/llama_memory_shim.cpp"),
+        .flags = cpp_flags.items,
+    });
 
     llama_lib.linkLibC();
     if (actual_target.query.abi != .msvc) {

@@ -3,6 +3,7 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("llama.h");
     @cInclude("ggml_residency_backend.h");
+    @cInclude("llama_memory_shim.h");
 });
 
 pub const Token = c.llama_token;
@@ -12,6 +13,10 @@ pub const LlamaError = error{
     BackendInitFailed,
     ModelLoadFailed,
     ContextInitFailed,
+    ResidencyHooksUnavailable,
+    ResidencyInvalidBudget,
+    ResidencyStateBudgetExceeded,
+    ResidencyBridgeInitFailed,
     VocabUnavailable,
     TemplateFailed,
     TokenizeFailed,
@@ -80,6 +85,18 @@ pub const Model = struct {
     /// Embedding dimension (n_embd) of the model.
     pub fn nEmbd(self: Model) i32 {
         return c.llama_model_n_embd(self.handle);
+    }
+
+    pub fn nLayer(self: Model) i32 {
+        return c.llama_model_n_layer(self.handle);
+    }
+
+    pub fn nHead(self: Model) i32 {
+        return c.llama_model_n_head(self.handle);
+    }
+
+    pub fn nHeadKv(self: Model) i32 {
+        return c.llama_model_n_head_kv(self.handle);
     }
 };
 

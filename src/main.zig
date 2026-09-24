@@ -67,6 +67,9 @@ pub fn main() !void {
                     \\  --host <string>        Server host (default: 127.0.0.1)
                     \\  --port <int>           Server port (default: 8080)
                     \\  --api-key <string>     Require Authorization: Bearer <api-key>
+                    \\  --residency             Use official bounded GGML weights (CPU only)
+                    \\  --weight-budget-mib <n> Active mapped immutable-weight budget
+                    \\  --state-budget-mib <n>  Hard limit for KV/state, workspace, logits (preflighted)
                     \\
                     \\Custom SIMD backend (built with -Dsimd-backend=true):
                     \\  --no-simd              Disable custom SIMD hooks (use ggml default)
@@ -146,6 +149,9 @@ pub fn main() !void {
             .draft_model_path = cfg.draft_model_path,
             .max_concurrent = cfg.max_concurrent,
             .prefix_cache = cfg.prefix_cache,
+            .residency_enabled = cfg.residency_enabled,
+            .residency_weight_budget_bytes = try mibToBytes(cfg.residency_weight_budget_mib),
+            .residency_state_budget_bytes = if (cfg.residency_state_budget_mib) |limit| try mibToBytes(limit) else null,
         });
         return;
     }
@@ -166,8 +172,13 @@ pub fn main() !void {
         .draft_model_path = cfg.draft_model_path,
         .max_concurrent = cfg.max_concurrent,
         .prefix_cache = cfg.prefix_cache,
+        .residency_enabled = cfg.residency_enabled,
+        .residency_weight_budget_bytes = try mibToBytes(cfg.residency_weight_budget_mib),
+        .residency_state_budget_bytes = if (cfg.residency_state_budget_mib) |limit| try mibToBytes(limit) else null,
     };
 
+    var backend = llama_cpp.Backend.init();
+    defer backend.deinit();
     var engine = try server.Engine.init(allocator, model_path, engine_cfg);
     defer engine.deinit(allocator);
 
@@ -196,8 +207,10 @@ pub fn main() !void {
     if (cfg.prompt_mode) {
         if (cfg.user_prompt) |input| {
             const user_z = try chat.dupeZ(allocator, input);
-            errdefer allocator.free(user_z);
-            try msgs.append(allocator, .{ .role = .user, .content = user_z });
+            msgs.append(allocator, .{ .role = .user, .content = user_z }) catch |err| {
+                allocator.free(user_z);
+                return err;
+            };
 
             var dummy_ctx: u8 = 0;
             const sink: ?inference.TokenSink = if (cfg.stream) .{ .ctx = &dummy_ctx, .writeFn = printToken } else null;
@@ -323,6 +336,10 @@ pub fn main() !void {
 
         maybeSaveChat(allocator, cfg.save_chat_path, msgs.items);
     }
+}
+
+fn mibToBytes(value: usize) !usize {
+    return std.math.mul(usize, value, 1024 * 1024) catch error.InvalidResidencyBudget;
 }
 
 fn printToken(ctx: *anyopaque, bytes: []const u8) anyerror!void {

@@ -134,6 +134,12 @@ pub fn sequenceLogitsGgmlBackend(
 /// are copied into the process at load time; each node's kernel runs against
 /// a transient file mapping acquired inside the synchronized node hooks and
 /// released afterwards, bounded by the given residency budget.
+pub const BackedMode = enum { single, concurrent, cancel, fail };
+
+/// Injected failure points for `.fail`: the first acquisitions hit the token
+/// embedding GET_ROWS path; later ones land on whole-node and tiled weights.
+const injected_failure_points = [_]u64{ 1, 2, 3, 17, 50, 200 };
+
 pub fn sequenceLogitsGgmlBackendBacked(
     allocator: std.mem.Allocator,
     path_z: [:0]const u8,
@@ -141,6 +147,7 @@ pub fn sequenceLogitsGgmlBackendBacked(
     output: []f32,
     current_rss: *const fn () ?u64,
     budget_bytes: usize,
+    mode: BackedMode,
 ) !GgmlBackendRun {
     if (tokens.len == 0 or tokens.len > std.math.maxInt(u32)) return Error.InvalidToken;
     for (tokens) |token| {
@@ -155,7 +162,7 @@ pub fn sequenceLogitsGgmlBackendBacked(
     defer {
         llama.c.mlz_ggml_residency_set_node_hooks_enabled(false);
         llama.c.mlz_ggml_residency_set_backed_mode(false);
-        llama.c.mlz_ggml_residency_set_bridge(null, null, null, null, null);
+        llama.c.mlz_ggml_residency_set_bridge(null, null, null, null, null, null);
         bridge.deinit(allocator);
         llama.c.mlz_ggml_residency_registry_reset();
     }
@@ -172,6 +179,7 @@ pub fn sequenceLogitsGgmlBackendBacked(
         bridge.spanCallback,
         bridge.acquireRangeCallback,
         bridge.rangeCapacityCallback,
+        bridge.acquireManyCallback,
     );
     llama.c.mlz_ggml_residency_set_backed_mode(true);
 
@@ -230,7 +238,77 @@ pub fn sequenceLogitsGgmlBackendBacked(
     }
 
     var decode_timer = try std.time.Timer.start();
-    try context.decode(batch.handle);
+    if (mode == .concurrent or mode == .cancel) {
+        const other = try llama.Context.init(model, context_params);
+        defer other.deinit();
+        var abort_calls = std.atomic.Value(u32).init(0);
+        const Abort = struct {
+            fn callback(ctx: ?*anyopaque) callconv(.c) bool {
+                const calls: *std.atomic.Value(u32) = @ptrCast(@alignCast(ctx.?));
+                return calls.fetchAdd(1, .monotonic) >= 50;
+            }
+        };
+        if (mode == .cancel) llama.c.llama_set_abort_callback(other.handle, Abort.callback, &abort_calls);
+        var other_batch = llama.Batch.init(@intCast(tokens.len), 0, 1);
+        defer other_batch.deinit();
+        for (tokens, 0..) |token, position| {
+            try other_batch.add(@intCast(token), @intCast(position), &sequence, position + 1 == tokens.len);
+        }
+        var start = std.atomic.Value(bool).init(false);
+        const Worker = struct {
+            ctx: llama.Context,
+            batch: llama.Batch,
+            start: *std.atomic.Value(bool),
+            failure: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                while (!self.start.load(.acquire)) std.Thread.sleep(1000);
+                self.ctx.decode(self.batch.handle) catch |err| {
+                    self.failure = err;
+                };
+            }
+        };
+        var worker = Worker{ .ctx = other, .batch = other_batch, .start = &start };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        start.store(true, .release);
+        const main_result = context.decode(batch.handle);
+        thread.join();
+        if (mode == .cancel) {
+            const failure = worker.failure orelse return error.CancellationNotObserved;
+            if (failure != error.DecodeFailed) return failure;
+            llama.c.llama_set_abort_callback(other.handle, null, null);
+            if (!other.kvCacheSeqRm(0, -1, -1)) return error.CancelledStateNotCleared;
+            try other.decode(other_batch.handle);
+        } else if (worker.failure) |err| return err;
+        try main_result;
+        const other_logits = other.logitsIth(@intCast(tokens.len - 1)) orelse return Error.LogitsUnavailable;
+        const main_logits = context.logitsIth(@intCast(tokens.len - 1)) orelse return Error.LogitsUnavailable;
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(other_logits[0..output.len]), std.mem.sliceAsBytes(main_logits[0..output.len]))) {
+            return error.ConcurrentLogitMismatch;
+        }
+    } else if (mode == .fail) {
+        // Each injected acquire failure must stop the graph with an error,
+        // leave no pin behind, and let the same context decode exactly again.
+        for (injected_failure_points, 1..) |after, expected_failures| {
+            bridge.injectAcquireFailure(after);
+            if (context.decode(batch.handle)) |_| {
+                bridge.injectAcquireFailure(0);
+                return error.InjectedFailureNotObserved;
+            } else |err| if (err != error.DecodeFailed) return err;
+            const diagnostics = bridge.diagnostics() orelse return error.ResidencyBridgeMissing;
+            if (diagnostics.open_pins != 0) return error.FailedGraphLeakedPins;
+            if (diagnostics.failures.injected != expected_failures) return error.InjectedFailureNotRecorded;
+            const stats = llama.c.mlz_ggml_residency_get_stats();
+            if (stats.graph_failures != expected_failures) return error.GraphFailureNotReported;
+            if (stats.current_active_nodes != 0 or stats.node_pre_calls != stats.node_post_calls) {
+                return error.NodeHookImbalance;
+            }
+            if (!context.kvCacheSeqRm(0, -1, -1)) return error.FailedStateNotCleared;
+        }
+        try context.decode(batch.handle);
+    } else {
+        try context.decode(batch.handle);
+    }
     const logits = context.logitsIth(@intCast(tokens.len - 1)) orelse return Error.LogitsUnavailable;
     @memcpy(output, logits[0..output.len]);
     const decode_ns = decode_timer.read();
